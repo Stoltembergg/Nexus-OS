@@ -16,6 +16,97 @@ const REAL_DRIVER_BYTES: &[u8] =
     include_bytes!("../../../tests/fixtures/nt_driver/nexus_driver.sys");
 const STANDARD_WDM_BYTES: &[u8] =
     include_bytes!("../../../tests/fixtures/nt_driver/standard_wdm.sys");
+/// Fixture with an absolute-pointer table (3 `IMAGE_REL_BASED_DIR64` fixups); its
+/// `DriverEntry` returns STATUS_SUCCESS only if every relocated pointer is correct.
+const RELOC_DRIVER_BYTES: &[u8] =
+    include_bytes!("../../../tests/fixtures/nt_driver/reloc/reloc_driver.sys");
+/// Preferred `ImageBase` of the fixtures; the host always maps elsewhere.
+const FIXTURE_PREFERRED_BASE: u64 = 0x1_4000_0000;
+
+/// Applies the driver's W^X section permissions to the kernel page tables (code becomes
+/// executable only here: the UEFI heap backing the image is NX by default).
+#[cfg(any(target_os = "uefi", target_os = "none"))]
+fn protect_driver_pages(driver: &nexus_loader::LoadedDriver) {
+    if let Some(ref mut kas) = *crate::mem::KERNEL_ADDRESS_SPACE.lock() {
+        driver
+            .enforce_wx_protection(|va, writable, executable| {
+                let mut flags = crate::mem::vmm::PageTableFlags::empty();
+                if writable {
+                    flags |= crate::mem::vmm::PageTableFlags::WRITABLE;
+                }
+                if !executable {
+                    flags |= crate::mem::vmm::PageTableFlags::NO_EXECUTE;
+                }
+                kas.protect_kernel_page(VirtualAddress::new(va), flags)
+                    .map_err(|_| ())
+            })
+            .expect("Failed to apply W^X protection to driver sections");
+    }
+}
+
+/// Returns the image pages to RW+NX before the heap buffer is freed.
+#[cfg(any(target_os = "uefi", target_os = "none"))]
+fn release_driver_pages(driver: &nexus_loader::LoadedDriver) {
+    if let Some(ref mut kas) = *crate::mem::KERNEL_ADDRESS_SPACE.lock() {
+        let start = (driver.buffer.as_ptr() as u64) & !4095;
+        let end = (driver.buffer.as_ptr() as u64 + driver.buffer.len() as u64 + 4095) & !4095;
+        for addr in (start..end).step_by(4096) {
+            kas.protect_kernel_page(
+                VirtualAddress::new(addr),
+                crate::mem::vmm::PageTableFlags::WRITABLE
+                    | crate::mem::vmm::PageTableFlags::NO_EXECUTE,
+            )
+            .expect("Failed to restore RW+NX on released driver pages");
+        }
+    }
+}
+
+/// Exercises base relocation and fail-closed loading in guest Ring 0.
+///
+/// Panics (and therefore fails the QEMU run) unless the relocation-bearing driver is
+/// rebased, all 3 DIR64 fixups are applied, its `DriverEntry` verifies them, and images
+/// with corrupted import/relocation directories are refused.
+fn validate_loader_relocations_and_fail_closed(host: &NtDriverHost) {
+    let mut driver = host
+        .load_driver(
+            RELOC_DRIVER_BYTES,
+            "\\Driver\\NexusReloc",
+            "\\Registry\\Test",
+        )
+        .expect("relocation fixture must load");
+    assert_ne!(driver.image_base, FIXTURE_PREFERRED_BASE);
+    assert_eq!(driver.relocations_applied, 3);
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    protect_driver_pages(&driver);
+    let (reg, _reg_backing) = UnicodeString::from_str_vec("\\Registry\\Test");
+    let status = unsafe { driver.init(&reg) };
+    assert_eq!(
+        status, 0,
+        "reloc_driver DriverEntry rejected its relocated pointers"
+    );
+    crate::serial_println!(
+        "NEXUS_DRIVER_RELOC:applied={}:rebased=true:entry_status={:#x}",
+        driver.relocations_applied,
+        status
+    );
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    release_driver_pages(&driver);
+    drop(driver);
+
+    let pe_off = u32::from_le_bytes(RELOC_DRIVER_BYTES[60..64].try_into().unwrap()) as usize;
+    let data_dir = |index: usize| pe_off + 24 + 112 + index * 8;
+    for (name, index) in [("imports", 1usize), ("relocs", 5usize)] {
+        let mut corrupted = RELOC_DRIVER_BYTES.to_vec();
+        let at = data_dir(index);
+        corrupted[at..at + 4].copy_from_slice(&0x7FFF_0000u32.to_le_bytes());
+        assert!(
+            host.load_driver(&corrupted, "\\Driver\\Corrupt", "\\Registry\\Test")
+                .is_err(),
+            "corrupted {name} directory was loaded"
+        );
+    }
+    crate::serial_println!("NEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected");
+}
 
 fn hardware_cr8_getter() -> u8 {
     crate::arch::x86_64::read_cr8_irql()
@@ -37,6 +128,7 @@ pub fn validate_nt_driver_subsystem() {
     crate::serial_println!("[+] Hardware CR8 / TPR IRQL hooks installed into NT Driver Host");
 
     let host = NtDriverHost::new();
+    validate_loader_relocations_and_fail_closed(&host);
 
     // =========================================================================
     // Part 1: MSVC-Compiled Driver Validation (nexus_driver.sys)
