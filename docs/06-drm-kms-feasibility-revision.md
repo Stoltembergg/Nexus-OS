@@ -1,5 +1,14 @@
 # Architectural Review & Revision: DRM/KMS in an Independent Kernel
 
+## Status update: Nexus Shell and graphics constraints (2026-10-11)
+
+The early document uses absolute terms such as “technically impossible” for a direct DRM/KMS port, and implies that a userspace split solves graphics support. **Interpret these as assessments of large engineering cost, not mathematical impossibility or an implemented design.** GPU initialization, display modes, DMA, command queues, firmware and synchronization all need a real kernel/device contract. Mesa RADV/ANV/NVK userspace components are not standalone GPU drivers on Nexus.
+
+**Official desktop decision:** Nexus Shell will be based on the **Niri Wayland compositor** and **iNiR Shell (Quickshell/Qt/QML)**, preserved as closely as practical to upstream. Port Smithay/Niri platform backends and Quickshell services to Nexus-specific display, input and IPC interfaces. GPL and dependent licensing must be reviewed before redistribution.
+
+**Staged validation:** (1) existing UEFI GOP 2D console, (2) minimal compositor and virtio-gpu in QEMU as a development target, (3) carefully scoped real-hardware GPU driver/API prototype for specific vendor/device, (4) Vulkan acceleration with verified Mesa/kernel interface compatibility, (5) UI integration and fullscreen performance. Do not claim a functional Nexus Shell or Vulkan GPU stack today. See [architecture](03-system-architecture.md) and [roadmap](04-roadmap-and-phases.md).
+
+
 This document provides a critical review of the graphical stack assumptions made in early architectural drafts, specifically identifying the technical impossibility of embedding the monolithic Linux **DRM/KMS (Direct Rendering Manager / Kernel Mode Setting)** subsystem directly into an independent hybrid kernel without importing the entirety of the Linux kernel source tree.
 
 ---
