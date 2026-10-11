@@ -10,7 +10,7 @@ spec.loader.exec_module(runner)
 
 class RunnerTests(unittest.TestCase):
     def serial(self):
-        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in runner.CHECKS) + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\n'
+        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in runner.CHECKS) + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\nNEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0\nNEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n'
 
     def test_complete_protocol_requires_success_exit(self):
         runner.validate(33, self.serial())
@@ -22,6 +22,15 @@ class RunnerTests(unittest.TestCase):
         for serial in ['NEXUS_HARDENING_PASS:checks=8', self.serial().replace('NEXUS_CHECK:msrs:PASS', ''), self.serial() + 'NEXUS_CHECK:context:PASS\n', self.serial().replace('context:PASS', 'context:FAIL'), self.serial().replace('NEXUS_PHASE3_SUCCESS:', 'INCOMPLETE:')]:
             with self.assertRaises(RuntimeError):
                 runner.validate(33, serial)
+
+    def test_driver_relocation_and_fail_closed_markers_are_required(self):
+        for old, new in [
+            ('NEXUS_DRIVER_RELOC:applied=3', 'NEXUS_DRIVER_RELOC:applied=0'),
+            ('entry_status=0x0', 'entry_status=0xc0de0001'),
+            ('NEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n', ''),
+        ]:
+            with self.assertRaises(RuntimeError):
+                runner.validate(33, self.serial().replace(old, new))
 
 
 if __name__ == '__main__':

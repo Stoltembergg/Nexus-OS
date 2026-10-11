@@ -20,6 +20,9 @@ use nexus_types::driver::{
 use crate::error::LoaderError;
 use crate::pe::{PeImage, IMAGE_REL_BASED_DIR64, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 
+/// `IMAGE_FILE_HEADER.Characteristics` flag: base relocations were removed from the file.
+pub const IMAGE_FILE_RELOCS_STRIPPED: u16 = 0x0001;
+
 /// Global IRQL tracking register for the NT host executive (software fallback).
 pub static CURRENT_IRQL: AtomicU8 = AtomicU8::new(PASSIVE_LEVEL);
 
@@ -47,11 +50,20 @@ pub enum NtDriverError {
     NotNativeDriver(u16),
     NoEntryPoint,
     RelocationFailed,
-    UnresolvedImport { dll: String, function: String },
+    UnresolvedImport {
+        dll: String,
+        function: String,
+    },
     MemoryAllocationFailed,
     DriverEntryFailed(i32),
     NoUnloadRoutine,
     ProtectionFailed,
+    /// The image must be rebased but carries `IMAGE_FILE_RELOCS_STRIPPED`.
+    RelocationsStripped,
+    /// A section, relocation target or IAT slot falls outside the mapped image.
+    ImageOutOfBounds,
+    /// A section requests simultaneous write and execute permission (W^X violation).
+    WritableExecutableSection,
 }
 
 impl From<LoaderError> for NtDriverError {
@@ -498,6 +510,10 @@ pub struct LoadedDriver {
     pub driver_object: DriverObject,
     pub buffer: ExecutableBuffer,
     pub sections: Vec<DriverSectionMapping>,
+    /// Number of `IMAGE_REL_BASED_DIR64` fixups applied while mapping the image.
+    pub relocations_applied: usize,
+    /// UTF-16 backing storage for `driver_object.driver_name` (must outlive the driver object).
+    _driver_name_backing: Vec<u16>,
 }
 
 impl LoadedDriver {
@@ -527,7 +543,7 @@ impl LoadedDriver {
         for sec in &self.sections {
             // Strict W^X assertion: no section can ever be both W and X
             if sec.is_writable && sec.is_executable {
-                return Err(NtDriverError::InvalidImageFormat);
+                return Err(NtDriverError::WritableExecutableSection);
             }
 
             let start = (self.image_base + sec.rva as u64) & !4095;
@@ -555,12 +571,19 @@ impl LoadedDriver {
             self.buffer.protect_range(0, header_pages, false, false)?;
 
             for sec in &self.sections {
+                if sec.is_writable && sec.is_executable {
+                    return Err(NtDriverError::WritableExecutableSection);
+                }
                 let start = sec.rva as usize;
                 let size = ((sec.size as usize) + 4095) & !4095;
-                if start + size <= self.buffer.len() {
-                    self.buffer
-                        .protect_range(start, size, sec.is_writable, sec.is_executable)?;
+                if start
+                    .checked_add(size)
+                    .is_none_or(|end| end > self.buffer.len())
+                {
+                    return Err(NtDriverError::ImageOutOfBounds);
                 }
+                self.buffer
+                    .protect_range(start, size, sec.is_writable, sec.is_executable)?;
             }
         }
         Ok(())
@@ -663,12 +686,28 @@ impl NtDriverHost {
             return Err(NtDriverError::NoEntryPoint);
         }
 
+        // Fail closed: every relocation and import record must parse before any memory
+        // is allocated. A corrupted table is a load error, never "no relocations/imports".
+        let reloc_blocks = pe.parse_relocations(sys_bytes)?;
+        let import_descriptors = pe.parse_imports(sys_bytes)?;
+
+        // W^X is a load-time invariant, not only a property checked by the page-table hook.
+        if pe.sections.iter().any(|sec| {
+            sec.characteristics & IMAGE_SCN_MEM_WRITE != 0
+                && sec.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+        }) {
+            return Err(NtDriverError::WritableExecutableSection);
+        }
+
         // 1. Allocate aligned buffer (initially PAGE_READWRITE for relocations and IAT)
         let image_size = (pe.size_of_image as usize + 4095) & !4095;
         let mut buffer = ExecutableBuffer::allocate(image_size)?;
 
         // 2. Map PE Headers and Sections
-        let header_copy_len = (pe.size_of_headers as usize).min(sys_bytes.len());
+        let header_copy_len = pe.size_of_headers as usize;
+        if header_copy_len > sys_bytes.len() || header_copy_len > buffer.len() {
+            return Err(NtDriverError::ImageOutOfBounds);
+        }
         buffer.as_mut_slice()[..header_copy_len].copy_from_slice(&sys_bytes[..header_copy_len]);
 
         let mut section_mappings = Vec::new();
@@ -677,10 +716,15 @@ impl NtDriverHost {
             let raw_start = sec.pointer_to_raw_data as usize;
             let raw_size = sec.size_of_raw_data as usize;
 
-            if raw_start + raw_size <= sys_bytes.len() && va_start + raw_size <= buffer.len() {
-                buffer.as_mut_slice()[va_start..va_start + raw_size]
-                    .copy_from_slice(&sys_bytes[raw_start..raw_start + raw_size]);
-            }
+            let src = raw_start
+                .checked_add(raw_size)
+                .and_then(|end| sys_bytes.get(raw_start..end))
+                .ok_or(NtDriverError::ImageOutOfBounds)?;
+            let dst_end = va_start
+                .checked_add(raw_size)
+                .filter(|&end| end <= buffer.len())
+                .ok_or(NtDriverError::ImageOutOfBounds)?;
+            buffer.as_mut_slice()[va_start..dst_end].copy_from_slice(src);
 
             let mut name_bytes = [0u8; 8];
             let src_bytes = sec.name.as_bytes();
@@ -690,10 +734,17 @@ impl NtDriverHost {
             let is_exec = (sec.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
             let is_write = (sec.characteristics & IMAGE_SCN_MEM_WRITE) != 0;
 
+            // PE semantics: a zero VirtualSize means the section spans SizeOfRawData.
+            let mapped_size = if sec.virtual_size != 0 {
+                sec.virtual_size
+            } else {
+                sec.size_of_raw_data
+            };
+
             section_mappings.push(DriverSectionMapping {
                 name: name_bytes,
                 rva: sec.virtual_address,
-                size: sec.virtual_size,
+                size: mapped_size,
                 is_executable: is_exec,
                 is_writable: is_write,
             });
@@ -703,30 +754,35 @@ impl NtDriverHost {
         let actual_base = buffer.as_ptr() as u64;
         let preferred_base = pe.image_base;
         let delta = actual_base.wrapping_sub(preferred_base);
+        let mut relocations_applied = 0usize;
 
         if delta != 0 {
-            let reloc_blocks = pe.parse_relocations(sys_bytes).unwrap_or_default();
-            for block in reloc_blocks {
-                for entry in block.entries {
-                    if entry.rel_type == IMAGE_REL_BASED_DIR64 {
-                        let target_rva = (block.page_rva + entry.offset as u32) as usize;
-                        if target_rva + 8 <= buffer.len() {
-                            let curr_val = LittleEndian::read_u64(
-                                &buffer.as_mut_slice()[target_rva..target_rva + 8],
-                            );
-                            let patched = curr_val.wrapping_add(delta);
-                            LittleEndian::write_u64(
-                                &mut buffer.as_mut_slice()[target_rva..target_rva + 8],
-                                patched,
-                            );
-                        }
+            // Same rule as the NT loader: an image whose relocations were stripped can only
+            // run at its preferred base. (An image without a .reloc directory and without the
+            // flag has no absolute fixups to apply, e.g. MSVC output that is fully RIP-relative.)
+            if pe.file_characteristics & IMAGE_FILE_RELOCS_STRIPPED != 0 {
+                return Err(NtDriverError::RelocationsStripped);
+            }
+            for block in &reloc_blocks {
+                for entry in &block.entries {
+                    if entry.rel_type != IMAGE_REL_BASED_DIR64 {
+                        continue; // IMAGE_REL_BASED_ABSOLUTE padding; others rejected by the parser
                     }
+                    let target_rva = (block.page_rva as usize)
+                        .checked_add(entry.offset as usize)
+                        .ok_or(NtDriverError::RelocationFailed)?;
+                    let slot = target_rva
+                        .checked_add(8)
+                        .and_then(|end| buffer.as_mut_slice().get_mut(target_rva..end))
+                        .ok_or(NtDriverError::RelocationFailed)?;
+                    let patched = LittleEndian::read_u64(slot).wrapping_add(delta);
+                    LittleEndian::write_u64(slot, patched);
+                    relocations_applied += 1;
                 }
             }
         }
 
         // 4. Resolve Imports against NtoskrnlTable and patch IAT
-        let import_descriptors = pe.parse_imports(sys_bytes).unwrap_or_default();
         for desc in import_descriptors {
             for func in desc.functions {
                 let resolved_addr = self
@@ -738,18 +794,19 @@ impl NtDriverHost {
                     })?;
 
                 let iat_offset = func.iat_rva as usize;
-                if iat_offset + 8 <= buffer.len() {
-                    LittleEndian::write_u64(
-                        &mut buffer.as_mut_slice()[iat_offset..iat_offset + 8],
-                        resolved_addr as u64,
-                    );
-                }
+                let slot = iat_offset
+                    .checked_add(8)
+                    .and_then(|end| buffer.as_mut_slice().get_mut(iat_offset..end))
+                    .ok_or(NtDriverError::ImageOutOfBounds)?;
+                LittleEndian::write_u64(slot, resolved_addr as u64);
             }
         }
 
         // 5. Initialize DRIVER_OBJECT
         let mut driver_obj = DriverObject::default();
-        let (driver_name_ustr, _name_backing) = UnicodeString::from_str_vec(driver_name);
+        // The backing buffer is moved into LoadedDriver (moving a Vec keeps its heap
+        // allocation), so driver_object.driver_name never dangles.
+        let (driver_name_ustr, driver_name_backing) = UnicodeString::from_str_vec(driver_name);
 
         driver_obj.driver_name = driver_name_ustr;
         driver_obj.driver_start = buffer.as_mut_ptr() as *mut c_void;
@@ -764,6 +821,8 @@ impl NtDriverHost {
             driver_object: driver_obj,
             buffer,
             sections: section_mappings,
+            relocations_applied,
+            _driver_name_backing: driver_name_backing,
         };
 
         // 6. Enforce W^X platform page protection (Code -> RX, Data -> RW/RO, Headers -> RO)

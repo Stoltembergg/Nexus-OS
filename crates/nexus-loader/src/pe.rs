@@ -96,6 +96,8 @@ pub struct PeImportFunction {
 
 #[derive(Debug, Clone)]
 pub struct PeImage {
+    /// `IMAGE_FILE_HEADER.Characteristics` (e.g. `IMAGE_FILE_RELOCS_STRIPPED`).
+    pub file_characteristics: u16,
     pub image_base: u64,
     pub entry_point_rva: u32,
     pub size_of_image: u32,
@@ -149,6 +151,8 @@ impl PeImage {
 
         let num_sections =
             LittleEndian::read_u16(&bytes[file_header_offset + 2..file_header_offset + 4]) as usize;
+        let file_characteristics =
+            LittleEndian::read_u16(&bytes[file_header_offset + 18..file_header_offset + 20]);
         let size_of_opt_header =
             LittleEndian::read_u16(&bytes[file_header_offset + 16..file_header_offset + 18])
                 as usize;
@@ -244,6 +248,7 @@ impl PeImage {
         }
 
         let image = Self {
+            file_characteristics,
             image_base,
             entry_point_rva,
             size_of_image,

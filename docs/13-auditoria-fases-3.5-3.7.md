@@ -241,6 +241,21 @@ A Fase 4 **não deve começar** enquanto o PR-1 não estiver verde e as decisõe
 
 ## 9. Anexo: reprodutibilidade
 
-- Patches descartáveis (aplicados e revertidos; o repo terminou limpo): `logs/12-throwaway-libc.patch`, `logs/16-throwaway-qemu-probe.patch`, `logs/17-throwaway-wp-probe.patch`.
-- Experimentos de host (fora do repo): `/workspace/nexus-os-audit/experiments/` (`src/lib.rs`, `abi/offsets.c`, `abi/drv.c`, `abi/audit_wdm.sys`). Para rodar, o patch `libc` precisa estar aplicado no clone, por causa de C1.
-- Evidência QEMU bruta: `logs/qemu/*/{serial.log,qemu.log,result.json}` (`result.json` traz o hash do EFI, do firmware, das fixtures e do fonte).
+> **Atenção:** todos os caminhos `logs/...` e `/workspace/nexus-os-audit/...` deste relatório apontam para **evidência local, não versionada**, gerada na máquina da auditoria. Eles **não existem neste repositório** e servem só para rastreabilidade. A evidência versionada e reprodutível é a do CI: os artefatos `hardening-*` (`serial.log`, `qemu.log`, `result.json`) de cada execução do GitHub Actions e os testes do próprio repositório.
+
+- Patches descartáveis (aplicados e revertidos; o repo terminou limpo; locais, não versionados): `logs/12-throwaway-libc.patch`, `logs/16-throwaway-qemu-probe.patch`, `logs/17-throwaway-wp-probe.patch`.
+- Experimentos de host (fora do repo; locais, não versionados): `/workspace/nexus-os-audit/experiments/` (`src/lib.rs`, `abi/offsets.c`, `abi/drv.c`, `abi/audit_wdm.sys`). Para rodar, o patch `libc` precisava estar aplicado no clone, por causa de C1 (já corrigido no PR #3). Os experimentos E1 e E2 viraram testes versionados em `crates/nexus-loader/tests/driver_fail_closed.rs` (PR-2).
+- Evidência QEMU bruta da auditoria (local, não versionada): `logs/qemu/*/{serial.log,qemu.log,result.json}` (`result.json` traz o hash do EFI, do firmware, das fixtures e do fonte). O equivalente versionado são os artefatos `hardening-*` do CI.
+
+## 10. Acompanhamento das correções
+
+| PR | Achados | Estado |
+|---|---|---|
+| #3 (PR-1) | C1, C2 (pin temporário; issue #2), C3 | Merged em `main` (`2040ea5`). A mudança no workflow (pin explícito e `fail-fast: false`) ficou pendente porque o token não tinha permissão de workflow. |
+| PR-2 | A1, A3, M7 e o `DriverName` pendurado (ver abaixo) | Em revisão. |
+
+**PR-2 (loader de drivers fail-closed):**
+- **A1:** `load_driver` propaga os erros de `parse_relocations`/`parse_imports` com `?`, antes de alocar memória. Cópia de seção, alvo de relocação e slot de IAT fora da imagem viram `ImageOutOfBounds`/`RelocationFailed`, e não são mais ignorados.
+- **A3:** nova fixture `tests/fixtures/nt_driver/reloc/reloc_driver.sys` (fonte `reloc_driver.c`, compilada por `scripts/build-reloc-driver.py` com clang + lld-link; `--check` confere byte a byte). Ela tem 3 entradas DIR64, e o `DriverEntry` dela só retorna sucesso se os ponteiros relocados coincidirem com os endereços RIP-relativos. Isso é verificado no host e no Ring 0 do guest QEMU (`NEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0`, exigido pelo runner). Uma imagem com `IMAGE_FILE_RELOCS_STRIPPED` que precisaria ser rebaseada é recusada (`RelocationsStripped`). Uma imagem sem diretório `.reloc` e sem a flag continua aceita, como no loader do NT (é o caso das fixtures MSVC, que não têm fixups absolutos). Um teste de controle negativo prova que, sem relocações, o `DriverEntry` detecta o ponteiro errado.
+- **M7:** o parser já recusava `SectionAlignment < 4096` e seções que compartilham página. Agora há testes de regressão para isso, e uma seção W+X é recusada na carga (`WritableExecutableSection`), não só no callback de W^X.
+- **Novo:** o buffer UTF-16 de `DriverObject.DriverName` era liberado ao fim de `load_driver` (ponteiro pendurado). Agora ele vive em `LoadedDriver`.

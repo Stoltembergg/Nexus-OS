@@ -30,6 +30,10 @@ def validate(returncode, serial):
         raise RuntimeError('Phase 3.6 NT driver execution did not complete in guest Ring 0')
     if serial.count('NEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0') != 1:
         raise RuntimeError('Phase 3.7 NT driver hardening did not complete in guest Ring 0')
+    if serial.count('NEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0') != 1:
+        raise RuntimeError('Relocation-bearing NT driver was not rebased and verified in guest Ring 0')
+    if serial.count('NEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected') != 1:
+        raise RuntimeError('NT driver loader did not reject corrupted import/relocation tables in guest')
     if 'NEXUS_STRESS:cycles=64:processes=128:yields=1024:' not in serial:
         raise RuntimeError('Missing measured stress results')
 
