@@ -10,7 +10,7 @@ spec.loader.exec_module(runner)
 
 class RunnerTests(unittest.TestCase):
     def serial(self):
-        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in runner.CHECKS) + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\nNEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0\nNEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n'
+        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in sorted(runner.CHECKS | runner.DRIVER_CHECKS)) + '\nNEXUS_DRIVER_WX:pages_verified=20\nNEXUS_DRIVER_LIFECYCLE:drivers=3:heap_balanced=true:pool_balanced=true:devices_deleted=true' + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\nNEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0\nNEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n'
 
     def test_complete_protocol_requires_success_exit(self):
         runner.validate(33, self.serial())
@@ -31,6 +31,21 @@ class RunnerTests(unittest.TestCase):
         ]:
             with self.assertRaises(RuntimeError):
                 runner.validate(33, self.serial().replace(old, new))
+
+    def test_driver_evidence_is_required(self):
+        for old, new in [
+            ('NEXUS_CHECK:driver-wx:PASS\n', ''),
+            ('NEXUS_CHECK:driver-lifecycle:PASS\n', ''),
+            ('pages_verified=20', 'pages_verified=0'),
+            ('drivers=3:heap_balanced=true', 'drivers=2:heap_balanced=true'),
+        ]:
+            with self.assertRaises(RuntimeError):
+                runner.validate(33, self.serial().replace(old, new))
+
+    def test_guest_failure_exit_codes_are_named(self):
+        for code in (35, 37):
+            with self.assertRaisesRegex(RuntimeError, 'Guest reported failure'):
+                runner.validate(code, self.serial())
 
 
 if __name__ == '__main__':

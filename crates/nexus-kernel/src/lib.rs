@@ -19,6 +19,8 @@ use nexus_types::BootHandoverInfo;
 pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     // 1. Hardware Architecture Initialization (COM1 Serial, GDT, TSS, IDT)
     arch::init_arch();
+    #[cfg(feature = "hardening-tests")]
+    hardening::install_panic_exit_hook();
 
     serial_println!("============================================================");
     serial_println!("  Nexus OS - Unified PE32+ / ELF64 Process Executive (Phase 3) ");
@@ -178,7 +180,28 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     serial_println!("[*] Milestone 4: Windows NT Driver Compatibility Validation (Ring 0)...");
     serial_println!("------------------------------------------------------------");
 
-    driver_host::validate_nt_driver_subsystem();
+    let report = driver_host::validate_nt_driver_subsystem();
+
+    // Markers are derived from the evidence counters, not printed unconditionally (FP1).
+    // 3 drivers: reloc_driver, nexus_driver, standard_wdm.
+    assert_eq!(
+        report.lifecycles_verified, 3,
+        "driver lifecycle evidence missing"
+    );
+    assert!(
+        report.wx_pages_verified >= 3 * 4,
+        "driver PTE W^X evidence missing"
+    );
+    serial_println!("NEXUS_CHECK:driver-wx:PASS");
+    serial_println!(
+        "NEXUS_DRIVER_WX:pages_verified={}",
+        report.wx_pages_verified
+    );
+    serial_println!("NEXUS_CHECK:driver-lifecycle:PASS");
+    serial_println!(
+        "NEXUS_DRIVER_LIFECYCLE:drivers={}:heap_balanced=true:pool_balanced=true:devices_deleted=true",
+        report.lifecycles_verified
+    );
 
     serial_println!("============================================================");
     serial_println!(" NEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0");

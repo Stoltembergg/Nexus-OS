@@ -167,6 +167,16 @@ pub extern "win64" fn exception_dispatch_handler(frame: &mut ExceptionFrame) {
     if is_user && !matches!(frame.vector, 2 | 8 | 18) {
         crate::task::trigger_user_abort(frame.vector as i32);
     }
+    // A Ring 0 trap is unrecoverable. Under the QEMU hardening suite, report it as a
+    // failure exit code instead of halting until the runner times out (M8).
+    #[cfg(all(
+        feature = "hardening-tests",
+        any(target_os = "uefi", target_os = "none")
+    ))]
+    if !is_user {
+        serial_println!("NEXUS_RING0_TRAP: vector={}", frame.vector);
+        crate::hardening::exit_failure(crate::hardening::EXIT_CODE_RING0_TRAP);
+    }
     #[cfg(any(target_os = "uefi", target_os = "none"))]
     unsafe {
         core::arch::asm!("cli; 2: hlt; jmp 2b", options(noreturn));
