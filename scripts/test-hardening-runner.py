@@ -10,7 +10,7 @@ spec.loader.exec_module(runner)
 
 class RunnerTests(unittest.TestCase):
     def serial(self):
-        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in runner.CHECKS) + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\n'
+        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in runner.CHECKS) + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\n'
 
     def test_complete_protocol_requires_success_exit(self):
         runner.validate(33, self.serial())

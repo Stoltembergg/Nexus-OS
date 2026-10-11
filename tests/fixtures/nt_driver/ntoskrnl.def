@@ -1,0 +1,12 @@
+LIBRARY NTOSKRNL.EXE
+EXPORTS
+    DbgPrint
+    IoCreateDevice
+    IoDeleteDevice
+    IoCreateSymbolicLink
+    IoDeleteSymbolicLink
+    IoCompleteRequest
+    KeGetCurrentIrql
+    KeRaiseIrql
+    KeLowerIrql
+    RtlInitUnicodeString

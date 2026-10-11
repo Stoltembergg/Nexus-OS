@@ -353,9 +353,18 @@ impl AddressSpace {
     }
     /// Only for owned kernel tables, before user address spaces borrow branches.
     pub fn protect_kernel_code(&mut self, va: VirtualAddress) -> Result<(), VmmError> {
+        self.protect_kernel_page(va, PageTableFlags::PRESENT)
+    }
+
+    /// Set supervisor page permissions (e.g. PRESENT | WRITABLE for RW or PRESENT for RX).
+    pub fn protect_kernel_page(
+        &mut self,
+        va: VirtualAddress,
+        flags: PageTableFlags,
+    ) -> Result<(), VmmError> {
         #[cfg(not(any(target_os = "uefi", target_os = "none")))]
         {
-            let _ = va;
+            let _ = (va, flags);
             Err(VmmError::UnsupportedPlatform)
         }
         #[cfg(any(target_os = "uefi", target_os = "none"))]
@@ -382,7 +391,7 @@ impl AddressSpace {
             if !entry.is_present() || entry.is_user() {
                 return Err(VmmError::NotMapped);
             }
-            entry.set(entry.physical_address(), PageTableFlags::PRESENT);
+            entry.set(entry.physical_address(), flags | PageTableFlags::PRESENT);
             Self::invalidate_tlb(va);
             Ok(())
         }

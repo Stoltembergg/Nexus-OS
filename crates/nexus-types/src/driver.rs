@@ -1,35 +1,32 @@
-//! Windows Driver Model (WDM / NT Kernel) Architecture Types.
+//! Windows NT Kernel Driver Model (WDM / KMDF) Architectural Structures.
 //!
-//! Provides fundamental data structures for loading, initializing, and dispatching
-//! Windows NT kernel-mode drivers (`.sys` files) on bare-metal or simulated environments.
+//! Provides fundamental data structures, function pointer signatures, and constants
+//! matching the 64-bit Windows NT Kernel driver binary interface.
 
 extern crate alloc;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 
-/// Major function dispatch indices in Windows NT (`IRP_MJ_*`).
-pub const IRP_MJ_CREATE: usize = 0x00;
-pub const IRP_MJ_CREATE_NAMED_PIPE: usize = 0x01;
-pub const IRP_MJ_CLOSE: usize = 0x02;
-pub const IRP_MJ_READ: usize = 0x03;
-pub const IRP_MJ_WRITE: usize = 0x04;
-pub const IRP_MJ_QUERY_INFORMATION: usize = 0x05;
-pub const IRP_MJ_SET_INFORMATION: usize = 0x06;
-pub const IRP_MJ_FLUSH_BUFFERS: usize = 0x09;
-pub const IRP_MJ_QUERY_VOLUME_INFORMATION: usize = 0x0A;
-pub const IRP_MJ_DIRECTORY_CONTROL: usize = 0x0C;
-pub const IRP_MJ_DEVICE_CONTROL: usize = 0x0E;
-pub const IRP_MJ_INTERNAL_DEVICE_CONTROL: usize = 0x0F;
-pub const IRP_MJ_SHUTDOWN: usize = 0x10;
-pub const IRP_MJ_CLEANUP: usize = 0x12;
-pub const IRP_MJ_POWER: usize = 0x16;
-pub const IRP_MJ_SYSTEM_CONTROL: usize = 0x17;
-pub const IRP_MJ_DEVICE_CHANGE: usize = 0x18;
-pub const IRP_MJ_PNP: usize = 0x1B;
-pub const IRP_MJ_MAXIMUM_FUNCTION: usize = 0x1B;
-
 /// Standard NT Driver Subsystem identifier in PE headers (`IMAGE_SUBSYSTEM_NATIVE`).
 pub const IMAGE_SUBSYSTEM_NATIVE: u16 = 1;
+
+/// NT IRQL Constants
+pub type Kirql = u8;
+pub const PASSIVE_LEVEL: Kirql = 0;
+pub const APC_LEVEL: Kirql = 1;
+pub const DISPATCH_LEVEL: Kirql = 2;
+pub const HIGH_LEVEL: Kirql = 31;
+
+/// Standard NT Status Codes
+pub const STATUS_SUCCESS: i32 = 0x0000_0000;
+pub const STATUS_INVALID_PARAMETER: i32 = -1073741811; // 0xC000000D
+pub const STATUS_NOT_IMPLEMENTED: i32 = -1073741822; // 0xC0000002
+pub const STATUS_BUFFER_TOO_SMALL: i32 = -1073741789; // 0xC0000023
+
+/// Test IOCTL Codes
+pub const IOCTL_NEXUS_GET_VERSION: u32 = 0x8000_2000;
+pub const IOCTL_NEXUS_ECHO: u32 = 0x8000_2004;
+pub const IOCTL_NEXUS_RAISE_IRQL_TEST: u32 = 0x8000_2008;
 
 /// Unicode String structure used across the Windows NT Kernel (`UNICODE_STRING`).
 #[repr(C)]
@@ -120,6 +117,36 @@ pub struct DriverObject {
     pub major_function: [Option<DriverDispatchFn>; IRP_MJ_MAXIMUM_FUNCTION + 1],
 }
 
+pub const IRP_MJ_CREATE: usize = 0x00;
+pub const IRP_MJ_CREATE_NAMED_PIPE: usize = 0x01;
+pub const IRP_MJ_CLOSE: usize = 0x02;
+pub const IRP_MJ_READ: usize = 0x03;
+pub const IRP_MJ_WRITE: usize = 0x04;
+pub const IRP_MJ_QUERY_INFORMATION: usize = 0x05;
+pub const IRP_MJ_SET_INFORMATION: usize = 0x06;
+pub const IRP_MJ_QUERY_EA: usize = 0x07;
+pub const IRP_MJ_SET_EA: usize = 0x08;
+pub const IRP_MJ_FLUSH_BUFFERS: usize = 0x09;
+pub const IRP_MJ_QUERY_VOLUME_INFORMATION: usize = 0x0a;
+pub const IRP_MJ_SET_VOLUME_INFORMATION: usize = 0x0b;
+pub const IRP_MJ_DIRECTORY_CONTROL: usize = 0x0c;
+pub const IRP_MJ_FILE_SYSTEM_CONTROL: usize = 0x0d;
+pub const IRP_MJ_DEVICE_CONTROL: usize = 0x0e;
+pub const IRP_MJ_INTERNAL_DEVICE_CONTROL: usize = 0x0f;
+pub const IRP_MJ_SHUTDOWN: usize = 0x10;
+pub const IRP_MJ_LOCK_CONTROL: usize = 0x11;
+pub const IRP_MJ_CLEANUP: usize = 0x12;
+pub const IRP_MJ_CREATE_MAILSLOT: usize = 0x13;
+pub const IRP_MJ_QUERY_SECURITY: usize = 0x14;
+pub const IRP_MJ_SET_SECURITY: usize = 0x15;
+pub const IRP_MJ_POWER: usize = 0x16;
+pub const IRP_MJ_SYSTEM_CONTROL: usize = 0x17;
+pub const IRP_MJ_DEVICE_CHANGE: usize = 0x18;
+pub const IRP_MJ_QUERY_QUOTA: usize = 0x19;
+pub const IRP_MJ_SET_QUOTA: usize = 0x1a;
+pub const IRP_MJ_PNP: usize = 0x1b;
+pub const IRP_MJ_MAXIMUM_FUNCTION: usize = 0x1b;
+
 impl Default for DriverObject {
     fn default() -> Self {
         Self {
@@ -193,16 +220,39 @@ pub struct IoStatusBlock {
     pub information: usize,
 }
 
+/// Parameters union in Windows NT I/O Stack Location.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ParametersDeviceIoControl {
+    pub output_buffer_length: u32,
+    pub input_buffer_length: u32,
+    pub io_control_code: u32,
+    pub _padding: u32,
+    pub type3_input_buffer: *mut c_void,
+}
+
+impl Default for ParametersDeviceIoControl {
+    fn default() -> Self {
+        Self {
+            output_buffer_length: 0,
+            input_buffer_length: 0,
+            io_control_code: 0,
+            _padding: 0,
+            type3_input_buffer: core::ptr::null_mut(),
+        }
+    }
+}
+
 /// Windows NT I/O Stack Location (`IO_STACK_LOCATION`).
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct IoStackLocation {
     pub major_function: u8,
     pub minor_function: u8,
     pub flags: u8,
     pub control: u8,
     pub _padding: u32,
-    pub parameters: [u64; 4],
+    pub parameters: ParametersDeviceIoControl,
     pub device_object: *mut DeviceObject,
     pub file_object: *mut c_void,
     pub completion_routine: *mut c_void,
@@ -217,7 +267,7 @@ impl Default for IoStackLocation {
             flags: 0,
             control: 0,
             _padding: 0,
-            parameters: [0; 4],
+            parameters: ParametersDeviceIoControl::default(),
             device_object: core::ptr::null_mut(),
             file_object: core::ptr::null_mut(),
             completion_routine: core::ptr::null_mut(),

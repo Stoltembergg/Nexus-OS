@@ -6,6 +6,7 @@
 
 #[macro_use]
 pub mod arch;
+pub mod driver_host;
 pub mod framebuffer;
 pub mod mem;
 pub mod syscall;
@@ -171,6 +172,18 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     serial_println!("============================================================");
     serial_println!(" NEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified");
     serial_println!("============================================================");
+
+    // 8. Milestone 4: Windows NT Driver Compatibility Validation (Phase 3.6)
+    serial_println!("------------------------------------------------------------");
+    serial_println!("[*] Milestone 4: Windows NT Driver Compatibility Validation (Ring 0)...");
+    serial_println!("------------------------------------------------------------");
+
+    driver_host::validate_nt_driver_subsystem();
+
+    serial_println!("============================================================");
+    serial_println!(" NEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0");
+    serial_println!("============================================================");
+
     #[cfg(feature = "hardening-tests")]
     hardening::exit_success();
 }
