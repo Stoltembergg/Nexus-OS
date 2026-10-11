@@ -28,7 +28,8 @@ What it does (all outputs go to --out, default build/wdk-abi/):
    the host tests and the QEMU guest embed; `--check-fixtures` requires them to be byte
    identical. Both only with `--cc clang-cl` (deterministic, /Brepro), because the
    committed fixtures are produced by clang-cl + lld-link; MSVC output is
-   checked for link/load/run only.
+   checked independently for link/load/run. --check-reproducible compares two builds
+   made with the selected compiler, without comparing MSVC bytes to clang-cl bytes.
 
 Exit status:
 - infrastructure problems (WDK headers/lib not found, ABI probe does not compile, table
@@ -74,6 +75,8 @@ def find_one(root: Path, pattern: str) -> Path:
 
 
 def wdk_paths(wdk_root: Path, sdk_root: Path | None):
+    wdk_root = wdk_root.resolve()
+    sdk_root = sdk_root.resolve() if sdk_root is not None else None
     ntddk = find_one(wdk_root, 'km/ntddk.h')
     km = ntddk.parent
     inc = km.parent
@@ -212,6 +215,7 @@ def build_abi_table(cc, includes, layout, work: Path):
     probe.write_text('\n'.join(lines))
     obj = work / 'abi_probe.obj'
     res = compile_with_case_shim(cc, includes, probe, obj, True, work)
+    (work / 'abi-compile.log').write_text(res.stdout + res.stderr, encoding='utf-8')
     if res.returncode != 0 or not obj.exists():
         raise Infra(f'ABI probe did not compile with the WDK headers:\n{res.stdout}\n{res.stderr}')
     data = coff_section(obj.read_bytes(), SECTION)
@@ -242,6 +246,7 @@ def rebuild_drivers(cc, includes, lib, work: Path):
                  'wdk_headers': uses_headers, 'compiled': False, 'linked': False,
                  'unresolved_imports': []}
         res = compile_with_case_shim(cc, includes, source, obj, uses_headers, work)
+        (work / f'{name}-compile.log').write_text(res.stdout + res.stderr, encoding='utf-8')
         if res.returncode != 0:
             entry['compile_log'] = (res.stdout + res.stderr)[-4000:]
             if uses_headers:
@@ -250,6 +255,7 @@ def rebuild_drivers(cc, includes, lib, work: Path):
             continue
         entry['compiled'] = True
         res = run(linker_cmd(cc, obj, lib, sys_path), cwd=work)
+        (work / f'{name}-link.log').write_text(res.stdout + res.stderr, encoding='utf-8')
         if res.returncode == 0 and sys_path.exists():
             entry['linked'] = True
             map_path = sys_path.with_suffix('.map')
@@ -458,7 +464,38 @@ def collect_problems(rows, drivers, exports):
                  for d in drivers if d.get('static_lib_code')]
     problems += [f"{d['fixture']}: contains {d['fixture_lib_code_windows']} code windows of ntoskrnl.lib static members"
                  for d in drivers if d.get('fixture_lib_code_windows')]
+    problems += [f"{d['driver']}: same-compiler rebuild differs or failed"
+                 for d in drivers if d.get('reproducible') is False]
     return problems
+
+
+def compare_rebuilds(drivers, repeated):
+    """Compare two builds by the same compiler; never MSVC against clang-cl."""
+    by_name = {d['driver']: d for d in repeated}
+    if len(by_name) != len(repeated) or set(by_name) != {d['driver'] for d in drivers}:
+        raise Infra('same-compiler rebuild has missing/duplicate/unexpected drivers')
+    for d in drivers:
+        other = by_name[d['driver']]
+        d['rebuild_sha256'] = other.get('sha256')
+        d['reproducible'] = bool(d['linked'] and other['linked'] and d.get('sha256')
+                                 and d['sha256'] == other.get('sha256'))
+
+
+def inject_import_error(drivers):
+    """Corrupt only a built output's import name, preserving the PE layout."""
+    original, missing = b'IofCompleteRequest\0', b'NexusMissingExport\0'
+    for d in drivers:
+        if not d['linked']:
+            continue
+        path = Path(d['path'])
+        data = path.read_bytes()
+        if original in data:
+            data = data.replace(original, missing, 1)
+            path.write_bytes(data)
+            d['injected_import'] = missing[:-1].decode()
+            d['sha256'] = hashlib.sha256(data).hexdigest()
+            return
+    raise Infra('--inject-import-error: no built IofCompleteRequest import found')
 
 
 def inject_layout_error(layout, key: str):
@@ -480,11 +517,14 @@ def main():
     ap.add_argument('--out', type=Path, default=REPO / 'build' / 'wdk-abi')
     ap.add_argument('--enforce', action='store_true', help='fail on any ABI mismatch, link/load/run failure, non-ntoskrnl export or fixture drift')
     ap.add_argument('--inject-layout-error', metavar='TYPE.FIELD', help='negative control: shift that Nexus entry by 8 bytes; the run must fail with --enforce')
+    ap.add_argument('--inject-import-error', action='store_true', help='negative control: replace a built import with NexusMissingExport')
+    ap.add_argument('--check-reproducible', action='store_true', help='require two builds with this compiler to have identical driver hashes')
     fx = ap.add_mutually_exclusive_group()
     fx.add_argument('--check-fixtures', action='store_true', help='require the committed .sys fixtures to be byte-identical to the rebuild (clang-cl only)')
     fx.add_argument('--update-fixtures', action='store_true', help='overwrite the committed .sys fixtures with the rebuild (clang-cl only)')
     ap.add_argument('--summary', type=Path, help='append the markdown report to this file (e.g. $GITHUB_STEP_SUMMARY)')
     args = ap.parse_args()
+    args.out = args.out.resolve()
 
     if (args.check_fixtures or args.update_fixtures) and args.cc != 'clang-cl':
         print('[wdk-abi] --check-fixtures/--update-fixtures need --cc clang-cl (the committed fixtures are clang-cl builds)', file=sys.stderr)
@@ -502,6 +542,12 @@ def main():
             inject_layout_error(layout, args.inject_layout_error)
         rows = build_abi_table(args.cc, includes, layout, args.out)
         drivers = rebuild_drivers(args.cc, includes, lib, args.out)
+        if args.check_reproducible:
+            repeated_out = args.out / 'repro'
+            repeated_out.mkdir(exist_ok=True)
+            compare_rebuilds(drivers, rebuild_drivers(args.cc, includes, lib, repeated_out))
+        if args.inject_import_error:
+            inject_import_error(drivers)
         probe_loads(drivers)
         exports = check_exports(lib)
         if args.check_fixtures or args.update_fixtures:
@@ -511,8 +557,9 @@ def main():
         return 1
 
     wdk_desc = f'`{lib.relative_to(args.wdk_root) if lib.is_relative_to(args.wdk_root) else lib}`'
+    problems = collect_problems(rows, drivers, exports)
     report = {'wdk_lib': str(lib), 'compiler': args.cc, 'abi': rows, 'drivers': drivers,
-              'exports': exports, 'enforced': args.enforce}
+              'exports': exports, 'enforced': args.enforce, 'problems': problems}
     (args.out / 'wdk-abi.json').write_text(json.dumps(report, indent=2))
     md = markdown(rows, drivers, wdk_desc, exports)
     (args.out / 'abi-table.md').write_text(md, encoding='utf-8')
@@ -521,7 +568,6 @@ def main():
             f.write(md + '\n')
     print(md)
 
-    problems = collect_problems(rows, drivers, exports)
     mode = 'ENFORCED' if args.enforce else 'report-only'
     print(f'[wdk-abi] {len(problems)} incompatibilities, mode: {mode}')
     for p in problems:
