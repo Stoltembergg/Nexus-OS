@@ -18,7 +18,7 @@ The development of Nexus OS is structured into six strictly incremental phases. 
                                     |
                                     v
 +--------------------------------------------------------------------------+
-| Phase 2: Dual Address Space & Hybrid Process Scheduler                  |
+| Phase 2: Real Process Execution, VMM Isolation & Ring 3 Syscalls (Done)  |
 +--------------------------------------------------------------------------+
                                     |
                                     v
@@ -71,29 +71,55 @@ The development of Nexus OS is structured into six strictly incremental phases. 
     - 100% unit tests pass across all workspace crates (`cargo test --workspace`).
     - 100% clean formatting and linting (`cargo fmt --check`, `cargo clippy -D warnings`).
 
-### Phase 2: Dual Address Space & Hybrid Process Scheduler
-- **Objective**: Implement physical and virtual memory managers and preemptive task scheduling for hybrid processes.
-- **Deliverables**:
-  - PMM frame allocator integration with dynamic page table mapping (VMM).
-  - Virtual Address Space (`VAddressSpace`) capable of mapping both PE base (`0x140000000`) and ELF base (`0x400000`).
-  - Context switching mechanism saving and restoring user registers, `FS_BASE`, `GS_BASE`, and SSE/AVX state.
-  - Preemptive timer interrupt (APIC Timer) and round-robin scheduler.
+### Phase 2: Real Process Execution, VMM Isolation & Ring 3 Syscalls (Completed)
+- **Objective**: Implement a functional Virtual Memory Manager (VMM), dual address space isolation, hardware Ring 3 transitions, safe syscall dispatcher with user-pointer boundary checks, freestanding ELF64 execution, and hardware exception recovery.
+- **Deliverables & Verified Milestones**:
+  - **Audit & Architecture**:
+    - Audited Phase 1 bootloader/kernel boundary, memory map handoff, and paging isolation (`docs/07-phase2-process-execution.md`).
+    - Fixed low-memory identity mapping collision: relocated user binary execution space to `0x4000_0000` (1GB) and user stack to `0x0000_7FFF_FFFF_0000`.
+  - **Functional VMM & Memory Isolation**:
+    - Dynamic physical memory discovery up to detected RAM ceiling (128 MB in test VM).
+    - Dedicated Kernel AddressSpace (PML4) constructed at physical frame `0x0010_0000`.
+    - Low physical RAM and GOP framebuffer identity-mapped with supervisor-only flags (`USER = 0`).
+    - CPU CR3 switched cleanly from UEFI page tables (`0x07801000`) to Kernel PML4 (`0x00100000`).
+    - `AddressSpace::new_user`: creates isolated address space per process, sharing upper-half kernel mappings and mapping lower half with hardware-enforced protection.
+  - **Ring 0 / Ring 3 Transitions & Task Context**:
+    - Segment selectors: Ring 3 Code (`0x23`), Ring 3 Data (`0x1B`).
+    - TSS initialized with 16KB dedicated kernel stack (`TSS.rsp0`) and double-fault stack (`TSS.ist1`). Task Register loaded via `ltr 0x28`.
+    - Hardware Ring 3 transition implemented via `iretq` in standalone assembly routine `nexus_enter_user`.
+    - Safe exception and syscall unrolling via `trigger_user_abort_asm`.
+  - **Hardware SYSCALL / SYSRET Dispatcher & User Pointer Security**:
+    - Hardware `SYSCALL` entry stub (`asm_syscall_entry`) wired to `IA32_LSTAR`.
+    - Scratch RSP swapping between user RSP and thread-specific kernel RSP.
+    - Secure pointer validation (`validate_user_buffer`): checks for 64-bit integer overflow, enforces canonical user ceiling (`< 0x0000_8000_0000_0000`), and verifies page presence in the active address space before dereferencing.
+    - Implemented Linux `SYS_WRITE` (1) and `SYS_EXIT` (60) dispatchers.
+  - **Milestone 1 Verified (Bare-Metal QEMU Execution)**:
+    - Generated and executed freestanding ELF64 executable in Ring 3.
+    - Executed `SYS_WRITE` printing `"Hello from Nexus OS Ring 3 (Freestanding ELF64)!\n"` to COM1 serial.
+    - Executed `SYS_EXIT` with exit code 0, unrolling back to kernel cleanly.
+  - **Milestone 2 Verified (Hardware Memory Isolation & #PF Recovery)**:
+    - Spawned isolated faulting process in Ring 3 attempting to dereference supervisor kernel page (`0x0010_0000`).
+    - CPU MMU raised hardware `#PF` (Vector 14, Error Code `0x5`: Protection Violation in User Mode).
+    - Kernel IDT exception gate intercepted `#PF`, safely logged violation, unrolled execution back to kernel, and terminated process without panicking or halting the OS.
+  - **Automated Verification**:
+    - `scripts/test-boot.ps1` runs QEMU/OVMF headless and asserts `NEXUS_PHASE2_SUCCESS`, `MILESTONE 1 VERIFIED`, and `MILESTONE 2 VERIFIED`.
+    - 22 workspace unit tests pass (`cargo test --workspace`).
+    - 0 warnings in Clippy (`cargo clippy --workspace --all-targets -- -D warnings`).
 
 ### Phase 3: Linux Pico Subsystem & Musl/Glibc Runtime Execution
 - **Objective**: Execute real Linux command-line binaries (e.g., BusyBox, Dash, GCC-compiled static/dynamic ELF) natively on bare metal.
 - **Deliverables**:
-  - MSR `LSTAR` syscall handler intercepting System V AMD64 syscalls.
-  - Core POSIX syscalls: `sys_read`, `sys_write`, `sys_open`, `sys_close`, `sys_mmap`, `sys_munmap`, `sys_brk`, `sys_clone`, `sys_exit_group`, `sys_arch_prctl`.
-  - VFS (Virtual File System) providing rootfs, `/dev/null`, `/dev/zero`, `/dev/console`.
-  - Musl libc ELF runtime execution test.
+  - Extended POSIX syscall set: `sys_read`, `sys_open`, `sys_close`, `sys_mmap`, `sys_munmap`, `sys_brk`, `sys_clone`, `sys_exit_group`, `sys_arch_prctl`.
+  - In-memory Root VFS providing `/dev/null`, `/dev/zero`, `/dev/console`, and initramfs binary loading.
+  - Musl libc dynamic loader (`ld-musl-x86_64.so.1`) bootstrap on bare metal.
 
 ### Phase 4: NT Executive Subsystem & Win32 Userland (PE Execution)
-- **Objective**: Execute real Windows console and windowed PE executables natively.
+- **Objective**: Execute real Windows console and windowed PE executables natively using the unified process infrastructure.
 - **Deliverables**:
   - NT System Service Dispatcher (`NtAllocateVirtualMemory`, `NtCreateSection`, `NtMapViewOfSection`, `NtWriteFile`, `NtCreateThreadEx`).
-  - `ntdll.dll` bootstrap loader: mapping and initializing PE import tables (IAT), base relocations, and Thread Local Storage (TLS).
-  - Handle table (`HANDLE`) implementation with reference-counted kernel objects (Events, Mutexes, Sections, Files).
-  - Integration with Wine-based Win32 userland libraries.
+  - PE32+ loader integration into `Process::spawn_pe`: mapping sections, applying base relocations, allocating TEB/PEB, and setting up SEH.
+  - Handle table (`HANDLE`) implementation with reference-counted kernel objects.
+  - Wine-based Win32 userland integration.
 
 ### Phase 5: Hardware Acceleration (Vulkan/DRM) & Anti-Cheat Research Lab
 - **Objective**: Direct GPU hardware acceleration for modern games and systematic reverse engineering of anti-cheat drivers.

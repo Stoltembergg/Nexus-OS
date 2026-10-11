@@ -1,13 +1,15 @@
 //! Nexus OS Bare-Metal Kernel Core.
 //!
 //! Provides bare-metal x86_64 architecture initialization (GDT, IDT, exceptions),
-//! Physical Memory Management (PMM), GOP Framebuffer Terminal, and MSR Syscall Routing.
+//! Physical Memory Management (PMM), Virtual Memory Management (VMM),
+//! Process / Thread execution in Ring 3, and Dual-Personality Syscalls.
 
 #[macro_use]
 pub mod arch;
 pub mod framebuffer;
 pub mod mem;
 pub mod syscall;
+pub mod task;
 
 use nexus_types::BootHandoverInfo;
 
@@ -17,12 +19,11 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     arch::init_arch();
 
     serial_println!("============================================================");
-    serial_println!("        Nexus OS - Bare-Metal Kernel Boot (Phase 1)         ");
+    serial_println!("     Nexus OS - Real Process Execution & VMM (Phase 2)      ");
     serial_println!("============================================================");
     serial_println!("[*] CPU Architecture: x86_64 Long Mode (64-bit)");
     serial_println!("[+] Serial COM1 (115200 8N1) Initialized.");
-    serial_println!("[+] GDT and TSS Configured (Ring 0 & Ring 3 Selectors Ready).");
-    serial_println!("[+] IDT Initialized (Architectural Exception Gates Armed).");
+    serial_println!("[+] GDT, TSS (TR loaded), and Architectural Exception Gates Armed.");
 
     // 2. GOP Linear Framebuffer Console Initialization
     framebuffer::CONSOLE.lock().init(boot_info.framebuffer);
@@ -40,7 +41,7 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
         );
     }
 
-    // 3. Physical Memory Manager (PMM)
+    // 3. Physical & Virtual Memory Management (PMM / VMM)
     mem::init_memory(boot_info);
     let (_total_frames, free_frames) = {
         let pmm = mem::pmm::PMM.lock();
@@ -48,17 +49,107 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     };
     let usable_mb = (free_frames * 4096) / (1024 * 1024);
     serial_println!(
-        "[+] PMM Initialized: {} usable frames ({} MB free conventional RAM).",
+        "[+] PMM & VMM Active: {} usable frames ({} MB free RAM). Dedicated Kernel CR3 Armed.",
         free_frames,
         usable_mb
     );
 
-    // 4. SYSCALL / SYSRET MSR Configuration
-    syscall::init_syscall_msrs(0xFFFF_8000_0000_1000);
-    serial_println!("[+] IA32_EFER.SCE & IA32_LSTAR Configured for Dual-Personality Syscalls.");
+    // 4. SYSCALL / SYSRET Hardware MSR Configuration
+    syscall::init_syscall_msrs(task::syscall::asm_syscall_entry as *const () as usize as u64);
+    serial_println!("[+] IA32_EFER.SCE & IA32_LSTAR Configured with Secure Pointer Validation.");
+
+    // 5. Milestone 1: Freestanding ELF64 Process Execution in Ring 3
+    serial_println!("------------------------------------------------------------");
+    serial_println!("[*] Milestone 1: Executing Freestanding ELF64 in Ring 3...");
+    serial_println!("------------------------------------------------------------");
+
+    serial_println!("[*] Generating Ring 3 payload...");
+    let elf_bytes = task::elf_payload::generate_ring3_elf_payload(
+        b"Hello from Nexus OS Ring 3 (Freestanding ELF64)!\n",
+    );
+    serial_println!("[*] Acquiring kernel memory locks...");
+    let mut kernel_as_guard = mem::KERNEL_ADDRESS_SPACE.lock();
+    let kernel_as = kernel_as_guard
+        .as_mut()
+        .expect("Kernel Address Space must be initialized");
+    let mut pmm_guard = mem::pmm::PMM.lock();
+
+    serial_println!("[*] Calling spawn_elf for PID 1...");
+    let mut user_process = task::Process::spawn_elf(
+        nexus_types::ProcessId(1),
+        "init_elf",
+        &elf_bytes,
+        kernel_as,
+        &mut pmm_guard,
+    )
+    .expect("Failed to spawn Ring 3 ELF process");
+
+    drop(kernel_as_guard);
+    drop(pmm_guard);
+
+    serial_println!("[*] Launching user process PID 1 in Ring 3...");
+    let kernel_as_ref = mem::KERNEL_ADDRESS_SPACE.lock();
+    let k_as = kernel_as_ref.as_ref().unwrap();
+    let exit_code =
+        task::run_user_process(&mut user_process, k_as).expect("Failed to execute process");
+    drop(kernel_as_ref);
+
+    if exit_code == 0 {
+        serial_println!(
+            "[+] MILESTONE 1 VERIFIED: Ring 3 ELF64 executed cleanly (Exit Code: {}).",
+            exit_code
+        );
+    } else {
+        serial_println!("[!] MILESTONE 1 FAILED: Unexpected Exit Code {}", exit_code);
+    }
+
+    // 6. Milestone 2: Ring 3 Memory Isolation & #PF Recovery Test
+    serial_println!("------------------------------------------------------------");
+    serial_println!("[*] Milestone 2: Testing Ring 3 Memory Isolation & #PF Recovery...");
+    serial_println!("------------------------------------------------------------");
+
+    let fault_elf_bytes = task::elf_payload::generate_faulting_elf_payload();
+    let mut kernel_as_guard = mem::KERNEL_ADDRESS_SPACE.lock();
+    let kernel_as = kernel_as_guard
+        .as_mut()
+        .expect("Kernel Address Space must be initialized");
+    let mut pmm_guard = mem::pmm::PMM.lock();
+
+    let mut fault_process = task::Process::spawn_elf(
+        nexus_types::ProcessId(2),
+        "fault_test",
+        &fault_elf_bytes,
+        kernel_as,
+        &mut pmm_guard,
+    )
+    .expect("Failed to spawn faulting ELF process");
+
+    drop(kernel_as_guard);
+    drop(pmm_guard);
+
+    let kernel_as_ref = mem::KERNEL_ADDRESS_SPACE.lock();
+    let k_as = kernel_as_ref.as_ref().unwrap();
+    let fault_res = task::run_user_process(&mut fault_process, k_as);
+    drop(kernel_as_ref);
+
+    match fault_res {
+        Err(task::ProcessError::Fault(14)) => {
+            serial_println!(
+                "[+] MILESTONE 2 VERIFIED: Memory isolation caught illegal access (Exception Vector 14: #PF)."
+            );
+        }
+        Err(task::ProcessError::Fault(13)) => {
+            serial_println!(
+                "[+] MILESTONE 2 VERIFIED: Memory isolation caught illegal access (Exception Vector 13: #GP)."
+            );
+        }
+        other => {
+            serial_println!("[!] MILESTONE 2: Outcome: {:?}", other);
+        }
+    }
 
     serial_println!("============================================================");
-    serial_println!("  NEXUS_BOOT_SUCCESS: Kernel Core Initialized and Stable    ");
+    serial_println!(" NEXUS_PHASE2_SUCCESS: Real Process Execution Verified     ");
     serial_println!("============================================================");
 }
 

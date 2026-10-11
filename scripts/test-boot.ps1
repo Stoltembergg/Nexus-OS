@@ -1,17 +1,17 @@
-# Nexus OS - Phase 1 Automated Bare-Metal UEFI Boot Test (PowerShell)
-# Runs QEMU with OVMF firmware and verifies bare-metal boot sequence.
+# Nexus OS - Phase 2 Automated Bare-Metal UEFI Boot & Process Execution Test (PowerShell)
+# Runs QEMU with OVMF firmware and verifies bare-metal boot, Ring 3 ELF64 execution, and memory isolation.
 
 param(
     [string]$QemuPath = "C:\Program Files\qemu\qemu-system-x86_64.exe",
     [string]$OvmfPath = "C:\Program Files\qemu\share\edk2-x86_64-code.fd",
-    [int]$TimeoutSeconds = 10
+    [int]$TimeoutSeconds = 15
 )
 
 $ErrorActionPreference = "Stop"
 $WorkspaceRoot = (Get-Item $PSScriptRoot).Parent.FullName
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "       Nexus OS - Phase 1 Bare-Metal Boot Verification      " -ForegroundColor Cyan
+Write-Host "    Nexus OS - Phase 2 Real Process Execution & VMM Test    " -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Build UEFI Bootloader and Kernel
@@ -37,6 +37,10 @@ $BootDir = Join-Path $EspDir "EFI\BOOT"
 New-Item -ItemType Directory -Path $BootDir -Force | Out-Null
 Copy-Item $EfiSource (Join-Path $BootDir "BOOTX64.EFI") -Force
 
+# Stage startup.nsh so UEFI shell immediately launches our kernel
+$StartupNsh = Join-Path $EspDir "startup.nsh"
+Set-Content -Path $StartupNsh -Value "FS0:`r`n\EFI\BOOT\BOOTX64.EFI`r`n" -NoNewline
+
 if (!(Test-Path $QemuPath)) {
     Write-Error "QEMU binary not found at $QemuPath"
     exit 1
@@ -54,19 +58,19 @@ if (Test-Path $LogFile) {
     Remove-Item $LogFile -Force
 }
 
-# 3. Launch QEMU with Serial Port Redirection
+# 3. Launch QEMU with Direct Firmware Boot and Serial Log Output
 Write-Host "[3/4] Launching QEMU with OVMF UEFI firmware..." -ForegroundColor Yellow
 
 $qemuArgs = @(
     "-drive", "if=pflash,format=raw,readonly=on,file=$StagedOvmf",
-    "-drive", "file=fat:rw:$EspDir,format=raw",
+    "-kernel", $EfiSource,
     "-vga", "std",
     "-display", "none",
-    "-serial", "stdio",
+    "-serial", "file:$LogFile",
     "-no-reboot"
 )
 
-$proc = Start-Process -FilePath $QemuPath -ArgumentList $qemuArgs -RedirectStandardOutput $LogFile -PassThru
+$proc = Start-Process -FilePath $QemuPath -ArgumentList $qemuArgs -PassThru
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $successFound = $false
@@ -75,7 +79,7 @@ while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
     Start-Sleep -Milliseconds 500
     if (Test-Path $LogFile) {
         $content = Get-Content $LogFile -Raw -ErrorAction SilentlyContinue
-        if ($content -and $content -match "NEXUS_BOOT_SUCCESS") {
+        if ($content -and $content -match "NEXUS_PHASE2_SUCCESS") {
             $successFound = $true
             break
         }
@@ -97,14 +101,14 @@ Write-Host "`n--- Serial Log Output ---" -ForegroundColor DarkGray
 Write-Host $logContent -ForegroundColor Gray
 Write-Host "-------------------------`n" -ForegroundColor DarkGray
 
-if ($logContent -match "NEXUS_BOOT_SUCCESS" -and
-    $logContent -match "GDT and TSS Configured" -and
-    $logContent -match "IDT Initialized" -and
+if ($logContent -match "NEXUS_PHASE2_SUCCESS" -and
+    $logContent -match "MILESTONE 1 VERIFIED" -and
+    $logContent -match "MILESTONE 2 VERIFIED" -and
     $logContent -match "GOP Framebuffer Detected" -and
-    $logContent -match "PMM Initialized") {
-    Write-Host "[+] BARE-METAL BOOT TEST PASSED: All Phase 1 kernel components verified." -ForegroundColor Green
+    $logContent -match "PMM & VMM Active") {
+    Write-Host "[+] REAL PROCESS EXECUTION & VMM TEST PASSED: All Phase 2 milestones verified." -ForegroundColor Green
     exit 0
 } else {
-    Write-Error "Test Failed: Expected boot milestones missing from log."
+    Write-Error "Test Failed: Expected Phase 2 boot milestones missing from log."
     exit 1
 }

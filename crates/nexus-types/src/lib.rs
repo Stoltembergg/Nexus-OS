@@ -16,5 +16,5 @@ pub mod status;
 pub use address::{MemoryFlags, PhysicalAddress, VirtualAddress, PAGE_SIZE_2MB, PAGE_SIZE_4KB};
 pub use boot::{BootHandoverInfo, FramebufferInfo, MemoryDescriptor, UefiMemoryType};
 pub use errno::Errno;
-pub use process::{HybridProcessDescriptor, ProcessPersonality};
+pub use process::{HybridProcessDescriptor, ProcessId, ProcessPersonality, ThreadId};
 pub use status::NtStatus;

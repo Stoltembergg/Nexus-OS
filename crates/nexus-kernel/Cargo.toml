@@ -20,6 +20,7 @@ nexus-loader = { workspace = true }
 nexus-abi = { workspace = true }
 bitflags = { workspace = true }
 spin = { workspace = true }
+byteorder = { workspace = true }
 
 [dev-dependencies]
 env_logger = { workspace = true }

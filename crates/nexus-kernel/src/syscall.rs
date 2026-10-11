@@ -15,8 +15,8 @@ pub static KERNEL_SYSCALL_ROUTER: Mutex<Option<SyscallRouter>> = Mutex::new(None
 
 /// Initializes IA32 MSRs for the SYSCALL / SYSRET instructions.
 ///
-/// - `IA32_STAR[63:48]`: User 32/64-bit CS and SS base selectors.
-/// - `IA32_STAR[47:32]`: Kernel CS and SS selectors.
+/// - `IA32_STAR[63:48]`: User 32/64-bit CS and SS base selectors. Base 0x13 -> SS=0x1B, CS=0x23
+/// - `IA32_STAR[47:32]`: Kernel CS and SS selectors. CS=0x08, SS=0x10
 /// - `IA32_LSTAR`: Target RIP for 64-bit mode SYSCALL.
 /// - `IA32_SFMASK`: Low 32 bits of RFLAGS masked during SYSCALL entry.
 /// - `IA32_EFER.SCE`: Must be set to 1 to enable SYSCALL opcode.
@@ -27,8 +27,8 @@ pub fn init_syscall_msrs(syscall_entry_rip: u64) {
         let efer = rdmsr(IA32_EFER_MSR);
         wrmsr(IA32_EFER_MSR, efer | EFER_SCE_BIT);
 
-        // STAR: Kernel CS=0x08, Kernel SS=0x10; User CS32=0x18, User SS=0x20, User CS64=0x28
-        let star: u64 = (0x0023_0008_u64) << 32;
+        // STAR: Kernel CS=0x08, Kernel SS=0x10; User CS/SS base = 0x0013
+        let star: u64 = (0x0013_0008_u64) << 32;
         wrmsr(IA32_STAR_MSR, star);
 
         // LSTAR: 64-bit Syscall Entry Point
