@@ -1,5 +1,8 @@
 # Nexus OS: System Architecture Specification
 
+> **2026-10-11 status notice:** Sections 1–5 are the original architectural target and contain illustrative pseudocode, not a list of implemented APIs. The decisions and implementation boundaries in **Section 6** and the [updated roadmap](04-roadmap-and-phases.md) supersede earlier claims of completed portability, graphics, drivers or runtimes.
+
+
 This document details the internal architecture of **Nexus OS**, specifying the memory manager, object and handle manager, dual-personality process model, system call dispatcher, and binary loaders.
 
 ---
@@ -136,7 +139,7 @@ pub extern "C" fn sys_call_handler(context: &mut TrapFrame) {
 }
 ```
 
-This single hardware entry point ensures zero overhead for personality switching. There is no VM exit, no hypervisor interception, and no userland context switch overhead.
+This is the intended direct system-call entry design. Performance and security of full personality switching are **not measured or proven** here. No hypervisor is planned as an application runtime; QEMU/OVMF may be used for kernel development.
 
 ---
 
@@ -148,3 +151,41 @@ To avoid reinventing solved engineering domains, Nexus OS reuses proven open-sou
 2. **Wine Userland Components**: User-space libraries (`kernel32`, `user32`, `gdi32`, `advapi32`) under LGPLv2.1 to provide the Win32 application surface.
 3. **Mesa Graphics Stack**: Open-source Vulkan drivers (RADV, ANV, NVK) ported to communicate with the Nexus OS DRM driver layer.
 4. **Musl libc**: Clean, standards-compliant, lightweight C library for native Linux ELF binaries.
+
+---
+
+## 6. Current binding decisions and integration contracts (2026-10-11)
+
+### 6.1 Exactly one kernel, two execution personalities
+
+Nexus uses one custom hybrid executive (Rust/C) for CPU, virtual memory, scheduling, interrupts, I/O, security and device ownership. NT PE32+ and Linux ELF64 are **ABI and process personalities**, not a Windows guest and not a second Linux kernel. Only minimal freestanding PE32+/ELF64 guest execution has been demonstrated; normal Win32, glibc/musl and Linux applications require major missing runtime and kernel work.
+
+### 6.2 NT driver boundary
+
+A specific MSVC-compiled WDM `.sys` fixture ran in QEMU Ring 0 with `DriverEntry`, IRP dispatch and unload ([Phase 3.6 report](11-phase3.6-nt-driver-validation.md)). It is **not** proof of general modern WDM/KMDF or `vgk.sys` support. Security debt includes current RWX driver pages, a limited IRQL model, and incomplete independent-driver conformance. The [kernel hardening report](09-phase3.5-kernel-hardening.md) remains an open gate; Phase 3.7 addresses driver runtime hardening.
+
+### 6.3 Graphics and Nexus Shell
+
+The official **Nexus Shell** choice is:
+- **Niri** — Wayland compositor/layout/window behavior, adapted to Nexus platform APIs.
+- **iNiR Shell** — desktop UX on **Quickshell / Qt / QML**, adapted to Nexus IPC, settings, notification, input, display and runtime facilities.
+- **Nexus display/graphics interface** — buffer allocation/sharing, synchronization, display modes, hardware input, window transport and later GPU command submission.
+
+Niri/iNiR must remain clearly sourced with upstream-compatible licensing obligations; an existing Linux Niri/Smithay/Qt binary cannot be assumed to run unchanged on the Nexus kernel. Windows GUI apps require a separate USER32/GDI/Win32 integration layer.
+
+The already demonstrated fallback is UEFI GOP framebuffer and text console. Proposed QEMU **virtio-gpu** is a development milestone, **not** the physical GPU strategy. Real AMD/Intel/NVIDIA support depends on explicit investigation and implementations of modesetting, PCIe, MMIO, VRAM, DMA, IOMMU, firmware, queues and security. Mesa Vulkan ICDs are generally userspace but depend on kernel device interfaces. Do not promise a simple drop-in DRM/KMS port or userspace-only GPU solution; see [DRM feasibility review](06-drm-kms-feasibility-revision.md).
+
+### 6.4 Update and boot reliability contract
+
+[Nexus Update](12-nexus-update-architecture.md) is a required planned service, **not implemented**. The kernel and boot manager must expose versioned, tested interfaces:
+- a durable block-device/GPT/VFS API with flush/readback and bounded writes;
+- an authenticated, versioned UEFI boot-control structure representing A/B slots, boot attempts and last-known-good;
+- an offline recovery path that operates before the shell;
+- a Ring 3 update agent with permission-limited service APIs and a separate health confirmation process;
+- no write to the currently running system slot, no accidental loss of user data, no confirmation based only on a printed serial marker.
+
+GitHub Releases provides delivery, **not trust**. Independent signed metadata and a pinned Nexus trust root are required. U0 specification begins now; a signed offline A/B update (U1–U3) must pass before any sustained physical SSD installation. GitHub transport (U4) waits on real TLS/network; iNiR integration (U5) waits on the shell.
+
+### 6.5 Acceptance and verification
+
+All proposed contracts must have independent tests and failure-injection cases. Host unit tests != guest Ring 0 tests != physical hardware tests. Project completion ultimately requires **legitimate League of Legends and VALORANT games with accepted Vanguard** on Nexus OS without a Windows installation/VM/bypass. Riot approval and the proprietary anti-cheat trust policy remain external unproven factors. Do not claim a reliable release before those gates are satisfied.
