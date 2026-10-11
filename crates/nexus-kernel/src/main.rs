@@ -31,6 +31,6 @@ pub extern "C" fn _start(boot_info: *const BootHandoverInfo) -> ! {
 fn main() {
     println!("Nexus OS Kernel Binary (compiled for host test/inspection).");
     println!(
-        "To build for bare-metal target: cargo build -p nexus-kernel --target x86_64-unknown-none"
+        "Validated boot target: cargo build -p nexus-boot --target x86_64-unknown-uefi (see docs/09-phase3.5-kernel-hardening.md for standalone no_std limitations)"
     );
 }

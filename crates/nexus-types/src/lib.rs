@@ -7,15 +7,22 @@
 //! - Process personalities and address space layouts
 //! - UEFI Boot Handoff protocol structures
 //! - Windows TEB / PEB and Thread CPU Contexts
+//! - Windows NT Kernel Driver Objects (WDM / `.sys` abstractions)
 
 pub mod address;
 pub mod boot;
+pub mod driver;
 pub mod errno;
 pub mod process;
 pub mod status;
 
 pub use address::{MemoryFlags, PhysicalAddress, VirtualAddress, PAGE_SIZE_2MB, PAGE_SIZE_4KB};
 pub use boot::{BootHandoverInfo, FramebufferInfo, MemoryDescriptor, UefiMemoryType};
+pub use driver::{
+    DeviceObject, DriverDispatchFn, DriverEntryFn, DriverObject, DriverUnloadFn, IoStackLocation,
+    IoStatusBlock, Irp, UnicodeString, IMAGE_SUBSYSTEM_NATIVE, IRP_MJ_CLOSE, IRP_MJ_CREATE,
+    IRP_MJ_DEVICE_CONTROL, IRP_MJ_MAXIMUM_FUNCTION, IRP_MJ_READ, IRP_MJ_WRITE,
+};
 pub use errno::Errno;
 pub use process::{
     CpuContext, HybridProcessDescriptor, Peb, ProcessId, ProcessPersonality, Teb, ThreadId,

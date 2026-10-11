@@ -3,7 +3,9 @@
 [![CI Status](https://github.com/hybrid-os/nexus-os/actions/workflows/ci.yml/badge.svg)](https://github.com/hybrid-os/nexus-os/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0_OR_MIT-blue.svg)](LICENSE)
 [![Target](https://img.shields.io/badge/Target-x86__64_UEFI-orange.svg)](#architecture)
-[![Phase](https://img.shields.io/badge/Phase-0:_PoC_&_Architecture-green.svg)](docs/04-roadmap-and-phases.md)
+[![Phase](https://img.shields.io/badge/Phase-3.5_Hardening_in_progress-orange.svg)](docs/09-phase3.5-kernel-hardening.md)
+
+> Current status: Phase 3.5 hardening is in progress. QEMU validates a bounded freestanding PE32+/ELF64 execution profile; general Windows/Linux application compatibility, preemption and SMP remain unvalidated. See [the hardening report](docs/09-phase3.5-kernel-hardening.md) for evidence and limitations.
 
 **Nexus OS** is an open-source, research-driven hybrid operating system designed to execute Windows (PE/PE32+) and Linux (ELF64) binaries natively on x86_64 bare-metal hardware without relying on virtual machines or emulation layers.
 
@@ -105,12 +107,12 @@ Existing solutions either:
 ## 4. Quickstart & Phase 0 Verification
 
 ### Prerequisites
-- **Rust Toolchain**: `stable` (1.80+ recommended, x86_64 target)
+- **Rust Toolchain**: `stable` (1.88+ recommended, x86_64 target)
 - **CMake**: 3.20+
 - **Git**
 
 ### Running the Proof of Concept
-The Phase 0 PoC demonstrates parsing, validation, virtual memory mapping, and simulated dual ABI syscall dispatching for both a native Windows PE32+ binary and an ELF64 Linux binary:
+The Phase 0 PoC demonstrates parsing, validation, virtual memory mapping, and dual ABI routing inspection (unimplemented services return errors) for both a native Windows PE32+ binary and an ELF64 Linux binary:
 
 ```bash
 # Clone the repository
@@ -128,10 +130,11 @@ cargo run -p nexus-poc
 
 ## 5. Development Phases
 
-- [x] **Phase 0: Specifications, Architecture & Minimal Dual Loader PoC** (Current)
-- [ ] **Phase 1: Bare-Metal UEFI Bootloader & Microkernel Initialization** (Paging, GDT, IDT, Serial)
-- [ ] **Phase 2: Hybrid Process Scheduler & Memory Subsystem** (VAD / mm_struct unified core)
-- [ ] **Phase 3: Linux Pico Subsystem & Musl/Glibc Runtime** (POSIX VFS, tty, signals)
+- [x] **Phase 0: Specifications, Architecture & Minimal Dual Loader PoC** (host parsing/routing only)
+- [x] **Phase 1: Bare-Metal UEFI Bootloader & Microkernel Initialization** (Paging, GDT, IDT, Serial)
+- [x] **Phase 2: Hybrid Process Scheduler & Memory Subsystem** (VAD / mm_struct unified core)
+- [x] **Phase 3: Unified Freestanding PE32+/ELF64 Execution & Cooperative Scheduling** (see validation limits)
+- [ ] **Phase 3.5: Kernel Hardening & Architecture Validation** ([in progress](docs/09-phase3.5-kernel-hardening.md))
 - [ ] **Phase 4: NT Executive Subsystem & Win32 Userland** (Relocations, IAT, DirectX/Vulkan bridge)
 - [ ] **Phase 5: Native GPU Acceleration (DRM/KMS) & Anti-Cheat Research Lab**
 

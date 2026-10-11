@@ -105,7 +105,7 @@ pub fn generate_ring3_pe_payload() -> Vec<u8> {
 
     // 6. Machine Code in .text (Offset 0x1000)
     let msg_va = PE_IMAGE_BASE + PE_DATA_RVA as u64;
-    let msg_len: u64 = 46; // "Hello from Nexus OS Ring 3 (Windows PE32+)!\n\0" length
+    let msg_len = b"Hello from Nexus OS Ring 3 (Windows PE32+)!\n".len() as u64;
 
     let mut code: Vec<u8> = Vec::new();
 
@@ -125,6 +125,9 @@ pub fn generate_ring3_pe_payload() -> Vec<u8> {
 
     // mov [rsp + 0x30], rdx
     code.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 0x30]);
+    code.extend_from_slice(&[0x48, 0xB8]); // IOSB in writable .data
+    code.extend_from_slice(&(msg_va + 0x100).to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x28]);
 
     // mov qword ptr [rsp + 0x38], msg_len
     code.extend_from_slice(&[0x48, 0xC7, 0x44, 0x24, 0x38]);
@@ -136,6 +139,7 @@ pub fn generate_ring3_pe_payload() -> Vec<u8> {
     code.extend_from_slice(&[0x49, 0xC7, 0xC0]);
     code.extend_from_slice(&(msg_len as u32).to_le_bytes());
     // mov eax, 0x0008 (NtWriteFile)
+    code.extend_from_slice(&[0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9]); // Event/APC = NULL
     code.extend_from_slice(&[0xB8, 0x08, 0x00, 0x00, 0x00]);
     // syscall
     code.extend_from_slice(&[0x0F, 0x05]);
@@ -165,7 +169,7 @@ pub fn generate_ring3_pe_payload() -> Vec<u8> {
     pe[0x1000..0x1000 + code.len()].copy_from_slice(&code);
 
     // 7. Data in .data (Offset 0x2000)
-    let msg = b"Hello from Nexus OS Ring 3 (Windows PE32+)!\n\0";
+    let msg = b"Hello from Nexus OS Ring 3 (Windows PE32+)!\n";
     pe[0x2000..0x2000 + msg.len()].copy_from_slice(msg);
 
     // 8. Relocations in .reloc (Offset 0x3000)

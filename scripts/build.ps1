@@ -9,6 +9,7 @@ $ErrorActionPreference = "Stop"
 if ($Clean) {
     Write-Host "[*] Cleaning build artifacts..." -ForegroundColor Yellow
     cargo clean
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
 $buildFlags = @("--workspace", "--all-targets")
@@ -18,5 +19,6 @@ if ($Release) {
 
 Write-Host "[*] Compiling Nexus OS workspace..." -ForegroundColor Cyan
 cargo build @buildFlags
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "[+] Build completed successfully!" -ForegroundColor Green

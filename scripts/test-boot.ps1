@@ -1,118 +1,27 @@
-# Nexus OS - Phase 3 Automated Bare-Metal UEFI Boot & Unified Process Execution Test (PowerShell)
-# Runs QEMU with OVMF firmware and verifies bare-metal boot, interleaved Ring 3 Windows PE32+ & Linux ELF64 execution, and memory isolation.
-
+# Phase 3.5: external binaries and real guest assertions + QEMU exit.
 param(
     [string]$QemuPath = "C:\Program Files\qemu\qemu-system-x86_64.exe",
     [string]$OvmfPath = "C:\Program Files\qemu\share\edk2-x86_64-code.fd",
-    [int]$TimeoutSeconds = 20
+    [int]$TimeoutSeconds = 60,
+    [int]$MemoryMB = 128,
+    [string]$Cpu = "qemu64",
+    [string]$ZigPath = "",
+    [switch]$Release
 )
-
 $ErrorActionPreference = "Stop"
 $WorkspaceRoot = (Get-Item $PSScriptRoot).Parent.FullName
-
-Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "  Nexus OS - Phase 3 Unified PE32+ / ELF64 Execution Test   " -ForegroundColor Cyan
-Write-Host "============================================================" -ForegroundColor Cyan
-
-# 1. Build UEFI Bootloader and Kernel
-Write-Host "[1/4] Compiling nexus-boot for x86_64-unknown-uefi..." -ForegroundColor Yellow
 Push-Location $WorkspaceRoot
 try {
-    cargo build -p nexus-boot --target x86_64-unknown-uefi
-} finally {
-    Pop-Location
-}
-
-$EfiSource = Join-Path $WorkspaceRoot "target\x86_64-unknown-uefi\debug\bootx64.efi"
-if (!(Test-Path $EfiSource)) {
-    Write-Error "bootx64.efi not found at $EfiSource"
-    exit 1
-}
-
-# 2. Stage EFI System Partition (ESP) and Firmware
-Write-Host "[2/4] Staging ESP directory structure and OVMF firmware..." -ForegroundColor Yellow
-$BuildDir = Join-Path $WorkspaceRoot "build"
-$EspDir = Join-Path $BuildDir "esp"
-$BootDir = Join-Path $EspDir "EFI\BOOT"
-New-Item -ItemType Directory -Path $BootDir -Force | Out-Null
-Copy-Item $EfiSource (Join-Path $BootDir "BOOTX64.EFI") -Force
-
-# Stage startup.nsh so UEFI shell immediately launches our kernel
-$StartupNsh = Join-Path $EspDir "startup.nsh"
-Set-Content -Path $StartupNsh -Value "FS0:`r`n\EFI\BOOT\BOOTX64.EFI`r`n" -NoNewline
-
-if (!(Test-Path $QemuPath)) {
-    Write-Error "QEMU binary not found at $QemuPath"
-    exit 1
-}
-if (!(Test-Path $OvmfPath)) {
-    Write-Error "OVMF firmware not found at $OvmfPath"
-    exit 1
-}
-
-$StagedOvmf = Join-Path $BuildDir "ovmf.fd"
-Copy-Item $OvmfPath $StagedOvmf -Force
-
-$LogFile = Join-Path $BuildDir "boot_serial.log"
-if (Test-Path $LogFile) {
-    Remove-Item $LogFile -Force
-}
-
-# 3. Launch QEMU with Direct Firmware Boot and Serial Log Output
-Write-Host "[3/4] Launching QEMU with OVMF UEFI firmware..." -ForegroundColor Yellow
-
-$qemuArgs = @(
-    "-drive", "if=pflash,format=raw,readonly=on,file=$StagedOvmf",
-    "-kernel", $EfiSource,
-    "-vga", "std",
-    "-display", "none",
-    "-serial", "file:$LogFile",
-    "-no-reboot"
-)
-
-$proc = Start-Process -FilePath $QemuPath -ArgumentList $qemuArgs -PassThru
-
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-$successFound = $false
-
-while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-    Start-Sleep -Milliseconds 500
-    if (Test-Path $LogFile) {
-        $content = Get-Content $LogFile -Raw -ErrorAction SilentlyContinue
-        if ($content -and $content -match "NEXUS_PHASE3_SUCCESS") {
-            $successFound = $true
-            break
-        }
+    if (!$ZigPath -and (Test-Path "build/tools/zig-windows-x86_64-0.13.0/zig.exe")) {
+        $ZigPath = "build/tools/zig-windows-x86_64-0.13.0/zig.exe"
     }
-}
-
-Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-
-# 4. Verify Boot Output
-Write-Host "[4/4] Validating Serial Boot Logs..." -ForegroundColor Yellow
-
-if (!(Test-Path $LogFile)) {
-    Write-Error "Test Failed: No serial output log was generated."
-    exit 1
-}
-
-$logContent = Get-Content $LogFile -Raw
-Write-Host "`n--- Serial Log Output ---" -ForegroundColor DarkGray
-Write-Host $logContent -ForegroundColor Gray
-Write-Host "-------------------------`n" -ForegroundColor DarkGray
-
-if ($logContent -match "NEXUS_PHASE3_SUCCESS" -and
-    $logContent -match "Ring 3 WinPE" -and
-    $logContent -match "Ring 3 Linux" -and
-    $logContent -match "NtYieldExecution invoked by Windows PE32\+ task" -and
-    $logContent -match "SYS_SCHED_YIELD invoked by Linux ELF64 task" -and
-    $logContent -match "NtTerminateProcess invoked" -and
-    $logContent -match "Linux sys_exit invoked" -and
-    $logContent -match "MILESTONE 1 & 2 VERIFIED" -and
-    $logContent -match "MILESTONE 3 VERIFIED") {
-    Write-Host "[+] UNIFIED PE32+ / ELF64 EXECUTION TEST PASSED: All Phase 3 milestones verified." -ForegroundColor Green
-    exit 0
-} else {
-    Write-Error "Test Failed: Expected Phase 3 boot milestones missing from log."
-    exit 1
-}
+    $fixtureArgs = @("scripts/build-fixtures.py")
+    if ($ZigPath) { $fixtureArgs += @("--zig", $ZigPath) }
+    python @fixtureArgs
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $testArgs = @("scripts/test-hardening.py", "--qemu", $QemuPath, "--ovmf", $OvmfPath,
+        "--timeout", $TimeoutSeconds, "--ram", $MemoryMB, "--cpu", $Cpu)
+    if ($Release) { $testArgs += "--release" }
+    python @testArgs
+    exit $LASTEXITCODE
+} finally { Pop-Location }

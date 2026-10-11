@@ -17,6 +17,49 @@ mod tests {
     use nexus_types::process::ProcessPersonality;
 
     #[test]
+    fn standalone_router_never_claims_unimplemented_os_operations_succeeded() {
+        for nr in [
+            linux::SYS_READ,
+            linux::SYS_WRITE,
+            linux::SYS_OPEN,
+            linux::SYS_CLOSE,
+            linux::SYS_BRK,
+            linux::SYS_MMAP,
+            linux::SYS_ARCH_PRCTL,
+            linux::SYS_EXIT,
+            linux::SYS_SCHED_YIELD,
+        ] {
+            let mut ctx = RegisterContext {
+                rax: nr,
+                rdx: 32,
+                ..Default::default()
+            };
+            assert_eq!(
+                dispatch_linux_syscall(&mut ctx),
+                nexus_types::Errno::ENOSYS.as_ret_val()
+            );
+        }
+        for nr in [
+            nt::NT_ALLOCATE_VIRTUAL_MEMORY,
+            nt::NT_FREE_VIRTUAL_MEMORY,
+            nt::NT_WRITE_FILE,
+            nt::NT_TERMINATE_PROCESS,
+            nt::NT_YIELD_EXECUTION,
+            nt::NT_CLOSE,
+            nt::NT_QUERY_SYSTEM_INFORMATION,
+        ] {
+            let mut ctx = RegisterContext {
+                rax: nr as u64,
+                ..Default::default()
+            };
+            assert_eq!(
+                dispatch_nt_syscall(&mut ctx),
+                nexus_types::NtStatus::STATUS_NOT_IMPLEMENTED
+            );
+        }
+    }
+
+    #[test]
     fn test_dual_router_dispatch() {
         let mut router = SyscallRouter::new();
 
@@ -35,7 +78,10 @@ mod tests {
         win_ctx.r9 = 0x1000; // 4KB commit
 
         router.dispatch(&win_pers, &mut win_ctx);
-        assert_eq!(win_ctx.rax, 0); // STATUS_SUCCESS
+        assert_eq!(
+            win_ctx.rax,
+            nexus_types::NtStatus::STATUS_NOT_IMPLEMENTED.0 as u64
+        );
         assert_eq!(router.nt_call_count, 1);
 
         // 2. Dispatch Linux syscall
@@ -52,7 +98,7 @@ mod tests {
         lin_ctx.rdx = 14; // "Hello, World!\n"
 
         router.dispatch(&lin_pers, &mut lin_ctx);
-        assert_eq!(lin_ctx.rax, 14); // 14 bytes written
+        assert_eq!(lin_ctx.rax as i64, nexus_types::Errno::ENOSYS.as_ret_val());
         assert_eq!(router.linux_call_count, 1);
     }
 }

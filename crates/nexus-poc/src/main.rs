@@ -133,7 +133,10 @@ fn main() {
     win_ctx.r9 = 0x2000; // Commit 8KB
     router.dispatch(&win_proc.personality, &mut win_ctx);
     println!("      -> Result: NTSTATUS = {:#010X}", win_ctx.rax);
-    assert_eq!(win_ctx.rax, 0); // STATUS_SUCCESS
+    assert_eq!(
+        win_ctx.rax,
+        nexus_types::NtStatus::STATUS_NOT_IMPLEMENTED.0 as u64
+    );
 
     // Simulated Linux thread issues sys_write
     println!("  [*] Simulating Linux thread syscall: sys_write (ID 1)");
@@ -143,8 +146,11 @@ fn main() {
     lin_ctx.rsi = 0x0040_1000; // buffer pointer
     lin_ctx.rdx = 24; // length
     router.dispatch(&lin_proc.personality, &mut lin_ctx);
-    println!("      -> Result: Written bytes = {}", lin_ctx.rax);
-    assert_eq!(lin_ctx.rax, 24);
+    println!(
+        "      -> Result: syscall return (unimplemented) = {:#X}",
+        lin_ctx.rax
+    );
+    assert_eq!(lin_ctx.rax as i64, nexus_types::Errno::ENOSYS.as_ret_val());
 
     // Simulated Linux thread issues sys_brk
     println!("  [*] Simulating Linux thread syscall: sys_brk (ID 12)");
@@ -152,8 +158,11 @@ fn main() {
     brk_ctx.rax = linux::SYS_BRK;
     brk_ctx.rdi = 0x0041_0000; // Expand heap break
     router.dispatch(&lin_proc.personality, &mut brk_ctx);
-    println!("      -> Result: New heap break = {:#X}", brk_ctx.rax);
-    assert_eq!(brk_ctx.rax, 0x0041_0000);
+    println!(
+        "      -> Result: syscall return (unimplemented) = {:#X}",
+        brk_ctx.rax
+    );
+    assert_eq!(brk_ctx.rax as i64, nexus_types::Errno::ENOSYS.as_ret_val());
 
     println!("\n============================================================");
     println!("  Phase 0 PoC Verification Summary:                         ");
@@ -165,7 +174,7 @@ fn main() {
         "  - Total Linux Pico Syscalls Handled:     {}",
         router.linux_call_count
     );
-    println!("  - Hybrid Binary Execution Status: PASS                    ");
+    println!("  - Parsing and routing checks: PASS (no execution)                    ");
     println!("============================================================");
 }
 
@@ -194,12 +203,15 @@ mod tests {
         let mut win_ctx = RegisterContext::new();
         win_ctx.rax = nt::NT_ALLOCATE_VIRTUAL_MEMORY as u64;
         router.dispatch(&loaded_pe.personality, &mut win_ctx);
-        assert_eq!(win_ctx.rax, 0);
+        assert_eq!(
+            win_ctx.rax,
+            nexus_types::NtStatus::STATUS_NOT_IMPLEMENTED.0 as u64
+        );
 
         let mut lin_ctx = RegisterContext::new();
         lin_ctx.rax = linux::SYS_WRITE;
         lin_ctx.rdx = 10;
         router.dispatch(&loaded_elf.personality, &mut lin_ctx);
-        assert_eq!(lin_ctx.rax, 10);
+        assert_eq!(lin_ctx.rax as i64, nexus_types::Errno::ENOSYS.as_ret_val());
     }
 }

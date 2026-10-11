@@ -8,6 +8,7 @@ impl EfiStatus {
     pub const SUCCESS: Self = Self(0);
     pub const BUFFER_TOO_SMALL: Self = Self(0x8000000000000005);
     pub const NOT_FOUND: Self = Self(0x800000000000000E);
+    pub const INVALID_PARAMETER: Self = Self(0x8000000000000002);
 
     pub fn is_success(&self) -> bool {
         self.0 == 0
@@ -25,6 +26,12 @@ pub struct EfiGuid {
 }
 
 impl EfiGuid {
+    pub const LOADED_IMAGE_GUID: Self = Self::new(
+        0x5b1b31a1,
+        0x9562,
+        0x11d2,
+        [0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b],
+    );
     pub const fn new(data1: u32, data2: u16, data3: u16, data4: [u8; 8]) -> Self {
         Self {
             data1,
@@ -110,7 +117,11 @@ pub struct EfiBootServices {
     pub install_protocol_interface: usize,
     pub reinstall_protocol_interface: usize,
     pub uninstall_protocol_interface: usize,
-    pub handle_protocol: usize,
+    pub handle_protocol: unsafe extern "win64" fn(
+        EfiHandle,
+        *const EfiGuid,
+        *mut *mut core::ffi::c_void,
+    ) -> EfiStatus,
     pub void_reserved: usize,
     pub register_protocol_notify: usize,
     pub locate_handle: usize,
@@ -137,6 +148,23 @@ pub struct EfiBootServices {
         registration: *const core::ffi::c_void,
         interface: *mut *mut core::ffi::c_void,
     ) -> EfiStatus,
+}
+
+#[repr(C)]
+pub struct EfiLoadedImageProtocol {
+    pub revision: u32,
+    pub parent_handle: EfiHandle,
+    pub system_table: *mut EfiSystemTable,
+    pub device_handle: EfiHandle,
+    pub file_path: *mut core::ffi::c_void,
+    pub reserved: *mut core::ffi::c_void,
+    pub load_options_size: u32,
+    pub load_options: *mut core::ffi::c_void,
+    pub image_base: *mut core::ffi::c_void,
+    pub image_size: u64,
+    pub image_code_type: u32,
+    pub image_data_type: u32,
+    pub unload: usize,
 }
 
 #[repr(C)]

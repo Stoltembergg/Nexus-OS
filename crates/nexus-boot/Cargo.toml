@@ -17,3 +17,6 @@ test = false
 [dependencies]
 nexus-types = { workspace = true }
 nexus-kernel = { workspace = true }
+
+[features]
+hardening-tests = ["nexus-kernel/hardening-tests"]

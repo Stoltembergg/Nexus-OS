@@ -41,6 +41,7 @@ pub struct LoadedImage {
 impl LoadedImage {
     /// Loads a PE32+ image into virtual segments from raw file bytes.
     pub fn from_pe(pe: &PeImage, raw_bytes: &[u8]) -> Result<Self, LoaderError> {
+        pe.validate(raw_bytes)?;
         let mut segments = Vec::new();
 
         // 1. Headers segment (mapped at image_base)
@@ -61,12 +62,12 @@ impl LoadedImage {
         // 2. Map each section
         for sec in &pe.sections {
             let sec_va = VirtualAddress::new(pe.image_base + sec.virtual_address as u64);
-            let mem_size =
-                ((sec.virtual_size as u64 + PAGE_SIZE_4KB - 1) & !(PAGE_SIZE_4KB - 1)) as usize;
+            let mem_size = ((sec.virtual_size.max(sec.size_of_raw_data) as u64 + PAGE_SIZE_4KB - 1)
+                & !(PAGE_SIZE_4KB - 1)) as usize;
             let mut sec_data = vec![0u8; mem_size];
 
             let raw_offset = sec.pointer_to_raw_data as usize;
-            let raw_size = (sec.size_of_raw_data as usize).min(sec.virtual_size as usize);
+            let raw_size = sec.size_of_raw_data as usize;
 
             if raw_size > 0 && raw_offset + raw_size <= raw_bytes.len() {
                 sec_data[..raw_size].copy_from_slice(&raw_bytes[raw_offset..raw_offset + raw_size]);
@@ -98,6 +99,7 @@ impl LoadedImage {
 
     /// Loads an ELF64 image into virtual segments from raw file bytes.
     pub fn from_elf(elf: &ElfImage, raw_bytes: &[u8]) -> Result<Self, LoaderError> {
+        elf.validate(raw_bytes)?;
         let mut segments = Vec::new();
         let mut min_va = u64::MAX;
         let mut max_va = 0u64;

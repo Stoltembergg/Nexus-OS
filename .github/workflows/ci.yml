@@ -2,67 +2,87 @@ name: Nexus OS CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [main]
   pull_request:
-    branches: [ "main" ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   check-and-test:
-    name: Build, Lint and Test (Multi-Platform)
+    name: Host checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-uefi
           components: clippy, rustfmt
-
-      - name: Cache Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Format Check
+      - name: Format
         run: cargo fmt --all -- --check
+      - name: Host check and lint
+        run: |
+          cargo check --locked --workspace --all-targets
+          cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Host regressions (not Ring 3 evidence)
+        run: |
+          cargo test --locked --workspace
+          cargo test --locked --workspace --release
+      - name: Phase 0 parsing and routing inspection
+        run: cargo run --locked -p nexus-poc
+      - name: Real UEFI build
+        run: cargo build --locked -p nexus-boot --target x86_64-unknown-uefi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Runner negative tests
+        run: python scripts/test-hardening-runner.py
 
-      - name: Cargo Check
-        run: cargo check --workspace --all-targets
-
-      - name: Clippy Linting
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run Unit & Integration Tests
-        run: cargo test --workspace --verbose
-
-      - name: Run Phase 0 PoC Loader
-        run: cargo run -p nexus-poc
-
-      - name: Build Bare-Metal UEFI Bootloader & Kernel
-        run: cargo build -p nexus-boot --target x86_64-unknown-uefi
-
-      - name: Install QEMU and OVMF (Ubuntu)
-        if: runner.os == 'Linux'
+  kernel-hardening:
+    name: QEMU/OVMF (${{ matrix.ram }} MiB, ${{ matrix.cpu }}, ${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {ram: 128, cpu: qemu64, profile: debug}
+          - {ram: 256, cpu: max, profile: debug}
+          - {ram: 512, cpu: max, profile: release}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+          components: clippy
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install external compiler, linker and emulator
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf
-
-      - name: Run Phase 3 Bare-Metal UEFI Boot Test (Ubuntu)
-        if: runner.os == 'Linux'
-        run: bash scripts/test-boot.sh
+          sudo apt-get install -y clang lld qemu-system-x86 ovmf
+      - name: Compile independent C/assembly PE32+ and ELF64 images
+        run: python3 scripts/build-fixtures.py
+      - name: Lint actual privileged target
+        run: cargo clippy --locked -p nexus-boot --target x86_64-unknown-uefi --features hardening-tests -- -D warnings
+      - name: Execute isolation, context, traps, OOM and stress assertions
+        shell: bash
+        run: |
+          args=()
+          if [[ "${{ matrix.profile }}" == "release" ]]; then args+=(--release); fi
+          python3 scripts/test-hardening.py --ram "${{ matrix.ram }}" --cpu "${{ matrix.cpu }}" --timeout 60 "${args[@]}"
+      - name: Preserve raw evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hardening-${{ matrix.ram }}-${{ matrix.cpu }}-${{ matrix.profile }}
+          path: |
+            build/hardening-*/serial.log
+            build/hardening-*/qemu.log
+            build/hardening-*/result.json
+            build/fixtures/manifest.json

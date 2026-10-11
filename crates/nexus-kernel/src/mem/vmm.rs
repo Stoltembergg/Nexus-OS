@@ -26,6 +26,9 @@ pub enum VmmError {
     AlreadyMapped,
     NotMapped,
     InvalidAddress,
+    UnsupportedPlatform,
+    HugePageUnsupported,
+    ActiveAddressSpace,
 }
 
 /// A 64-bit Page Table Entry (PTE).
@@ -107,124 +110,178 @@ pub fn page_indices(vaddr: VirtualAddress) -> (usize, usize, usize, usize) {
     (pml4, pdpt, pd, pt)
 }
 
-/// An isolated Virtual Address Space backed by a 4-level PML4 page table hierarchy.
+pub const fn is_canonical(addr: u64) -> bool {
+    addr < 0x0000_8000_0000_0000 || addr >= 0xFFFF_8000_0000_0000
+}
+
 #[derive(Debug, Clone, Copy)]
+pub struct PageMapping {
+    pub physical_address: PhysicalAddress,
+    pub flags: PageTableFlags,
+}
+
+/// Owns its page tables. Borrowed kernel branches are copied before modification.
+#[derive(Debug)]
 pub struct AddressSpace {
     pml4_frame: PhysicalAddress,
+    tables: Vec<PhysicalAddress>,
 }
 
 impl AddressSpace {
-    /// Creates a new address space by allocating a root PML4 table.
     pub fn new(pmm: &mut PhysicalMemoryManager) -> Result<Self, VmmError> {
-        let pml4_frame = pmm
-            .allocate_zeroed_frame()
-            .ok_or(VmmError::FrameAllocationFailed)?;
-        Ok(Self { pml4_frame })
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+        {
+            let _ = pmm;
+            Err(VmmError::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
+        {
+            let mut tables = Vec::new();
+            tables
+                .try_reserve(1)
+                .map_err(|_| VmmError::FrameAllocationFailed)?;
+            let frame = pmm
+                .allocate_zeroed_frame()
+                .ok_or(VmmError::FrameAllocationFailed)?;
+            tables.push(frame);
+            Ok(Self {
+                pml4_frame: frame,
+                tables,
+            })
+        }
     }
-
-    /// Creates an AddressSpace wrapper around an existing root PML4 frame.
+    /// Non-owning view of a live, identity-mapped root.
     pub const fn from_pml4(pml4_frame: PhysicalAddress) -> Self {
-        Self { pml4_frame }
+        Self {
+            pml4_frame,
+            tables: Vec::new(),
+        }
     }
-
     pub fn pml4_frame(&self) -> PhysicalAddress {
         self.pml4_frame
     }
 
-    /// Creates an isolated user address space that preserves supervisor kernel mapping
-    /// but restricts Ring 3 permissions exclusively to user-allocated pages.
-    pub fn new_user(
-        kernel_as: &AddressSpace,
-        pmm: &mut PhysicalMemoryManager,
-    ) -> Result<Self, VmmError> {
-        let user_as = Self::new(pmm)?;
-
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+    pub fn new_user(kernel: &Self, pmm: &mut PhysicalMemoryManager) -> Result<Self, VmmError> {
+        let space = Self::new(pmm)?;
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
         unsafe {
-            let kernel_pml4 = &*(kernel_as.pml4_frame.as_u64() as *const PageTable);
-            let user_pml4 = &mut *(user_as.pml4_frame.as_u64() as *mut PageTable);
-
-            // 1. Share upper-half kernel mappings (indices 256..512)
-            for i in 256..512 {
-                if kernel_pml4.entries[i].is_present() {
-                    user_pml4.entries[i] = kernel_pml4.entries[i];
-                }
-            }
-
-            // 2. Clone PML4 entry 0 (lower half) using a dedicated PDPT to protect kernel tables
-            if kernel_pml4.entries[0].is_present() {
-                let kernel_pdpt =
-                    &*(kernel_pml4.entries[0].physical_address().as_u64() as *const PageTable);
-                let user_pdpt_frame = pmm
-                    .allocate_zeroed_frame()
-                    .ok_or(VmmError::FrameAllocationFailed)?;
-                let user_pdpt = &mut *(user_pdpt_frame.as_u64() as *mut PageTable);
-
-                // Copy kernel PD entries into user PDPT (Supervisor-only: USER = 0)
-                for j in 0..512 {
-                    user_pdpt.entries[j] = kernel_pdpt.entries[j];
-                }
-
-                user_pml4.entries[0] = PageTableEntry::new(
-                    user_pdpt_frame,
-                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER,
+            let source = &*(kernel.pml4_frame.as_u64() as *const PageTable);
+            let dest = &mut *(space.pml4_frame.as_u64() as *mut PageTable);
+            for (dst, src) in dest.entries.iter_mut().zip(source.entries.iter()) {
+                *dst = PageTableEntry::new(
+                    src.physical_address(),
+                    src.flags() & !PageTableFlags::USER,
                 );
             }
         }
-
-        #[cfg(any(not(target_arch = "x86_64"), test))]
-        {
-            let _ = (kernel_as, pmm);
-        }
-
-        Ok(user_as)
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+        let _ = kernel;
+        Ok(space)
     }
 
-    /// Maps a 4KB virtual page to a physical frame with specified flags.
-    /// Allocates intermediate page tables (PDPT, PD, PT) as needed.
     pub fn map_page(
         &mut self,
-        vaddr: VirtualAddress,
-        paddr: PhysicalAddress,
+        va: VirtualAddress,
+        pa: PhysicalAddress,
         flags: PageTableFlags,
         pmm: &mut PhysicalMemoryManager,
     ) -> Result<(), VmmError> {
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(vaddr);
-
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+        if !va.is_page_aligned()
+            || pa.as_u64() & 4095 != 0
+            || !is_canonical(va.as_u64())
+            || pa.as_u64() >= (1 << 52)
+            || flags.contains(PageTableFlags::HUGE_PAGE)
+            || (flags.contains(PageTableFlags::USER)
+                && (va.as_u64() == 0
+                    || va.as_u64() >= 0x0000_8000_0000_0000
+                    || flags.contains(PageTableFlags::GLOBAL)
+                    || (flags.contains(PageTableFlags::WRITABLE)
+                        && !flags.contains(PageTableFlags::NO_EXECUTE))))
+        {
+            return Err(VmmError::InvalidAddress);
+        }
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+        {
+            let _ = pmm;
+            Err(VmmError::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
         unsafe {
-            let pml4 = &mut *(self.pml4_frame.as_u64() as *mut PageTable);
-
-            // Level 4 -> Level 3 (PDPT)
-            let pdpt_frame = Self::get_or_create_subtable(&mut pml4.entries[pml4_idx], flags, pmm)?;
-            let pdpt = &mut *(pdpt_frame.as_u64() as *mut PageTable);
-
-            // Level 3 -> Level 2 (PD)
-            let pd_frame = Self::get_or_create_subtable(&mut pdpt.entries[pdpt_idx], flags, pmm)?;
-            let pd = &mut *(pd_frame.as_u64() as *mut PageTable);
-
-            // Level 2 -> Level 1 (PT)
-            let pt_frame = Self::get_or_create_subtable(&mut pd.entries[pd_idx], flags, pmm)?;
-            let pt = &mut *(pt_frame.as_u64() as *mut PageTable);
-
-            let pte = &mut pt.entries[pt_idx];
-            if pte.is_present() {
+            // Shadowing a live kernel identity mapping is forbidden.
+            if self.mapping(va).is_some() {
                 return Err(VmmError::AlreadyMapped);
             }
-
-            pte.set(paddr, flags | PageTableFlags::PRESENT);
-            Self::invalidate_tlb(vaddr);
-            Ok(())
-        }
-
-        #[cfg(any(not(target_arch = "x86_64"), test))]
-        {
-            let _ = (pml4_idx, pdpt_idx, pd_idx, pt_idx, paddr, flags, pmm);
+            let indices = page_indices(va);
+            let mut table_frame = self.pml4_frame;
+            let owned_before = self.tables.len();
+            let mut changed = [(
+                core::ptr::null_mut::<PageTableEntry>(),
+                PageTableEntry::ZERO,
+            ); 3];
+            let mut count = 0;
+            for idx in [indices.0, indices.1, indices.2] {
+                let table = &mut *(table_frame.as_u64() as *mut PageTable);
+                let entry = &mut table.entries[idx];
+                let old = *entry;
+                match self.private_subtable(entry, flags, pmm) {
+                    Ok(frame) => {
+                        changed[count] = (entry as *mut _, old);
+                        count += 1;
+                        table_frame = frame;
+                    }
+                    Err(err) => {
+                        for (ptr, old) in changed[..count].iter().rev() {
+                            **ptr = *old;
+                        }
+                        for frame in self.tables.drain(owned_before..) {
+                            pmm.free_frame(frame);
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+            let table = &mut *(table_frame.as_u64() as *mut PageTable);
+            table.entries[indices.3].set(pa, flags | PageTableFlags::PRESENT);
+            Self::invalidate_tlb(va);
             Ok(())
         }
     }
 
-    /// Maps a contiguous range of physical memory to identical virtual addresses (identity mapping).
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    unsafe fn private_subtable(
+        &mut self,
+        entry: &mut PageTableEntry,
+        flags: PageTableFlags,
+        pmm: &mut PhysicalMemoryManager,
+    ) -> Result<PhysicalAddress, VmmError> {
+        if entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return Err(VmmError::HugePageUnsupported);
+        }
+        if !entry.is_present() || !self.tables.contains(&entry.physical_address()) {
+            self.tables
+                .try_reserve(1)
+                .map_err(|_| VmmError::FrameAllocationFailed)?;
+            let frame = pmm
+                .allocate_zeroed_frame()
+                .ok_or(VmmError::FrameAllocationFailed)?;
+            if entry.is_present() {
+                core::ptr::copy_nonoverlapping(
+                    entry.physical_address().as_u64() as *const PageTable,
+                    frame.as_u64() as *mut PageTable,
+                    1,
+                );
+            }
+            self.tables.push(frame);
+            entry.set(frame, PageTableFlags::PRESENT | PageTableFlags::WRITABLE);
+        }
+        let mut parent_flags = entry.flags();
+        if flags.contains(PageTableFlags::USER) {
+            parent_flags |= PageTableFlags::USER;
+        }
+        entry.set(entry.physical_address(), parent_flags);
+        Ok(entry.physical_address())
+    }
+
     pub fn map_identity(
         &mut self,
         start: PhysicalAddress,
@@ -232,124 +289,161 @@ impl AddressSpace {
         flags: PageTableFlags,
         pmm: &mut PhysicalMemoryManager,
     ) -> Result<(), VmmError> {
-        let pages = (length as u64).div_ceil(PAGE_SIZE_4KB);
-        let base = start.as_u64();
-
-        for i in 0..pages {
-            let addr = base + i * PAGE_SIZE_4KB;
-            let vaddr = VirtualAddress::new(addr);
-            let paddr = PhysicalAddress::new(addr);
-            self.map_page(vaddr, paddr, flags, pmm)?;
+        if length == 0 {
+            return Ok(());
+        }
+        let base = start.as_u64() & !4095;
+        let end = start
+            .as_u64()
+            .checked_add(length as u64)
+            .and_then(|v| v.checked_add(4095))
+            .ok_or(VmmError::InvalidAddress)?
+            & !4095;
+        for addr in (base..end).step_by(PAGE_SIZE_4KB as usize) {
+            self.map_page(
+                VirtualAddress::new(addr),
+                PhysicalAddress::new(addr),
+                flags,
+                pmm,
+            )?;
         }
         Ok(())
     }
 
-    /// Translates a virtual address to physical address in this address space.
-    pub fn translate(&self, vaddr: VirtualAddress) -> Option<PhysicalAddress> {
-        let (pml4_idx, pdpt_idx, pd_idx, pt_idx) = page_indices(vaddr);
-        let offset = vaddr.as_u64() & (PAGE_SIZE_4KB - 1);
-
-        #[cfg(all(target_arch = "x86_64", not(test)))]
-        unsafe {
-            let pml4 = &*(self.pml4_frame.as_u64() as *const PageTable);
-            let pml4e = &pml4.entries[pml4_idx];
-            if !pml4e.is_present() {
-                return None;
-            }
-
-            let pdpt = &*(pml4e.physical_address().as_u64() as *const PageTable);
-            let pdpte = &pdpt.entries[pdpt_idx];
-            if !pdpte.is_present() {
-                return None;
-            }
-
-            let pd = &*(pdpte.physical_address().as_u64() as *const PageTable);
-            let pde = &pd.entries[pd_idx];
-            if !pde.is_present() {
-                return None;
-            }
-
-            let pt = &*(pde.physical_address().as_u64() as *const PageTable);
-            let pte = &pt.entries[pt_idx];
-            if !pte.is_present() {
-                return None;
-            }
-
-            Some(PhysicalAddress::new(
-                pte.physical_address().as_u64() + offset,
-            ))
+    /// Reports effective USER/WRITE/NX permission across all four paging levels.
+    pub fn mapping(&self, va: VirtualAddress) -> Option<PageMapping> {
+        if !is_canonical(va.as_u64()) || self.pml4_frame.as_u64() == 0 {
+            return None;
         }
-
-        #[cfg(any(not(target_arch = "x86_64"), test))]
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
         {
-            let _ = (pml4_idx, pdpt_idx, pd_idx, pt_idx);
-            Some(PhysicalAddress::new(vaddr.as_u64() + offset))
+            None
+        }
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
+        unsafe {
+            let idx = page_indices(va);
+            let mut frame = self.pml4_frame;
+            let mut effective =
+                PageTableFlags::PRESENT | PageTableFlags::USER | PageTableFlags::WRITABLE;
+            for i in [idx.0, idx.1, idx.2, idx.3] {
+                let table = &*(frame.as_u64() as *const PageTable);
+                let entry = table.entries[i];
+                if !entry.is_present() || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    return None;
+                }
+                if !entry.is_user() {
+                    effective.remove(PageTableFlags::USER);
+                }
+                if !entry.is_writable() {
+                    effective.remove(PageTableFlags::WRITABLE);
+                }
+                if entry.flags().contains(PageTableFlags::NO_EXECUTE) {
+                    effective.insert(PageTableFlags::NO_EXECUTE);
+                }
+                frame = entry.physical_address();
+            }
+            Some(PageMapping {
+                physical_address: PhysicalAddress::new(frame.as_u64() + (va.as_u64() & 4095)),
+                flags: effective,
+            })
         }
     }
-
-    /// Switches the CPU's CR3 register to this address space.
+    pub fn translate(&self, va: VirtualAddress) -> Option<PhysicalAddress> {
+        self.mapping(va).map(|m| m.physical_address)
+    }
+    /// Only for owned kernel tables, before user address spaces borrow branches.
+    pub fn protect_kernel_code(&mut self, va: VirtualAddress) -> Result<(), VmmError> {
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+        {
+            let _ = va;
+            Err(VmmError::UnsupportedPlatform)
+        }
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
+        unsafe {
+            if !va.is_page_aligned() {
+                return Err(VmmError::InvalidAddress);
+            }
+            let idx = page_indices(va);
+            let mut frame = self.pml4_frame;
+            for i in [idx.0, idx.1, idx.2] {
+                if !self.tables.contains(&frame) {
+                    return Err(VmmError::InvalidAddress);
+                }
+                let entry = (&*(frame.as_u64() as *const PageTable)).entries[i];
+                if !entry.is_present() || entry.flags().contains(PageTableFlags::HUGE_PAGE) {
+                    return Err(VmmError::NotMapped);
+                }
+                frame = entry.physical_address();
+            }
+            if !self.tables.contains(&frame) {
+                return Err(VmmError::InvalidAddress);
+            }
+            let entry = &mut (&mut *(frame.as_u64() as *mut PageTable)).entries[idx.3];
+            if !entry.is_present() || entry.is_user() {
+                return Err(VmmError::NotMapped);
+            }
+            entry.set(entry.physical_address(), PageTableFlags::PRESENT);
+            Self::invalidate_tlb(va);
+            Ok(())
+        }
+    }
     pub fn switch_to(&self) {
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
         unsafe {
-            let cr3 = self.pml4_frame.as_u64();
-            core::arch::asm!(
-                "mov cr3, {}",
-                in(reg) cr3,
-                options(nostack, preserves_flags)
-            );
+            core::arch::asm!("mov cr3, {}", in(reg) self.pml4_frame.as_u64(), options(nostack, preserves_flags));
         }
     }
-
-    /// Invalidates TLB entry for the given virtual address via INVLPG.
-    #[inline]
-    pub fn invalidate_tlb(vaddr: VirtualAddress) {
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+    pub fn is_active(&self) -> bool {
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
         unsafe {
-            let addr = vaddr.as_u64();
-            core::arch::asm!(
-                "invlpg [{}]",
-                in(reg) addr,
-                options(nostack, preserves_flags)
-            );
+            let root: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) root, options(nomem, nostack, preserves_flags));
+            root & !4095 == self.pml4_frame.as_u64()
         }
-        #[cfg(test)]
-        let _ = vaddr;
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+        {
+            false
+        }
     }
-
-    #[cfg(all(target_arch = "x86_64", not(test)))]
-    fn get_or_create_subtable(
-        entry: &mut PageTableEntry,
-        flags: PageTableFlags,
-        pmm: &mut PhysicalMemoryManager,
-    ) -> Result<PhysicalAddress, VmmError> {
-        if entry.is_present() {
-            // If the new mapping requires USER or WRITABLE, propagate it to parent entries
-            let mut parent_flags = entry.flags();
-            if flags.contains(PageTableFlags::USER) {
-                parent_flags |= PageTableFlags::USER;
-            }
-            if flags.contains(PageTableFlags::WRITABLE) {
-                parent_flags |= PageTableFlags::WRITABLE;
-            }
-            entry.set(entry.physical_address(), parent_flags);
-            Ok(entry.physical_address())
-        } else {
-            let frame = pmm
-                .allocate_zeroed_frame()
-                .ok_or(VmmError::FrameAllocationFailed)?;
-            let mut parent_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
-            if flags.contains(PageTableFlags::USER) {
-                parent_flags |= PageTableFlags::USER;
-            }
-            entry.set(frame, parent_flags);
-            Ok(frame)
+    /// The caller must switch away first. Process owns leaf frames separately.
+    pub fn destroy(&mut self, pmm: &mut PhysicalMemoryManager) -> Result<(), VmmError> {
+        if self.is_active() {
+            return Err(VmmError::ActiveAddressSpace);
         }
+        for frame in self.tables.drain(..).rev() {
+            pmm.free_frame(frame);
+        }
+        self.pml4_frame = PhysicalAddress::new(0);
+        Ok(())
+    }
+    pub fn invalidate_tlb(va: VirtualAddress) {
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) va.as_u64(), options(nostack, preserves_flags));
+        }
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+        let _ = va;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_does_not_invent_mappings_or_success() {
+        let mut pmm = PhysicalMemoryManager::new();
+        let mut space = AddressSpace::from_pml4(PhysicalAddress::new(0x1000));
+        assert_eq!(space.translate(VirtualAddress::new(0x400123)), None);
+        assert!(space
+            .map_page(
+                VirtualAddress::new(0x400000),
+                PhysicalAddress::new(0x2000),
+                PageTableFlags::USER,
+                &mut pmm
+            )
+            .is_err());
+    }
 
     #[test]
     fn test_page_table_entry_encoding() {

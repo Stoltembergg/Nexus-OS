@@ -14,6 +14,7 @@ pub mod task;
 use nexus_types::BootHandoverInfo;
 
 /// Main kernel entry point invoked immediately following UEFI ExitBootServices.
+#[cfg(any(target_os = "uefi", target_os = "none"))]
 pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     // 1. Hardware Architecture Initialization (COM1 Serial, GDT, TSS, IDT)
     arch::init_arch();
@@ -57,6 +58,9 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     // 4. SYSCALL / SYSRET Hardware MSR Configuration
     syscall::init_syscall_msrs(task::syscall::asm_syscall_entry as *const () as usize as u64);
     serial_println!("[+] IA32_EFER.SCE & IA32_LSTAR Configured with Secure Pointer Validation.");
+
+    #[cfg(feature = "hardening-tests")]
+    hardening::run();
 
     // 5. Milestone 1: Spawning Windows PE32+ and Linux ELF64 Processes
     serial_println!("------------------------------------------------------------");
@@ -109,6 +113,10 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     let kernel_as_ref = mem::KERNEL_ADDRESS_SPACE.lock();
     let k_as = kernel_as_ref.as_ref().unwrap();
     scheduler.run_all(k_as).expect("Scheduler execution failed");
+    assert!(scheduler
+        .processes
+        .iter()
+        .all(|p| p.outcome == Some(task::RunOutcome::Exit(0))));
     drop(kernel_as_ref);
 
     serial_println!(
@@ -148,57 +156,32 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
 
     match fault_res {
         Err(task::ProcessError::Fault(14)) => {
+            let fault = unsafe { core::ptr::read(&raw const arch::x86_64::idt::LAST_FAULT_INFO) };
+            assert_eq!(fault, Some((14, 0x100000, 5)));
             serial_println!(
                 "[+] MILESTONE 3 VERIFIED: Memory isolation caught illegal access (Exception Vector 14: #PF)."
             );
         }
-        Err(task::ProcessError::Fault(13)) => {
-            serial_println!(
-                "[+] MILESTONE 3 VERIFIED: Memory isolation caught illegal access (Exception Vector 13: #GP)."
-            );
-        }
-        other => {
-            serial_println!("[!] MILESTONE 3: Outcome: {:?}", other);
-        }
+        other => panic!("Unexpected isolation result: {:?}", other),
     }
+    fault_process
+        .release(&mut mem::pmm::PMM.lock())
+        .expect("fault reaping");
 
     serial_println!("============================================================");
     serial_println!(" NEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified");
     serial_println!("============================================================");
+    #[cfg(feature = "hardening-tests")]
+    hardening::exit_success();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use nexus_types::{
-        FramebufferInfo, MemoryDescriptor, PhysicalAddress, UefiMemoryType, VirtualAddress,
-    };
-
-    #[test]
-    fn test_kernel_init_flow() {
-        let mut boot_info = BootHandoverInfo::new();
-        boot_info.push_descriptor(MemoryDescriptor {
-            mem_type: UefiMemoryType::ConventionalMemory,
-            phys_start: PhysicalAddress::new(0x200_0000), // 32MB
-            virt_start: VirtualAddress::new(0),
-            number_of_pages: 1024, // 4MB
-            attribute: 0,
-        });
-
-        boot_info.framebuffer = Some(FramebufferInfo {
-            base_address: PhysicalAddress::new(0xE000_0000),
-            size: 1920 * 1080 * 4,
-            width: 1920,
-            height: 1080,
-            pixels_per_scan_line: 1920,
-            red_mask: 0x00FF0000,
-            green_mask: 0x0000FF00,
-            blue_mask: 0x000000FF,
-        });
-
-        nexus_kernel_init(&boot_info);
-
-        let pmm = mem::pmm::PMM.lock();
-        assert!(pmm.free_frames() > 0);
-    }
+#[cfg(not(any(target_os = "uefi", target_os = "none")))]
+pub fn nexus_kernel_init(_boot_info: &BootHandoverInfo) {
+    panic!("Kernel initialization requires real UEFI/bare-metal execution");
 }
+
+#[cfg(all(
+    feature = "hardening-tests",
+    any(target_os = "uefi", target_os = "none")
+))]
+mod hardening;

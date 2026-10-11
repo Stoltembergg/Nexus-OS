@@ -155,6 +155,13 @@ impl PeImage {
 
         // 3. Verify Optional Header (PE32+ 64-bit)
         let opt_header_offset = file_header_offset + 20;
+        if size_of_opt_header < 112
+            || size_of_opt_header > bytes.len().saturating_sub(opt_header_offset)
+            || num_sections == 0
+            || num_sections > 96
+        {
+            return Err(LoaderError::CorruptedBinary);
+        }
         let opt_magic = LittleEndian::read_u16(&bytes[opt_header_offset..opt_header_offset + 2]);
         if opt_magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
             return Err(LoaderError::InvalidPeMagic(opt_magic));
@@ -185,6 +192,9 @@ impl PeImage {
 
         let mut data_directories = [ImageDataDirectory::default(); 16];
         let num_dirs = num_rva_sizes.min(16);
+        if num_rva_sizes > 16 || 112 + num_dirs * 8 > size_of_opt_header {
+            return Err(LoaderError::CorruptedBinary);
+        }
         let dirs_start = opt_header_offset + 112;
 
         for (i, dir) in data_directories.iter_mut().enumerate().take(num_dirs) {
@@ -233,7 +243,7 @@ impl PeImage {
             });
         }
 
-        Ok(Self {
+        let image = Self {
             image_base,
             entry_point_rva,
             size_of_image,
@@ -243,7 +253,69 @@ impl PeImage {
             subsystem,
             data_directories,
             sections,
-        })
+        };
+        if (image.size_of_headers as usize) < section_table_offset + num_sections * 40 {
+            return Err(LoaderError::CorruptedBinary);
+        }
+        image.validate(bytes)?;
+        Ok(image)
+    }
+
+    pub fn validate(&self, bytes: &[u8]) -> Result<(), LoaderError> {
+        let end = self
+            .image_base
+            .checked_add(self.size_of_image as u64)
+            .ok_or(LoaderError::CorruptedBinary)?;
+        if self.image_base == 0
+            || !self.image_base.is_multiple_of(4096)
+            || end > 0x0000_8000_0000_0000
+            || self.size_of_image == 0
+            || self.size_of_image > 64 * 1024 * 1024
+            || !self.size_of_image.is_multiple_of(4096)
+            || self.section_alignment < 4096
+            || !self.section_alignment.is_power_of_two()
+            || !self.file_alignment.is_power_of_two()
+            || self.file_alignment > self.section_alignment
+            || self.size_of_headers == 0
+            || self.size_of_headers as usize > bytes.len()
+            || self.size_of_headers > self.size_of_image
+        {
+            return Err(LoaderError::CorruptedBinary);
+        }
+        let headers_end = (self.size_of_headers as u64).div_ceil(4096) * 4096;
+        let mut executable_entry = false;
+        for (i, sec) in self.sections.iter().enumerate() {
+            let size = sec.virtual_size.max(sec.size_of_raw_data) as u64;
+            let start = sec.virtual_address as u64;
+            let end = start + size;
+            let file_end = sec.pointer_to_raw_data as u64 + sec.size_of_raw_data as u64;
+            if !start.is_multiple_of(self.section_alignment as u64)
+                || start < headers_end
+                || end > self.size_of_image as u64
+                || file_end > bytes.len() as u64
+                || (sec.size_of_raw_data > 0 && sec.pointer_to_raw_data < self.size_of_headers)
+            {
+                return Err(LoaderError::CorruptedBinary);
+            }
+            if size == 0 {
+                continue;
+            }
+            for other in &self.sections[..i] {
+                let other_size = other.virtual_size.max(other.size_of_raw_data) as u64;
+                if other_size != 0
+                    && start < (other.virtual_address as u64 + other_size).div_ceil(4096) * 4096
+                    && (other.virtual_address as u64) < end.div_ceil(4096) * 4096
+                {
+                    return Err(LoaderError::AddressOverlap(self.image_base + start));
+                }
+            }
+            executable_entry |= sec.characteristics & IMAGE_SCN_MEM_EXECUTE != 0
+                && (start..end).contains(&(self.entry_point_rva as u64));
+        }
+        if !executable_entry {
+            return Err(LoaderError::CorruptedBinary);
+        }
+        Ok(())
     }
 
     /// Absolute entry point virtual address based on image base.
@@ -256,14 +328,14 @@ impl PeImage {
         for sec in &self.sections {
             let sec_start = sec.virtual_address;
             let sec_len = sec.virtual_size.max(sec.size_of_raw_data);
-            if rva >= sec_start && rva < sec_start + sec_len {
+            if rva >= sec_start && (rva as u64) < sec_start as u64 + sec_len as u64 {
                 let offset_in_sec = rva - sec_start;
                 if offset_in_sec < sec.size_of_raw_data {
-                    return Some((sec.pointer_to_raw_data + offset_in_sec) as usize);
+                    return Some(sec.pointer_to_raw_data as usize + offset_in_sec as usize);
                 }
             }
         }
-        None
+        (rva < self.size_of_headers).then_some(rva as usize)
     }
 
     /// Retrieves an ImageDataDirectory by standard directory index.
@@ -271,157 +343,179 @@ impl PeImage {
         self.data_directories.get(index)
     }
 
-    /// Parses the Base Relocation Table from the PE raw bytes.
-    pub fn parse_relocations(&self, bytes: &[u8]) -> Result<Vec<PeRelocationBlock>, LoaderError> {
-        let dir = match self.data_directory(IMAGE_DIRECTORY_ENTRY_BASERELOC) {
-            Some(d) if d.virtual_address != 0 && d.size > 0 => d,
-            _ => return Ok(Vec::new()),
-        };
-
-        let start_offset = match self.rva_to_file_offset(dir.virtual_address) {
-            Some(off) => off,
-            None => return Ok(Vec::new()),
-        };
-
-        let mut blocks = Vec::new();
-        let mut curr_offset = start_offset;
-        let end_offset = start_offset + dir.size as usize;
-
-        while curr_offset + 8 <= end_offset && curr_offset + 8 <= bytes.len() {
-            let page_rva = LittleEndian::read_u32(&bytes[curr_offset..curr_offset + 4]);
-            let block_size =
-                LittleEndian::read_u32(&bytes[curr_offset + 4..curr_offset + 8]) as usize;
-
-            if block_size < 8 || curr_offset + block_size > bytes.len() {
-                break;
+    fn rva_bytes<'a>(&self, bytes: &'a [u8], rva: u32) -> Result<&'a [u8], LoaderError> {
+        if rva < self.size_of_headers {
+            return bytes
+                .get(rva as usize..self.size_of_headers as usize)
+                .ok_or(LoaderError::CorruptedBinary);
+        }
+        for section in &self.sections {
+            if rva >= section.virtual_address {
+                let offset = (rva - section.virtual_address) as usize;
+                if offset < section.size_of_raw_data as usize {
+                    let start = section.pointer_to_raw_data as usize;
+                    let end = start
+                        .checked_add(section.size_of_raw_data as usize)
+                        .ok_or(LoaderError::CorruptedBinary)?;
+                    return bytes
+                        .get(start + offset..end)
+                        .ok_or(LoaderError::CorruptedBinary);
+                }
             }
-
-            let num_entries = (block_size - 8) / 2;
-            let mut entries = Vec::with_capacity(num_entries);
-
-            for i in 0..num_entries {
-                let entry_offset = curr_offset + 8 + (i * 2);
-                let entry_val = LittleEndian::read_u16(&bytes[entry_offset..entry_offset + 2]);
-                let rel_type = (entry_val >> 12) as u8;
-                let offset = entry_val & 0x0FFF;
-
+        }
+        Err(LoaderError::CorruptedBinary)
+    }
+    fn c_string(&self, bytes: &[u8], rva: u32) -> Result<String, LoaderError> {
+        let tail = self.rva_bytes(bytes, rva)?;
+        let end = tail
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(LoaderError::CorruptedBinary)?;
+        if end == 0 || end > 1024 {
+            return Err(LoaderError::CorruptedBinary);
+        }
+        Ok(String::from_utf8_lossy(&tail[..end]).into_owned())
+    }
+    pub fn parse_relocations(&self, bytes: &[u8]) -> Result<Vec<PeRelocationBlock>, LoaderError> {
+        self.validate(bytes)?;
+        let dir = self.data_directories[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+        if dir.virtual_address == 0 && dir.size == 0 {
+            return Ok(Vec::new());
+        }
+        let data = self
+            .rva_bytes(bytes, dir.virtual_address)?
+            .get(..dir.size as usize)
+            .ok_or(LoaderError::CorruptedBinary)?;
+        let mut blocks = Vec::new();
+        let mut cursor = 0usize;
+        while cursor < data.len() {
+            let header = data
+                .get(cursor..cursor + 8)
+                .ok_or(LoaderError::CorruptedBinary)?;
+            let page_rva = LittleEndian::read_u32(&header[..4]);
+            let size = LittleEndian::read_u32(&header[4..8]) as usize;
+            if size < 8 || !size.is_multiple_of(2) || page_rva % 4096 != 0 {
+                return Err(LoaderError::CorruptedBinary);
+            }
+            let block = data
+                .get(
+                    cursor
+                        ..cursor
+                            .checked_add(size)
+                            .ok_or(LoaderError::CorruptedBinary)?,
+                )
+                .ok_or(LoaderError::CorruptedBinary)?;
+            let mut entries = Vec::new();
+            for word in block[8..].as_chunks::<2>().0 {
+                let raw = LittleEndian::read_u16(word);
+                let rel_type = (raw >> 12) as u8;
+                let offset = raw & 4095;
+                let target = page_rva as u64 + offset as u64;
+                if !matches!(rel_type, IMAGE_REL_BASED_ABSOLUTE | IMAGE_REL_BASED_DIR64)
+                    || (rel_type == IMAGE_REL_BASED_DIR64
+                        && !self.sections.iter().any(|s| {
+                            target >= s.virtual_address as u64
+                                && target + 8
+                                    <= s.virtual_address as u64
+                                        + s.virtual_size.max(s.size_of_raw_data) as u64
+                        }))
+                {
+                    return Err(LoaderError::CorruptedBinary);
+                }
                 entries.push(PeRelocationEntry { rel_type, offset });
             }
-
             blocks.push(PeRelocationBlock { page_rva, entries });
-            curr_offset += block_size;
+            cursor += size;
         }
-
+        if blocks.is_empty() {
+            return Err(LoaderError::CorruptedBinary);
+        }
         Ok(blocks)
     }
-
-    /// Parses the Import Directory and resolves imported functions and DLL names.
     pub fn parse_imports(&self, bytes: &[u8]) -> Result<Vec<PeImportDescriptor>, LoaderError> {
-        let dir = match self.data_directory(IMAGE_DIRECTORY_ENTRY_IMPORT) {
-            Some(d) if d.virtual_address != 0 && d.size > 0 => d,
-            _ => return Ok(Vec::new()),
-        };
-
-        let start_offset = match self.rva_to_file_offset(dir.virtual_address) {
-            Some(off) => off,
-            None => return Ok(Vec::new()),
-        };
-
+        self.validate(bytes)?;
+        let dir = self.data_directories[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if dir.virtual_address == 0 && dir.size == 0 {
+            return Ok(Vec::new());
+        }
+        let data = self
+            .rva_bytes(bytes, dir.virtual_address)?
+            .get(..dir.size as usize)
+            .ok_or(LoaderError::CorruptedBinary)?;
         let mut descriptors = Vec::new();
-        let mut curr_offset = start_offset;
-
-        while curr_offset + 20 <= bytes.len() {
-            let orig_first_thunk = LittleEndian::read_u32(&bytes[curr_offset..curr_offset + 4]);
-            let time_date_stamp = LittleEndian::read_u32(&bytes[curr_offset + 4..curr_offset + 8]);
-            let forwarder_chain = LittleEndian::read_u32(&bytes[curr_offset + 8..curr_offset + 12]);
-            let name_rva = LittleEndian::read_u32(&bytes[curr_offset + 12..curr_offset + 16]);
-            let first_thunk = LittleEndian::read_u32(&bytes[curr_offset + 16..curr_offset + 20]);
-
-            // All zeroes signifies termination
-            if orig_first_thunk == 0 && name_rva == 0 && first_thunk == 0 {
-                break;
+        for descriptor in data.as_chunks::<20>().0 {
+            if descriptor.iter().all(|&b| b == 0) {
+                return Ok(descriptors);
             }
-
-            let dll_name = if let Some(name_off) = self.rva_to_file_offset(name_rva) {
-                let mut end = name_off;
-                while end < bytes.len() && bytes[end] != 0 {
-                    end += 1;
-                }
-                String::from_utf8_lossy(&bytes[name_off..end]).to_string()
-            } else {
-                String::new()
-            };
-
-            // Parse imported functions from ILT (or IAT fallback)
-            let thunk_rva = if orig_first_thunk != 0 {
-                orig_first_thunk
-            } else {
-                first_thunk
-            };
-
+            if descriptors.len() >= 96 {
+                return Err(LoaderError::CorruptedBinary);
+            }
+            let orig = LittleEndian::read_u32(&descriptor[..4]);
+            let timestamp = LittleEndian::read_u32(&descriptor[4..8]);
+            let forwarder = LittleEndian::read_u32(&descriptor[8..12]);
+            let name_rva = LittleEndian::read_u32(&descriptor[12..16]);
+            let first = LittleEndian::read_u32(&descriptor[16..20]);
+            if first == 0 {
+                return Err(LoaderError::CorruptedBinary);
+            }
+            let dll_name = self.c_string(bytes, name_rva)?;
+            let thunks = self.rva_bytes(bytes, if orig != 0 { orig } else { first })?;
             let mut functions = Vec::new();
-            if let Some(mut thunk_file_off) = self.rva_to_file_offset(thunk_rva) {
-                let mut iat_entry_rva = first_thunk;
-                while thunk_file_off + 8 <= bytes.len() {
-                    let thunk_data =
-                        LittleEndian::read_u64(&bytes[thunk_file_off..thunk_file_off + 8]);
-                    if thunk_data == 0 {
-                        break;
-                    }
-
-                    let (ordinal_or_hint, fn_name) = if (thunk_data & (1 << 63)) != 0 {
-                        // Import by ordinal
-                        (
-                            (thunk_data & 0xFFFF) as u16,
-                            format!("Ordinal_{}", thunk_data & 0xFFFF),
-                        )
-                    } else {
-                        // Import by name (RVA to Hint/Name table)
-                        let hint_name_rva = (thunk_data & 0x7FFF_FFFF) as u32;
-                        if let Some(hn_off) = self.rva_to_file_offset(hint_name_rva) {
-                            if hn_off + 2 < bytes.len() {
-                                let hint = LittleEndian::read_u16(&bytes[hn_off..hn_off + 2]);
-                                let mut fn_end = hn_off + 2;
-                                while fn_end < bytes.len() && bytes[fn_end] != 0 {
-                                    fn_end += 1;
-                                }
-                                (
-                                    hint,
-                                    String::from_utf8_lossy(&bytes[hn_off + 2..fn_end]).to_string(),
-                                )
-                            } else {
-                                (0, String::new())
-                            }
-                        } else {
-                            (0, String::new())
-                        }
-                    };
-
-                    functions.push(PeImportFunction {
-                        ordinal_or_hint,
-                        name: fn_name,
-                        iat_rva: iat_entry_rva,
-                    });
-
-                    thunk_file_off += 8;
-                    iat_entry_rva += 8;
+            let mut terminated = false;
+            for (index, word) in thunks.as_chunks::<8>().0.iter().enumerate() {
+                let thunk = LittleEndian::read_u64(word);
+                if thunk == 0 {
+                    terminated = true;
+                    break;
                 }
+                if index >= 4096 {
+                    return Err(LoaderError::CorruptedBinary);
+                }
+                let (ordinal_or_hint, name) = if thunk & (1 << 63) != 0 {
+                    (
+                        (thunk & 0xffff) as u16,
+                        format!("Ordinal_{}", thunk & 0xffff),
+                    )
+                } else {
+                    let rva = u32::try_from(thunk).map_err(|_| LoaderError::CorruptedBinary)?;
+                    let hint = self
+                        .rva_bytes(bytes, rva)?
+                        .get(..2)
+                        .ok_or(LoaderError::CorruptedBinary)?;
+                    (
+                        LittleEndian::read_u16(hint),
+                        self.c_string(
+                            bytes,
+                            rva.checked_add(2).ok_or(LoaderError::CorruptedBinary)?,
+                        )?,
+                    )
+                };
+                let iat_rva = first
+                    .checked_add((index as u32) * 8)
+                    .ok_or(LoaderError::CorruptedBinary)?;
+                self.rva_bytes(bytes, iat_rva)?
+                    .get(..8)
+                    .ok_or(LoaderError::CorruptedBinary)?;
+                functions.push(PeImportFunction {
+                    ordinal_or_hint,
+                    name,
+                    iat_rva,
+                });
             }
-
+            if !terminated {
+                return Err(LoaderError::CorruptedBinary);
+            }
             descriptors.push(PeImportDescriptor {
-                original_first_thunk: orig_first_thunk,
-                time_date_stamp,
-                forwarder_chain,
+                original_first_thunk: orig,
+                time_date_stamp: timestamp,
+                forwarder_chain: forwarder,
                 name_rva,
-                first_thunk,
+                first_thunk: first,
                 dll_name,
                 functions,
             });
-
-            curr_offset += 20;
         }
-
-        Ok(descriptors)
+        Err(LoaderError::CorruptedBinary)
     }
 }
 
@@ -430,8 +524,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn truncated_optional_header_returns_error_without_panicking() {
+        let mut bytes = vec![0; 152];
+        LittleEndian::write_u16(&mut bytes[0..2], IMAGE_DOS_SIGNATURE);
+        LittleEndian::write_u32(&mut bytes[60..64], 128);
+        LittleEndian::write_u32(&mut bytes[128..132], IMAGE_NT_SIGNATURE);
+        LittleEndian::write_u16(&mut bytes[132..134], IMAGE_FILE_MACHINE_AMD64);
+        LittleEndian::write_u16(&mut bytes[148..150], 240);
+        let result = std::panic::catch_unwind(|| PeImage::parse(&bytes));
+        assert!(result.is_ok(), "untrusted PE must not panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
     fn test_pe_image_parse_dummy() {
-        let mut buf = vec![0u8; 1024];
+        let mut buf = vec![0u8; 8192];
         LittleEndian::write_u16(&mut buf[0..2], IMAGE_DOS_SIGNATURE);
         LittleEndian::write_u32(&mut buf[60..64], 128); // e_lfanew = 128
 
@@ -448,6 +555,10 @@ mod tests {
         );
         LittleEndian::write_u32(opt_off_slice(&mut buf, opt_off, 16, 20), 0x1000); // EntryPoint = 0x1000
         LittleEndian::write_u64(opt_off_slice(&mut buf, opt_off, 24, 32), 0x140000000); // ImageBase
+        LittleEndian::write_u32(opt_off_slice(&mut buf, opt_off, 32, 36), 4096);
+        LittleEndian::write_u32(opt_off_slice(&mut buf, opt_off, 36, 40), 512);
+        LittleEndian::write_u32(opt_off_slice(&mut buf, opt_off, 56, 60), 8192);
+        LittleEndian::write_u32(opt_off_slice(&mut buf, opt_off, 60, 64), 512);
         LittleEndian::write_u32(opt_off_slice(&mut buf, opt_off, 108, 112), 16); // NumberOfRvaAndSizes
 
         let sec_off = opt_off + 240;

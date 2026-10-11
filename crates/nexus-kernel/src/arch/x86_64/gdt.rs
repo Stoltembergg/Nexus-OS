@@ -182,7 +182,7 @@ impl GdtTable {
 
     pub fn pointer(&self) -> GdtPointer {
         GdtPointer {
-            limit: (size_of::<Self>() - 1) as u16,
+            limit: (size_of::<[GdtEntry; 5]>() + size_of::<TssDescriptor>() - 1) as u16,
             base: self as *const _ as u64,
         }
     }
@@ -191,6 +191,14 @@ impl GdtTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gdtr_limit_excludes_alignment_padding() {
+        let tss = TaskStateSegment::zeroed();
+        let gdt = GdtTable::new(&tss);
+        let limit = gdt.pointer().limit;
+        assert_eq!(limit, 55); // five segment slots plus two TSS slots
+    }
 
     #[test]
     fn test_gdt_selectors() {

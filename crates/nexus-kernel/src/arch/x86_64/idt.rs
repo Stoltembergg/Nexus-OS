@@ -128,11 +128,11 @@ pub struct ExceptionFrame {
 #[inline]
 pub fn read_cr2() -> u64 {
     let cr2: u64;
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     unsafe {
         core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags));
     }
-    #[cfg(any(not(target_arch = "x86_64"), test))]
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
     {
         cr2 = 0;
     }
@@ -142,149 +142,267 @@ pub fn read_cr2() -> u64 {
 pub static mut LAST_FAULT_INFO: Option<(u64, u64, u64)> = None; // (vector, cr2, error_code)
 
 #[no_mangle]
-pub extern "C" fn exception_dispatch_handler(frame: &mut ExceptionFrame) {
-    let vector = frame.vector;
+pub extern "win64" fn exception_dispatch_handler(frame: &mut ExceptionFrame) {
     let is_user = (frame.cs & 3) == 3;
-
-    match vector {
-        14 => {
-            // #PF (Page Fault)
-            let cr2 = read_cr2();
-            unsafe {
-                LAST_FAULT_INFO = Some((14, cr2, frame.error_code));
-            }
-            serial_println!(
-                "[#PF] Page Fault at Linear Address {:#018X} (RIP={:#018X}, Code={:#X}, Ring={})",
-                cr2,
-                frame.rip,
-                frame.error_code,
-                if is_user { 3 } else { 0 }
-            );
-
-            if is_user {
-                serial_println!(
-                    "[#PF] Enforcing memory isolation: safely terminating Ring 3 process."
-                );
-                crate::task::trigger_user_abort(14);
-            } else {
-                serial_println!("[#PF] FATAL: Kernel Page Fault in Ring 0! Halting.");
-                #[cfg(all(target_arch = "x86_64", not(test)))]
-                unsafe {
-                    core::arch::asm!("cli; 2: hlt; jmp 2b", options(noreturn));
-                }
-            }
-        }
-        13 => {
-            // #GP (General Protection Fault)
-            unsafe {
-                LAST_FAULT_INFO = Some((13, 0, frame.error_code));
-            }
-            serial_println!(
-                "[#GP] General Protection Fault at RIP={:#018X} (Code={:#X}, Ring={})",
-                frame.rip,
-                frame.error_code,
-                if is_user { 3 } else { 0 }
-            );
-            if is_user {
-                serial_println!("[#GP] Terminating Ring 3 process after privilege violation.");
-                crate::task::trigger_user_abort(13);
-            } else {
-                serial_println!("[#GP] FATAL: Kernel GP Fault in Ring 0! Halting.");
-                #[cfg(all(target_arch = "x86_64", not(test)))]
-                unsafe {
-                    core::arch::asm!("cli; 2: hlt; jmp 2b", options(noreturn));
-                }
-            }
-        }
-        6 => {
-            // #UD (Invalid Opcode)
-            let rip_ptr = frame.rip as *const u8;
-            let (b0, b1, b2, b3) =
-                unsafe { (*rip_ptr, *rip_ptr.add(1), *rip_ptr.add(2), *rip_ptr.add(3)) };
-            serial_println!(
-                "[#UD] Invalid Opcode at RIP={:#018X} (Ring={}) Bytes: {:02X} {:02X} {:02X} {:02X}",
-                frame.rip,
-                if is_user { 3 } else { 0 },
-                b0,
-                b1,
-                b2,
-                b3
-            );
-            if is_user {
-                crate::task::trigger_user_abort(6);
-            } else {
-                serial_println!("[#UD] FATAL: Kernel Invalid Opcode in Ring 0! Halting.");
-                #[cfg(all(target_arch = "x86_64", not(test)))]
-                unsafe {
-                    core::arch::asm!("cli; 2: hlt; jmp 2b", options(noreturn));
-                }
-            }
-        }
-        8 => {
-            // #DF (Double Fault)
-            serial_println!("[#DF] FATAL: Double Fault at RIP={:#018X}", frame.rip);
-            #[cfg(all(target_arch = "x86_64", not(test)))]
-            unsafe {
-                core::arch::asm!("cli; 2: hlt; jmp 2b", options(noreturn));
-            }
-        }
-        _ => {
-            serial_println!(
-                "[!] Unhandled Exception Vector {} at RIP={:#018X}",
-                vector,
-                frame.rip
-            );
-        }
+    #[cfg(all(
+        feature = "hardening-tests",
+        any(target_os = "uefi", target_os = "none")
+    ))]
+    if is_user {
+        crate::hardening::assert_kernel_fx();
+    }
+    let cr2 = if frame.vector == 14 { read_cr2() } else { 0 };
+    unsafe {
+        LAST_FAULT_INFO = Some((frame.vector, cr2, frame.error_code));
+    }
+    // Never dereference untrusted RIP merely for #UD diagnostics.
+    serial_println!(
+        "[TRAP] vector={} cr2={:#x} error={:#x} rip={:#x} ring={}",
+        frame.vector,
+        cr2,
+        frame.error_code,
+        frame.rip,
+        if is_user { 3 } else { 0 }
+    );
+    if is_user && !matches!(frame.vector, 2 | 8 | 18) {
+        crate::task::trigger_user_abort(frame.vector as i32);
+    }
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    unsafe {
+        core::arch::asm!("cli; 2: hlt; jmp 2b", options(noreturn));
     }
 }
-
 pub fn arm_exception_gates(idt: &mut IdtTable) {
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
     {
         extern "C" {
+            fn asm_stub_de();
+            fn asm_stub_db();
+            fn asm_stub_nmi();
+            fn asm_stub_bp();
+            fn asm_stub_of();
+            fn asm_stub_br();
             fn asm_stub_ud();
+            fn asm_stub_nm();
             fn asm_stub_df();
+            fn asm_stub_r9();
+            fn asm_stub_ts();
+            fn asm_stub_np();
+            fn asm_stub_ss();
             fn asm_stub_gp();
             fn asm_stub_pf();
+            fn asm_stub_r15();
+            fn asm_stub_mf();
+            fn asm_stub_ac();
+            fn asm_stub_mc();
+            fn asm_stub_xm();
+            fn asm_stub_ve();
+            fn asm_stub_cp();
+            fn asm_stub_r22();
+            fn asm_stub_r23();
+            fn asm_stub_r24();
+            fn asm_stub_r25();
+            fn asm_stub_r26();
+            fn asm_stub_r27();
+            fn asm_stub_hv();
+            fn asm_stub_vc();
+            fn asm_stub_sx();
+            fn asm_stub_r31();
         }
-        idt.set_gate(6, asm_stub_ud as *const () as u64, 0x08, 0, 0x8E); // #UD
-        idt.set_gate(8, asm_stub_df as *const () as u64, 0x08, 1, 0x8E); // #DF (uses IST1)
-        idt.set_gate(13, asm_stub_gp as *const () as u64, 0x08, 0, 0x8E); // #GP
-        idt.set_gate(14, asm_stub_pf as *const () as u64, 0x08, 0, 0x8E); // #PF
+        let handlers = [
+            asm_stub_de as *const () as u64,
+            asm_stub_db as *const () as u64,
+            asm_stub_nmi as *const () as u64,
+            asm_stub_bp as *const () as u64,
+            asm_stub_of as *const () as u64,
+            asm_stub_br as *const () as u64,
+            asm_stub_ud as *const () as u64,
+            asm_stub_nm as *const () as u64,
+            asm_stub_df as *const () as u64,
+            asm_stub_r9 as *const () as u64,
+            asm_stub_ts as *const () as u64,
+            asm_stub_np as *const () as u64,
+            asm_stub_ss as *const () as u64,
+            asm_stub_gp as *const () as u64,
+            asm_stub_pf as *const () as u64,
+            asm_stub_r15 as *const () as u64,
+            asm_stub_mf as *const () as u64,
+            asm_stub_ac as *const () as u64,
+            asm_stub_mc as *const () as u64,
+            asm_stub_xm as *const () as u64,
+            asm_stub_ve as *const () as u64,
+            asm_stub_cp as *const () as u64,
+            asm_stub_r22 as *const () as u64,
+            asm_stub_r23 as *const () as u64,
+            asm_stub_r24 as *const () as u64,
+            asm_stub_r25 as *const () as u64,
+            asm_stub_r26 as *const () as u64,
+            asm_stub_r27 as *const () as u64,
+            asm_stub_hv as *const () as u64,
+            asm_stub_vc as *const () as u64,
+            asm_stub_sx as *const () as u64,
+            asm_stub_r31 as *const () as u64,
+        ];
+        for (vector, handler) in handlers.into_iter().enumerate() {
+            idt.set_gate(vector, handler, 0x08, if vector == 8 { 1 } else { 0 }, 0x8e);
+        }
     }
-    #[cfg(any(not(target_arch = "x86_64"), test))]
-    {
-        let _ = idt;
-    }
+    #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+    let _ = idt;
 }
-
-#[cfg(all(target_arch = "x86_64", not(test)))]
+#[cfg(any(target_os = "uefi", target_os = "none"))]
 core::arch::global_asm!(
     r#"
+    .global asm_stub_de
+    asm_stub_de:
+        push 0
+        push 0
+        jmp asm_common_exception
+    .global asm_stub_db
+    asm_stub_db:
+        push 0
+        push 1
+        jmp asm_common_exception
+    .global asm_stub_nmi
+    asm_stub_nmi:
+        push 0
+        push 2
+        jmp asm_common_exception
+    .global asm_stub_bp
+    asm_stub_bp:
+        push 0
+        push 3
+        jmp asm_common_exception
+    .global asm_stub_of
+    asm_stub_of:
+        push 0
+        push 4
+        jmp asm_common_exception
+    .global asm_stub_br
+    asm_stub_br:
+        push 0
+        push 5
+        jmp asm_common_exception
     .global asm_stub_ud
     asm_stub_ud:
-        push 0 // Dummy error code
-        push 6 // Vector
+        push 0
+        push 6
         jmp asm_common_exception
-
+    .global asm_stub_nm
+    asm_stub_nm:
+        push 0
+        push 7
+        jmp asm_common_exception
     .global asm_stub_df
     asm_stub_df:
-        // Hardware pushes error code
-        push 8 // Vector
+        push 8
         jmp asm_common_exception
-
+    .global asm_stub_r9
+    asm_stub_r9:
+        push 0
+        push 9
+        jmp asm_common_exception
+    .global asm_stub_ts
+    asm_stub_ts:
+        push 10
+        jmp asm_common_exception
+    .global asm_stub_np
+    asm_stub_np:
+        push 11
+        jmp asm_common_exception
+    .global asm_stub_ss
+    asm_stub_ss:
+        push 12
+        jmp asm_common_exception
     .global asm_stub_gp
     asm_stub_gp:
-        // Hardware pushes error code
-        push 13 // Vector
+        push 13
         jmp asm_common_exception
-
     .global asm_stub_pf
     asm_stub_pf:
-        // Hardware pushes error code
-        push 14 // Vector
+        push 14
         jmp asm_common_exception
-
+    .global asm_stub_r15
+    asm_stub_r15:
+        push 0
+        push 15
+        jmp asm_common_exception
+    .global asm_stub_mf
+    asm_stub_mf:
+        push 0
+        push 16
+        jmp asm_common_exception
+    .global asm_stub_ac
+    asm_stub_ac:
+        push 17
+        jmp asm_common_exception
+    .global asm_stub_mc
+    asm_stub_mc:
+        push 0
+        push 18
+        jmp asm_common_exception
+    .global asm_stub_xm
+    asm_stub_xm:
+        push 0
+        push 19
+        jmp asm_common_exception
+    .global asm_stub_ve
+    asm_stub_ve:
+        push 0
+        push 20
+        jmp asm_common_exception
+    .global asm_stub_cp
+    asm_stub_cp:
+        push 21
+        jmp asm_common_exception
+    .global asm_stub_r22
+    asm_stub_r22:
+        push 0
+        push 22
+        jmp asm_common_exception
+    .global asm_stub_r23
+    asm_stub_r23:
+        push 0
+        push 23
+        jmp asm_common_exception
+    .global asm_stub_r24
+    asm_stub_r24:
+        push 0
+        push 24
+        jmp asm_common_exception
+    .global asm_stub_r25
+    asm_stub_r25:
+        push 0
+        push 25
+        jmp asm_common_exception
+    .global asm_stub_r26
+    asm_stub_r26:
+        push 0
+        push 26
+        jmp asm_common_exception
+    .global asm_stub_r27
+    asm_stub_r27:
+        push 0
+        push 27
+        jmp asm_common_exception
+    .global asm_stub_hv
+    asm_stub_hv:
+        push 0
+        push 28
+        jmp asm_common_exception
+    .global asm_stub_vc
+    asm_stub_vc:
+        push 29
+        jmp asm_common_exception
+    .global asm_stub_sx
+    asm_stub_sx:
+        push 30
+        jmp asm_common_exception
+    .global asm_stub_r31
+    asm_stub_r31:
+        push 0
+        push 31
+        jmp asm_common_exception
     asm_common_exception:
         push rax
         push rbx
@@ -301,13 +419,17 @@ core::arch::global_asm!(
         push r13
         push r14
         push r15
-
+        cld
+        test byte ptr [rsp + 144], 3 // saved CS: only Ring 3 has a saved kernel context
+        jz .Lkernel_exception_fx
+        fxrstor64 [rip + KERNEL_SAVED_CTX + 0x60]
+    .Lkernel_exception_fx:
         mov rcx, rsp
-        mov rdi, rsp
-        sub rsp, 40
+        mov r12, rsp
+        and rsp, -16
+        sub rsp, 32
         call exception_dispatch_handler
-        add rsp, 40
-
+        mov rsp, r12
         pop r15
         pop r14
         pop r13
@@ -323,10 +445,9 @@ core::arch::global_asm!(
         pop rcx
         pop rbx
         pop rax
-
-        add rsp, 16 // Pop vector and error_code
+        add rsp, 16
         iretq
-    "#
+"#
 );
 
 #[cfg(test)]

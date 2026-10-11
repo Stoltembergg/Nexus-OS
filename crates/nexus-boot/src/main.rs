@@ -3,11 +3,13 @@
 #[cfg(target_os = "uefi")]
 use nexus_boot::proto::*;
 #[cfg(target_os = "uefi")]
-use nexus_types::{BootHandoverInfo, FramebufferInfo, MemoryDescriptor, PhysicalAddress};
+use nexus_types::{BootHandoverInfo, FramebufferInfo, PhysicalAddress};
 
 #[cfg(target_os = "uefi")]
 #[no_mangle]
-pub extern "win64" fn efi_main(
+/// # Safety
+/// Firmware must pass valid live UEFI system-table and image handles.
+pub unsafe extern "win64" fn efi_main(
     image_handle: EfiHandle,
     system_table: *mut EfiSystemTable,
 ) -> EfiStatus {
@@ -17,6 +19,9 @@ pub extern "win64" fn efi_main(
         }
 
         let st = &*system_table;
+        if st.boot_services.is_null() {
+            return EfiStatus::NOT_FOUND;
+        }
         let bs = &*st.boot_services;
 
         // 1. Clear screen & print greeting
@@ -70,7 +75,11 @@ pub extern "win64" fn efi_main(
 
         let fb_info = if status.is_success() && !gop_ptr.is_null() {
             let gop = &*(gop_ptr as *mut EfiGraphicsOutputProtocol);
-            if !gop.mode.is_null() {
+            if !gop.mode.is_null()
+                && !(*gop.mode).info.is_null()
+                && (*gop.mode).size_of_info
+                    >= core::mem::size_of::<EfiGraphicsOutputModeInformation>()
+            {
                 let mode = &*gop.mode;
                 let info = &*mode.info;
                 Some(FramebufferInfo {
@@ -94,55 +103,66 @@ pub extern "win64" fn efi_main(
         let mut boot_info = BootHandoverInfo::new();
         boot_info.framebuffer = fb_info;
 
-        // 4. Acquire Memory Map
-        let mut mem_map_size = 0usize;
-        let mut map_key = 0usize;
-        let mut desc_size = 0usize;
-        let mut desc_version = 0u32;
+        let mut loaded: *mut core::ffi::c_void = core::ptr::null_mut();
+        let status = (bs.handle_protocol)(image_handle, &EfiGuid::LOADED_IMAGE_GUID, &mut loaded);
+        if !status.is_success() || loaded.is_null() {
+            return EfiStatus::NOT_FOUND;
+        }
+        let loaded = &*(loaded as *const EfiLoadedImageProtocol);
+        if loaded.image_base.is_null()
+            || loaded.image_size == 0
+            || loaded.image_size > 64 * 1024 * 1024
+        {
+            return EfiStatus::INVALID_PARAMETER;
+        }
+        let image =
+            core::slice::from_raw_parts(loaded.image_base.cast::<u8>(), loaded.image_size as usize);
+        if let Err(status) =
+            nexus_boot::decode_kernel_code(loaded.image_base as u64, image, &mut boot_info)
+        {
+            return status;
+        }
 
-        let _ = (bs.get_memory_map)(
-            &mut mem_map_size,
-            core::ptr::null_mut(),
-            &mut map_key,
-            &mut desc_size,
-            &mut desc_version,
-        );
-
-        mem_map_size += desc_size * 8;
+        // Fixed-capacity map: fail closed if firmware exceeds it. No truncation.
         let mut memory_buffer = [0u8; 16384];
-        if mem_map_size > memory_buffer.len() {
-            mem_map_size = memory_buffer.len();
-        }
-
-        let map_status = (bs.get_memory_map)(
-            &mut mem_map_size,
-            memory_buffer.as_mut_ptr() as *mut EfiMemoryDescriptorRaw,
-            &mut map_key,
-            &mut desc_size,
-            &mut desc_version,
-        );
-
-        if map_status.is_success() && desc_size > 0 {
-            let count = mem_map_size / desc_size;
-            for i in 0..count {
-                let raw_ptr =
-                    memory_buffer.as_ptr().add(i * desc_size) as *const EfiMemoryDescriptorRaw;
-                let raw = *raw_ptr;
-                boot_info.push_descriptor(MemoryDescriptor::from(raw));
+        for _ in 0..3 {
+            let mut map_size = memory_buffer.len();
+            let mut map_key = 0usize;
+            let mut desc_size = 0usize;
+            let mut desc_version = 0u32;
+            let status = (bs.get_memory_map)(
+                &mut map_size,
+                memory_buffer.as_mut_ptr().cast::<EfiMemoryDescriptorRaw>(),
+                &mut map_key,
+                &mut desc_size,
+                &mut desc_version,
+            );
+            if !status.is_success() {
+                return status;
             }
-        }
-
-        // 5. Exit Boot Services and Transfer Control to Nexus Kernel
-        if map_status.is_success() {
-            let exit_status = (bs.exit_boot_services)(image_handle, map_key);
-            if exit_status.is_success() {
+            let bytes = match memory_buffer.get(..map_size) {
+                Some(bytes) => bytes,
+                None => return EfiStatus::BUFFER_TOO_SMALL,
+            };
+            if let Err(status) =
+                nexus_boot::decode_memory_map(bytes, desc_size, desc_version, &mut boot_info)
+            {
+                return status;
+            }
+            // No allocating firmware call between GetMemoryMap and ExitBootServices.
+            let status = (bs.exit_boot_services)(image_handle, map_key);
+            if status.is_success() {
+                core::arch::asm!("cli", options(nomem, nostack));
                 nexus_kernel::nexus_kernel_init(&boot_info);
+                loop {
+                    core::hint::spin_loop();
+                }
+            }
+            if status != EfiStatus::INVALID_PARAMETER {
+                return status;
             }
         }
-
-        loop {
-            core::hint::spin_loop();
-        }
+        EfiStatus::INVALID_PARAMETER
     }
 }
 

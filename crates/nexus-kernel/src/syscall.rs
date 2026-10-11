@@ -9,7 +9,7 @@ pub const IA32_LSTAR_MSR: u32 = 0xC000_0082;
 pub const IA32_SFMASK_MSR: u32 = 0xC000_0084;
 
 pub const EFER_SCE_BIT: u64 = 1 << 0; // System Call Extensions enable
-pub const SFMASK_FLAGS: u64 = 0x200; // Mask IF (Interrupt Flag) on syscall entry
+pub const SFMASK_FLAGS: u64 = 0x44700; // Clear TF/IF/DF/NT/AC before Rust entry
 
 pub static KERNEL_SYSCALL_ROUTER: Mutex<Option<SyscallRouter>> = Mutex::new(None);
 
@@ -21,7 +21,7 @@ pub static KERNEL_SYSCALL_ROUTER: Mutex<Option<SyscallRouter>> = Mutex::new(None
 /// - `IA32_SFMASK`: Low 32 bits of RFLAGS masked during SYSCALL entry.
 /// - `IA32_EFER.SCE`: Must be set to 1 to enable SYSCALL opcode.
 pub fn init_syscall_msrs(syscall_entry_rip: u64) {
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     unsafe {
         // Enable SCE in EFER
         let efer = rdmsr(IA32_EFER_MSR);
@@ -38,7 +38,7 @@ pub fn init_syscall_msrs(syscall_entry_rip: u64) {
         wrmsr(IA32_SFMASK_MSR, SFMASK_FLAGS);
     }
 
-    #[cfg(test)]
+    #[cfg(not(any(target_os = "uefi", target_os = "none")))]
     let _ = syscall_entry_rip;
 
     let mut router = KERNEL_SYSCALL_ROUTER.lock();
@@ -51,7 +51,7 @@ pub fn init_syscall_msrs(syscall_entry_rip: u64) {
 /// Caller must ensure that the target CPU supports the specified MSR index,
 /// and that reading this MSR does not violate hardware privileges or trigger a general protection fault (#GP).
 pub unsafe fn rdmsr(msr: u32) -> u64 {
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     {
         let low: u32;
         let high: u32;
@@ -64,7 +64,7 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
         );
         ((high as u64) << 32) | (low as u64)
     }
-    #[cfg(any(not(target_arch = "x86_64"), test))]
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
     {
         let _ = msr;
         0
@@ -77,7 +77,7 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
 /// Caller must ensure that the target CPU supports the specified MSR index,
 /// and that the value written is valid and does not cause undefined hardware behavior or #GP.
 pub unsafe fn wrmsr(msr: u32, val: u64) {
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     {
         let low = val as u32;
         let high = (val >> 32) as u32;
@@ -89,7 +89,7 @@ pub unsafe fn wrmsr(msr: u32, val: u64) {
             options(nomem, nostack, preserves_flags)
         );
     }
-    #[cfg(any(not(target_arch = "x86_64"), test))]
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
     {
         let _ = msr;
         let _ = val;

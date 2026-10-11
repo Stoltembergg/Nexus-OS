@@ -30,7 +30,7 @@ pub fn generate_ring3_elf_payload(message: &[u8]) -> [u8; 8192] {
     // Program Header (56 bytes at offset 64)
     let ph_off = 64;
     LittleEndian::write_u32(&mut image[ph_off..ph_off + 4], 1); // PT_LOAD
-    LittleEndian::write_u32(&mut image[ph_off + 4..ph_off + 8], 7); // PF_R | PF_W | PF_X
+    LittleEndian::write_u32(&mut image[ph_off + 4..ph_off + 8], 5); // PF_R | PF_X
     LittleEndian::write_u64(&mut image[ph_off + 8..ph_off + 16], 0x1000); // p_offset
     LittleEndian::write_u64(&mut image[ph_off + 16..ph_off + 24], ELF_USER_ENTRY_VADDR); // p_vaddr
     LittleEndian::write_u64(&mut image[ph_off + 24..ph_off + 32], ELF_USER_ENTRY_VADDR); // p_paddr
@@ -118,7 +118,7 @@ pub fn generate_faulting_elf_payload() -> [u8; 8192] {
     // Program Header
     let ph_off = 64;
     LittleEndian::write_u32(&mut image[ph_off..ph_off + 4], 1);
-    LittleEndian::write_u32(&mut image[ph_off + 4..ph_off + 8], 7);
+    LittleEndian::write_u32(&mut image[ph_off + 4..ph_off + 8], 5);
     LittleEndian::write_u64(&mut image[ph_off + 8..ph_off + 16], 0x1000);
     LittleEndian::write_u64(&mut image[ph_off + 16..ph_off + 24], ELF_USER_ENTRY_VADDR);
     LittleEndian::write_u64(&mut image[ph_off + 24..ph_off + 32], ELF_USER_ENTRY_VADDR);

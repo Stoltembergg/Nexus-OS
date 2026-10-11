@@ -1,10 +1,11 @@
 //! Physical and Virtual Memory Management Subsystem.
 
+#[cfg(any(target_os = "uefi", target_os = "none"))]
 pub mod heap;
 pub mod pmm;
 pub mod vmm;
 
-use nexus_types::{BootHandoverInfo, PhysicalAddress};
+use nexus_types::{BootHandoverInfo, PhysicalAddress, UefiMemoryType, VirtualAddress};
 use spin::Mutex;
 
 pub static KERNEL_ADDRESS_SPACE: Mutex<Option<vmm::AddressSpace>> = Mutex::new(None);
@@ -23,7 +24,27 @@ pub fn init_memory(boot_info: &BootHandoverInfo) {
     // Determine the highest physical RAM address from all descriptors (excluding MMIO above 4GB)
     let mut max_phys_ram = 64 * 1024 * 1024_u64; // at least 64MB
     for desc in boot_info.memory_map() {
-        let end = desc.phys_start.as_u64() + desc.number_of_pages * 4096;
+        if !matches!(
+            desc.mem_type,
+            UefiMemoryType::ConventionalMemory
+                | UefiMemoryType::LoaderCode
+                | UefiMemoryType::LoaderData
+                | UefiMemoryType::BootServicesCode
+                | UefiMemoryType::BootServicesData
+                | UefiMemoryType::RuntimeServicesCode
+                | UefiMemoryType::RuntimeServicesData
+                | UefiMemoryType::AcpiReclaimMemory
+                | UefiMemoryType::AcpiMemoryNvs
+        ) {
+            continue;
+        }
+        let Some(end) = desc
+            .number_of_pages
+            .checked_mul(4096)
+            .and_then(|len| desc.phys_start.as_u64().checked_add(len))
+        else {
+            continue;
+        };
         if end > max_phys_ram && end <= 0x1_0000_0000 {
             // Keep below 4GB (standard RAM boundary)
             max_phys_ram = end;
@@ -44,7 +65,9 @@ pub fn init_memory(boot_info: &BootHandoverInfo) {
 
     // 3. Identity-map physical memory up to max_phys_ram for kernel text, data, and hardware IO
     // Crucial: Flags are PRESENT | WRITABLE (Supervisor-only: USER bit is NOT set!)
-    let kflags = vmm::PageTableFlags::PRESENT | vmm::PageTableFlags::WRITABLE;
+    let kflags = vmm::PageTableFlags::PRESENT
+        | vmm::PageTableFlags::WRITABLE
+        | vmm::PageTableFlags::NO_EXECUTE;
     kernel_as
         .map_identity(
             PhysicalAddress::new(0),
@@ -60,7 +83,28 @@ pub fn init_memory(boot_info: &BootHandoverInfo) {
 
     // 4. Identity-map Framebuffer MMIO memory (Supervisor-only)
     if let Some(ref fb) = boot_info.framebuffer {
-        let _ = kernel_as.map_identity(fb.base_address, fb.size, kflags, &mut pmm);
+        let end = fb
+            .base_address
+            .as_u64()
+            .checked_add(fb.size as u64)
+            .and_then(|value| value.checked_add(4095))
+            .expect("framebuffer range overflow")
+            & !4095;
+        for addr in ((fb.base_address.as_u64() & !4095)..end).step_by(4096) {
+            if let Some(existing) = kernel_as.mapping(VirtualAddress::new(addr)) {
+                assert_eq!(existing.physical_address.as_u64(), addr);
+                assert!(!existing.flags.contains(vmm::PageTableFlags::USER));
+            } else {
+                kernel_as
+                    .map_page(
+                        VirtualAddress::new(addr),
+                        PhysicalAddress::new(addr),
+                        kflags,
+                        &mut pmm,
+                    )
+                    .expect("framebuffer mapping failed");
+            }
+        }
         serial_println!(
             "[+] Identity mapped Framebuffer at {:#018X} ({} bytes)",
             fb.base_address.as_u64(),
@@ -68,8 +112,20 @@ pub fn init_memory(boot_info: &BootHandoverInfo) {
         );
     }
 
+    assert!(
+        boot_info.kernel_code_len > 0 && boot_info.kernel_code_len <= boot_info.kernel_code.len(),
+        "Actual UEFI-loaded kernel code layout required"
+    );
+    for &(start, length) in &boot_info.kernel_code[..boot_info.kernel_code_len] {
+        for address in (start..start + length).step_by(4096) {
+            kernel_as
+                .protect_kernel_code(VirtualAddress::new(address))
+                .expect("kernel RX mapping");
+        }
+    }
+
     // 5. Read current CR3 before switch
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     unsafe {
         let old_cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) old_cr3, options(nomem, nostack, preserves_flags));

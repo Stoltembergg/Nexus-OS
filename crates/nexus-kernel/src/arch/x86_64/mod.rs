@@ -33,7 +33,7 @@ pub fn set_kernel_stack(rsp0: u64) {
 /// The caller must ensure that `addr` is a canonical virtual address and that
 /// writing to IA32_FS_BASE is supported by the CPU.
 pub unsafe fn set_user_fs_base(addr: u64) {
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     {
         let low = addr as u32;
         let high = (addr >> 32) as u32;
@@ -45,7 +45,7 @@ pub unsafe fn set_user_fs_base(addr: u64) {
             options(nostack, preserves_flags)
         );
     }
-    #[cfg(any(not(target_arch = "x86_64"), test))]
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
     let _ = addr;
 }
 
@@ -56,7 +56,7 @@ pub unsafe fn set_user_fs_base(addr: u64) {
 /// The caller must ensure that `addr` is a canonical virtual address and that
 /// writing to IA32_GS_BASE is supported by the CPU.
 pub unsafe fn set_user_gs_base(addr: u64) {
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     {
         let low = addr as u32;
         let high = (addr >> 32) as u32;
@@ -68,7 +68,7 @@ pub unsafe fn set_user_gs_base(addr: u64) {
             options(nostack, preserves_flags)
         );
     }
-    #[cfg(any(not(target_arch = "x86_64"), test))]
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
     let _ = addr;
 }
 
@@ -78,18 +78,35 @@ pub fn init_arch() {
     serial::SERIAL1.lock().init();
 
     // 2. Enable SSE / FXSR in CR0 and CR4 to allow compiler vector instructions
-    #[cfg(all(target_arch = "x86_64", not(test)))]
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
     unsafe {
         let mut cr0: u64;
+        core::arch::asm!("cli", options(nomem, nostack));
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
         cr0 &= !(1 << 2); // Clear CR0.EM (Emulation)
-        cr0 |= 1 << 1; // Set CR0.MP (Monitor Coprocessor)
+        cr0 |= (1 << 1) | (1 << 16); // MP and supervisor write protection (WP)
         core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
 
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
         cr4 |= (1 << 9) | (1 << 10); // Set CR4.OSFXSR and CR4.OSXMMEXCPT
+                                     // FXSAVE context covers x87/SSE. Do not advertise user AVX or FSGSBASE.
+                                     // Clear PGE to flush inherited firmware global translations.
+        cr4 &= !((1 << 18) | (1 << 16) | (1 << 7));
+        let features = core::arch::x86_64::__cpuid_count(7, 0).ebx;
+        if features & (1 << 7) != 0 {
+            cr4 |= 1 << 20;
+        } // SMEP
+        if features & (1 << 20) != 0 {
+            cr4 |= 1 << 21;
+        } // SMAP (copies use supervisor aliases)
         core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+        let efer = crate::syscall::rdmsr(crate::syscall::IA32_EFER_MSR);
+        assert!(
+            core::arch::x86_64::__cpuid(0x80000001).edx & (1 << 20) != 0,
+            "CPU NX required"
+        );
+        crate::syscall::wrmsr(crate::syscall::IA32_EFER_MSR, efer | (1 << 11)); // NXE
     }
 
     // 3. Setup GDT and TSS
@@ -102,7 +119,7 @@ pub fn init_arch() {
         GDT = Some(GdtTable::from_tss_ptr(&raw const TSS));
         if let Some(ref gdt) = GDT {
             let ptr = gdt.pointer();
-            #[cfg(all(target_arch = "x86_64", not(test)))]
+            #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
             {
                 core::arch::asm!(
                     "lgdt [{}]",
@@ -127,7 +144,7 @@ pub fn init_arch() {
                     options(preserves_flags)
                 );
             }
-            #[cfg(test)]
+            #[cfg(not(any(target_os = "uefi", target_os = "none")))]
             {
                 let _ = ptr;
             }
@@ -140,7 +157,7 @@ pub fn init_arch() {
         idt::arm_exception_gates(&mut idt);
 
         let ptr = idt.pointer();
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+        #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
         unsafe {
             core::arch::asm!(
                 "lidt [{}]",
@@ -148,7 +165,7 @@ pub fn init_arch() {
                 options(readonly, nostack, preserves_flags)
             );
         }
-        #[cfg(test)]
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
         {
             let _ = ptr;
         }

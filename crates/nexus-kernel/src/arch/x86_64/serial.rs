@@ -39,11 +39,18 @@ impl SerialPort {
 
     /// Writes a single byte over the serial line.
     pub fn write_byte(&self, byte: u8) {
-        while !self.is_transmit_empty() {
-            core::hint::spin_loop();
+        #[cfg(not(any(target_os = "uefi", target_os = "none")))]
+        {
+            let _ = byte;
         }
-        unsafe {
-            self.outb(0, byte);
+        #[cfg(any(target_os = "uefi", target_os = "none"))]
+        {
+            while !self.is_transmit_empty() {
+                core::hint::spin_loop();
+            }
+            unsafe {
+                self.outb(0, byte);
+            }
         }
     }
 
@@ -59,7 +66,7 @@ impl SerialPort {
 
     #[inline]
     unsafe fn outb(&self, offset: u16, val: u8) {
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+        #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
         {
             let port = self.port + offset;
             core::arch::asm!(
@@ -69,15 +76,15 @@ impl SerialPort {
                 options(nomem, nostack, preserves_flags)
             );
         }
-        #[cfg(any(not(target_arch = "x86_64"), test))]
+        #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
         {
-            let _ = (offset, val);
+            let _ = (self.port, offset, val);
         }
     }
 
     #[inline]
     unsafe fn inb(&self, offset: u16) -> u8 {
-        #[cfg(all(target_arch = "x86_64", not(test)))]
+        #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
         {
             let port = self.port + offset;
             let val: u8;
@@ -89,10 +96,10 @@ impl SerialPort {
             );
             val
         }
-        #[cfg(any(not(target_arch = "x86_64"), test))]
+        #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
         {
-            let _ = offset;
-            0x20 // Simulate transmit buffer empty in test mode
+            let _ = (self.port, offset);
+            0 // Host has no UART; do not invent hardware state
         }
     }
 }
@@ -133,6 +140,6 @@ mod tests {
     fn test_serial_port_construction() {
         let port = SerialPort::new(COM1_PORT);
         assert_eq!(port.port, 0x3F8);
-        assert!(port.is_transmit_empty());
+        assert!(!port.is_transmit_empty());
     }
 }

@@ -36,6 +36,74 @@ pub struct ElfProgramHeader {
     pub p_align: u64,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image() -> Vec<u8> {
+        let mut bytes = vec![0; 4096];
+        bytes[..4].copy_from_slice(&ELF_MAGIC);
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        LittleEndian::write_u16(&mut bytes[16..18], 2);
+        LittleEndian::write_u16(&mut bytes[18..20], EM_X86_64);
+        LittleEndian::write_u32(&mut bytes[20..24], 1);
+        LittleEndian::write_u64(&mut bytes[24..32], 0x401000);
+        LittleEndian::write_u64(&mut bytes[32..40], 64);
+        LittleEndian::write_u16(&mut bytes[52..54], 64);
+        LittleEndian::write_u16(&mut bytes[54..56], 56);
+        LittleEndian::write_u16(&mut bytes[56..58], 1);
+        LittleEndian::write_u32(&mut bytes[64..68], PT_LOAD);
+        LittleEndian::write_u32(&mut bytes[68..72], PF_R | PF_X);
+        LittleEndian::write_u64(&mut bytes[72..80], 0);
+        LittleEndian::write_u64(&mut bytes[80..88], 0x401000);
+        LittleEndian::write_u64(&mut bytes[96..104], 4096);
+        LittleEndian::write_u64(&mut bytes[104..112], 4096);
+        LittleEndian::write_u64(&mut bytes[112..120], 4096);
+        bytes
+    }
+
+    #[test]
+    fn program_header_offset_overflow_is_rejected_without_panic() {
+        let mut bytes = image();
+        LittleEndian::write_u64(&mut bytes[32..40], u64::MAX - 7);
+        let result = std::panic::catch_unwind(|| ElfImage::parse(&bytes));
+        assert!(result.is_ok(), "untrusted ELF must not panic");
+        assert!(result.unwrap().is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_segments_filesz_exceeding_memsz_and_bad_entry() {
+        for field in [72, 96, 104, 24] {
+            let mut bytes = image();
+            LittleEndian::write_u64(
+                &mut bytes[field..field + 8],
+                if field == 104 { 1 } else { u64::MAX - 4095 },
+            );
+            assert!(
+                ElfImage::parse(&bytes).is_err(),
+                "accepted bad field {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_program_header_size_alignment_and_overlaps() {
+        let mut bytes = image();
+        LittleEndian::write_u16(&mut bytes[54..56], 0);
+        assert!(ElfImage::parse(&bytes).is_err());
+        let mut bytes = image();
+        LittleEndian::write_u64(&mut bytes[112..120], 3);
+        assert!(ElfImage::parse(&bytes).is_err());
+        let mut bytes = image();
+        LittleEndian::write_u16(&mut bytes[56..58], 2);
+        let ph = bytes[64..120].to_vec();
+        bytes[120..176].copy_from_slice(&ph);
+        assert!(ElfImage::parse(&bytes).is_err());
+    }
+}
+
 impl ElfProgramHeader {
     pub fn memory_flags(&self) -> MemoryFlags {
         let mut flags = MemoryFlags::USER;
@@ -96,6 +164,27 @@ impl ElfImage {
         let phentsize = LittleEndian::read_u16(&bytes[54..56]) as usize;
         let phnum = LittleEndian::read_u16(&bytes[56..58]) as usize;
 
+        if bytes[6] != 1
+            || LittleEndian::read_u32(&bytes[20..24]) != 1
+            || LittleEndian::read_u16(&bytes[52..54]) != 64
+            || !matches!(elf_type, 2 | 3)
+            || phentsize != 56
+            || phnum == 0
+            || phnum > 128
+        {
+            return Err(LoaderError::CorruptedBinary);
+        }
+        let table_end = phoff
+            .checked_add(
+                phnum
+                    .checked_mul(phentsize)
+                    .ok_or(LoaderError::CorruptedBinary)?,
+            )
+            .ok_or(LoaderError::CorruptedBinary)?;
+        if phoff < 64 || table_end > bytes.len() {
+            return Err(LoaderError::CorruptedBinary);
+        }
+
         // 4. Parse Program Headers
         let mut program_headers = Vec::with_capacity(phnum);
         for i in 0..phnum {
@@ -128,11 +217,74 @@ impl ElfImage {
             });
         }
 
-        Ok(Self {
+        let image = Self {
             entry_point,
             elf_type,
             program_headers,
-        })
+        };
+        image.validate(bytes)?;
+        Ok(image)
+    }
+
+    /// Checks loader invariants even for callers constructing an image directly.
+    pub fn validate(&self, bytes: &[u8]) -> Result<(), LoaderError> {
+        let mut total = 0u64;
+        let mut executable_entry = false;
+        for (i, ph) in self
+            .program_headers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.p_type == PT_LOAD)
+        {
+            let file_end = ph
+                .p_offset
+                .checked_add(ph.p_filesz)
+                .ok_or(LoaderError::CorruptedBinary)?;
+            let end = ph
+                .p_vaddr
+                .checked_add(ph.p_memsz)
+                .ok_or(LoaderError::CorruptedBinary)?;
+            if ph.p_filesz > ph.p_memsz
+                || file_end > bytes.len() as u64
+                || ph.p_vaddr == 0
+                || end > 0x0000_8000_0000_0000
+                || ph.p_memsz > 64 * 1024 * 1024
+                || ph.p_flags & !7 != 0
+                || (ph.p_align > 1
+                    && (!ph.p_align.is_power_of_two()
+                        || ph.p_vaddr % ph.p_align != ph.p_offset % ph.p_align))
+            {
+                return Err(LoaderError::CorruptedBinary);
+            }
+            total = total
+                .checked_add(ph.p_memsz)
+                .ok_or(LoaderError::CorruptedBinary)?;
+            if total > 64 * 1024 * 1024 {
+                return Err(LoaderError::CorruptedBinary);
+            }
+            if ph.p_memsz != 0 {
+                for other in self.program_headers[..i]
+                    .iter()
+                    .filter(|p| p.p_type == PT_LOAD && p.p_memsz != 0)
+                {
+                    let other_end = other
+                        .p_vaddr
+                        .checked_add(other.p_memsz)
+                        .ok_or(LoaderError::CorruptedBinary)?;
+                    if (ph.p_vaddr & !4095) < other_end.div_ceil(4096) * 4096
+                        && (other.p_vaddr & !4095) < end.div_ceil(4096) * 4096
+                    {
+                        return Err(LoaderError::AddressOverlap(ph.p_vaddr));
+                    }
+                }
+                executable_entry |=
+                    ph.p_flags & PF_X != 0 && (ph.p_vaddr..end).contains(&self.entry_point);
+            }
+        }
+        if !executable_entry {
+            return Err(LoaderError::CorruptedBinary);
+        }
+        Ok(())
     }
 
     pub fn entry_point_va(&self) -> VirtualAddress {

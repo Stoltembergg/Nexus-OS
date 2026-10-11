@@ -86,6 +86,8 @@ impl Default for MemoryDescriptor {
 /// Boot handover information structure passed from the UEFI loader to the kernel entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BootHandoverInfo {
+    pub kernel_code: [(u64, u64); 16], // actual loaded VA / page-rounded length
+    pub kernel_code_len: usize,
     pub rsdp_address: Option<PhysicalAddress>,
     pub framebuffer: Option<FramebufferInfo>,
     pub memory_map_len: usize,
@@ -95,6 +97,8 @@ pub struct BootHandoverInfo {
 impl BootHandoverInfo {
     pub const fn new() -> Self {
         Self {
+            kernel_code: [(0, 0); 16],
+            kernel_code_len: 0,
             rsdp_address: None,
             framebuffer: None,
             memory_map_len: 0,

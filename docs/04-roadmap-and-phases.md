@@ -4,6 +4,8 @@ The development of Nexus OS is structured into incremental, verifiable phases. E
 
 ---
 
+> Phase 3.5 is now the active gate before Phase 4. Earlier "Done" milestones refer to their original limited demonstrations; [the hardening report](09-phase3.5-kernel-hardening.md) supersedes broad validation claims and records remaining blockers.
+
 ## Phase Overview
 
 ```
@@ -24,6 +26,11 @@ The development of Nexus OS is structured into incremental, verifiable phases. E
                                     v
 +--------------------------------------------------------------------------+
 | Phase 3: Unified PE32+ / ELF64 Execution & Cooperative Scheduling (Done) |
++--------------------------------------------------------------------------+
+                                    |
+                                    v
++--------------------------------------------------------------------------+
+| Phase 3.5: Kernel Hardening & Architecture Validation (In progress)    |
 +--------------------------------------------------------------------------+
                                     |
                                     v

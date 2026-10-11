@@ -1,17 +1,21 @@
 //! Nexus OS Binary Loader Engine (PE32+ & ELF64).
 //!
-//! Provides parsing, validation, segment extraction, and address mapping
-//! for both Windows NT and Linux 64-bit binaries.
+//! Provides parsing, validation, segment extraction, address mapping,
+//! and NT kernel-mode driver hosting for both Windows NT and Linux 64-bit binaries.
 
+pub mod driver;
 pub mod elf;
 pub mod error;
 pub mod mapper;
 pub mod pe;
 
+pub use driver::{LoadedDriver, NtDriverError, NtDriverHost, NtoskrnlTable};
 pub use elf::ElfImage;
 pub use error::LoaderError;
 pub use mapper::{LoadedImage, MappedSegment};
 pub use pe::PeImage;
+
+use byteorder::{ByteOrder, LittleEndian};
 
 /// Detects the executable format from raw file bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +34,7 @@ pub fn detect_format(bytes: &[u8]) -> BinaryFormat {
         return BinaryFormat::Elf64;
     }
 
-    if bytes.len() >= 2 && bytes[0..2] == *b"MZ" {
+    if bytes.len() >= 2 && LittleEndian::read_u16(&bytes[0..2]) == pe::IMAGE_DOS_SIGNATURE {
         return BinaryFormat::Pe32Plus;
     }
 

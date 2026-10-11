@@ -1,18 +1,11 @@
-//! Hardware Syscall Dispatcher with Dual Personality (NT SSDT / Linux Pico).
-//!
-//! Handles transitions initiated by the `syscall` CPU instruction in Ring 3.
-//! Implements strict user pointer validation, boundary checks, and routing based on
-//! the active thread's `ProcessPersonality`.
-
-use crate::mem::vmm::AddressSpace;
+//! Real hardware syscall path; user access checks effective permissions at every level.
+use crate::mem::vmm::{AddressSpace, PageTableFlags};
 use core::sync::atomic::{AtomicU64, Ordering};
-use nexus_types::errno::Errno;
-use nexus_types::VirtualAddress;
-
+use nexus_types::{errno::Errno, VirtualAddress};
 pub static LAST_SYSCALL_EXIT_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SyscallFrame {
     pub rax: u64,
     pub r10: u64,
@@ -27,243 +20,239 @@ pub struct SyscallFrame {
     pub r12: u64,
     pub rbx: u64,
     pub rbp: u64,
-    pub rcx: u64, // Saved user RIP (from RCX)
-    pub r11: u64, // Saved user RFLAGS (from R11)
-    pub rsp: u64, // Saved user RSP
+    pub rcx: u64,
+    pub r11: u64,
+    pub rsp: u64,
+    pub fs_base: u64,
+    pub gs_base: u64,
 }
-
 #[no_mangle]
 pub static mut KERNEL_RSP_SCRATCH: u64 = 0;
-
 #[no_mangle]
 pub static mut USER_RSP_SCRATCH: u64 = 0;
-
 pub const USER_CEILING: u64 = 0x0000_8000_0000_0000;
 
-/// Validates that a user-provided buffer is safely within user memory bounds.
 pub fn validate_user_buffer(
-    user_ptr: u64,
+    ptr: u64,
     len: usize,
-    _require_writable: bool,
-    address_space: &AddressSpace,
+    writable: bool,
+    space: &AddressSpace,
 ) -> Result<(), Errno> {
     if len == 0 {
         return Ok(());
     }
-
-    let end_ptr = user_ptr.checked_add(len as u64).ok_or(Errno::EFAULT)?;
-
-    if end_ptr > USER_CEILING || user_ptr >= USER_CEILING || user_ptr == 0 {
+    let end = ptr.checked_add(len as u64).ok_or(Errno::EFAULT)?;
+    if ptr == 0 || ptr >= USER_CEILING || end > USER_CEILING {
         return Err(Errno::EFAULT);
     }
-
-    // Verify all pages spanned by buffer are mapped and present in user address space
-    let start_page = user_ptr & !0xFFF;
-    let end_page = (end_ptr + 0xFFF) & !0xFFF;
-
-    let mut curr = start_page;
-    while curr < end_page {
-        let vaddr = VirtualAddress::new(curr);
-        if address_space.translate(vaddr).is_none() {
+    for page in ((ptr & !4095)..end).step_by(4096) {
+        let mapping = space
+            .mapping(VirtualAddress::new(page))
+            .ok_or(Errno::EFAULT)?;
+        if !mapping.flags.contains(PageTableFlags::USER)
+            || (writable && !mapping.flags.contains(PageTableFlags::WRITABLE))
+        {
             return Err(Errno::EFAULT);
         }
-        curr += 4096;
     }
-
+    Ok(())
+}
+pub fn validate_return_context(frame: &SyscallFrame, space: &AddressSpace) -> Result<(), Errno> {
+    validate_user_buffer(frame.rcx, 1, false, space)?;
+    validate_user_buffer(
+        frame.rsp.checked_sub(1).ok_or(Errno::EFAULT)?,
+        1,
+        true,
+        space,
+    )?;
+    let code = space
+        .mapping(VirtualAddress::new(frame.rcx))
+        .ok_or(Errno::EFAULT)?;
+    if code.flags.contains(PageTableFlags::NO_EXECUTE)
+        || frame.fs_base >= USER_CEILING
+        || frame.gs_base >= USER_CEILING
+    {
+        return Err(Errno::EFAULT);
+    }
     Ok(())
 }
 
-/// Safely copies bytes from Ring 3 memory into a kernel buffer after validation.
+/// Copy through supervisor physical aliases, independent of the current CR3.
 pub fn safe_copy_from_user(
     dest: &mut [u8],
-    user_src: u64,
+    src: u64,
     len: usize,
-    address_space: &AddressSpace,
+    space: &AddressSpace,
 ) -> Result<usize, Errno> {
-    let to_copy = dest.len().min(len);
-    validate_user_buffer(user_src, to_copy, false, address_space)?;
-
-    #[cfg(all(target_arch = "x86_64", not(test)))]
-    unsafe {
-        let src_ptr = user_src as *const u8;
-        core::ptr::copy_nonoverlapping(src_ptr, dest.as_mut_ptr(), to_copy);
+    let count = dest.len().min(len);
+    validate_user_buffer(src, count, false, space)?;
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    for (offset, byte) in dest.iter_mut().enumerate().take(count) {
+        let pa = space
+            .translate(VirtualAddress::new(src + offset as u64))
+            .ok_or(Errno::EFAULT)?;
+        unsafe {
+            *byte = core::ptr::read(pa.as_u64() as *const u8);
+        }
     }
-
-    #[cfg(any(not(target_arch = "x86_64"), test))]
-    {
-        let _ = (dest, user_src, to_copy);
+    Ok(count)
+}
+pub fn safe_copy_to_user(dest: u64, src: &[u8], space: &AddressSpace) -> Result<(), Errno> {
+    validate_user_buffer(dest, src.len(), true, space)?;
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    for (offset, value) in src.iter().enumerate() {
+        let pa = space
+            .translate(VirtualAddress::new(dest + offset as u64))
+            .ok_or(Errno::EFAULT)?;
+        unsafe {
+            core::ptr::write(pa.as_u64() as *mut u8, *value);
+        }
     }
-
-    Ok(to_copy)
+    Ok(())
+}
+fn user_u64(ptr: u64, space: &AddressSpace) -> Result<u64, Errno> {
+    let mut bytes = [0; 8];
+    safe_copy_from_user(&mut bytes, ptr, 8, space)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+fn write_serial(bytes: &[u8]) {
+    let port = crate::arch::x86_64::serial::SERIAL1.lock();
+    for byte in bytes {
+        port.write_byte(*byte);
+    }
 }
 
 #[no_mangle]
-pub extern "C" fn raw_syscall_dispatcher(frame: &mut SyscallFrame) {
-    let personality = crate::task::get_active_personality();
-
-    if personality.is_windows() {
+pub extern "win64" fn raw_syscall_dispatcher(frame: &mut SyscallFrame) {
+    #[cfg(all(
+        feature = "hardening-tests",
+        any(target_os = "uefi", target_os = "none")
+    ))]
+    crate::hardening::assert_kernel_fx();
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    unsafe {
+        frame.fs_base = crate::syscall::rdmsr(0xc0000100);
+        frame.gs_base = crate::syscall::rdmsr(0xc0000101);
+    }
+    // Cooperative kernel keeps IF disabled. User may retain arithmetic flags and DF only.
+    frame.r11 = (frame.r11 & 0xcd5) | 2;
+    let space = crate::task::get_active_address_space();
+    if validate_return_context(frame, &space).is_err() {
+        crate::task::trigger_user_abort(13);
+        return;
+    }
+    if crate::task::get_active_personality().is_windows() {
         dispatch_nt_syscall(frame);
     } else {
         dispatch_linux_syscall(frame);
     }
 }
-
 fn dispatch_nt_syscall(frame: &mut SyscallFrame) {
-    let service_id = frame.rax as u32;
-
-    match service_id {
-        // NtWriteFile (0x0008)
+    if frame.rax > u32::MAX as u64 {
+        frame.rax = 0xc0000002;
+        return;
+    }
+    match frame.rax as u32 {
         0x0008 => {
-            let active_as = crate::task::get_active_address_space();
-            let mut buf_ptr = frame.rdx;
-            let mut count = frame.r8 as usize;
-
-            // Check if buffer pointer and length were passed on stack (Win64 NT convention)
-            let stack_buf_slot = frame.rsp.wrapping_add(0x30);
-            if validate_user_buffer(stack_buf_slot, 8, false, &active_as).is_ok() {
-                let stack_val = unsafe { *(stack_buf_slot as *const u64) };
-                if (0x4000_0000..USER_CEILING).contains(&stack_val) {
-                    buf_ptr = stack_val;
-                    let stack_len_slot = frame.rsp.wrapping_add(0x38);
-                    if validate_user_buffer(stack_len_slot, 8, false, &active_as).is_ok() {
-                        let l = unsafe { *(stack_len_slot as *const u64) } as usize;
-                        if l > 0 && l < 1024 {
-                            count = l;
-                        }
-                    }
+            let space = crate::task::get_active_address_space();
+            // NT x64: first argument in R10, fifth onward on user stack.
+            let args = (|| -> Result<(u64, u64, usize), Errno> {
+                let iosb = user_u64(frame.rsp.checked_add(0x28).ok_or(Errno::EFAULT)?, &space)?;
+                let buffer = user_u64(frame.rsp.checked_add(0x30).ok_or(Errno::EFAULT)?, &space)?;
+                let len =
+                    user_u64(frame.rsp.checked_add(0x38).ok_or(Errno::EFAULT)?, &space)? as usize;
+                validate_user_buffer(iosb, 16, true, &space)?;
+                Ok((iosb, buffer, len))
+            })();
+            let (iosb, ptr, len) = match args {
+                Ok(args) => args,
+                Err(_) => {
+                    frame.rax = 0xc0000005;
+                    return;
                 }
-            }
-
-            let mut local_buf = [0u8; 256];
-            let to_read = count.min(local_buf.len());
-
-            if let Err(e) = validate_user_buffer(buf_ptr, to_read, false, &active_as) {
-                serial_println!(
-                    "[Kernel Syscall] NtWriteFile rejected invalid pointer {:#018X} ({:?})",
-                    buf_ptr,
-                    e
-                );
-                frame.rax = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+            };
+            if !matches!(frame.r10, 1 | 2) {
+                frame.rax = 0xc0000008;
                 return;
             }
-
-            if let Ok(copied) = safe_copy_from_user(&mut local_buf, buf_ptr, to_read, &active_as) {
-                if let Ok(s) = core::str::from_utf8(&local_buf[..copied]) {
-                    serial_print!("[Ring 3 WinPE]: {}", s);
-                }
-                frame.rax = 0; // STATUS_SUCCESS
+            if frame.rdx != 0 || frame.r8 != 0 || frame.r9 != 0 || len > 256 {
+                frame.rax = 0xc000000d;
                 return;
             }
-
-            frame.rax = 0;
+            let mut bytes = [0; 256];
+            match safe_copy_from_user(&mut bytes, ptr, len, &space) {
+                Ok(count) => {
+                    write_serial(&bytes[..count]);
+                    let mut status = [0; 16];
+                    status[8..16].copy_from_slice(&(count as u64).to_le_bytes());
+                    frame.rax = if safe_copy_to_user(iosb, &status, &space).is_ok() {
+                        0
+                    } else {
+                        0xc0000005
+                    };
+                }
+                Err(_) => frame.rax = 0xc0000005,
+            }
         }
-
-        // NtYieldExecution (0x0050)
         0x0050 => {
-            serial_println!("[Kernel Syscall] NtYieldExecution invoked by Windows PE32+ task.");
+            frame.rax = 0;
             crate::task::save_active_thread_registers(frame);
             crate::task::trigger_user_yield();
         }
-
-        // NtTerminateProcess (0x002C)
-        0x002C => {
-            let exit_code = frame.rdx as i32;
-            serial_println!(
-                "[Kernel Syscall] NtTerminateProcess invoked (status={})",
-                exit_code
-            );
-            LAST_SYSCALL_EXIT_CODE.store(exit_code as u64, Ordering::SeqCst);
-            crate::task::trigger_user_abort(exit_code);
-        }
-
-        _ => {
-            serial_println!(
-                "[Kernel Syscall] Unhandled NT service ID: {:#06X}",
-                service_id
-            );
-            frame.rax = 0xC000_0002; // STATUS_NOT_IMPLEMENTED
-        }
-    }
-}
-
-fn dispatch_linux_syscall(frame: &mut SyscallFrame) {
-    let syscall_nr = frame.rax;
-
-    match syscall_nr {
-        // Linux SYS_WRITE (1): fd = rdi, buf = rsi, count = rdx
-        1 => {
-            let fd = frame.rdi;
-            let user_buf = frame.rsi;
-            let count = frame.rdx as usize;
-
-            if fd == 1 || fd == 2 {
-                let mut local_buf = [0u8; 256];
-                let to_read = count.min(local_buf.len());
-
-                let active_as = crate::task::get_active_address_space();
-                if let Err(e) = validate_user_buffer(user_buf, to_read, false, &active_as) {
-                    serial_println!(
-                        "[Kernel Syscall] SYS_WRITE rejected: Invalid user pointer {:#018X} ({:?})",
-                        user_buf,
-                        e
-                    );
-                    frame.rax = e.as_ret_val() as u64;
-                    return;
-                }
-
-                if let Ok(copied) =
-                    safe_copy_from_user(&mut local_buf, user_buf, to_read, &active_as)
-                {
-                    if let Ok(s) = core::str::from_utf8(&local_buf[..copied]) {
-                        serial_print!("[Ring 3 Linux]: {}", s);
-                    }
-                    frame.rax = copied as u64;
-                    return;
-                }
+        0x002c => {
+            if frame.r10 != u64::MAX {
+                frame.rax = 0xc0000008;
+                return;
             }
-            frame.rax = count as u64;
+            let code = frame.rdx as i32;
+            LAST_SYSCALL_EXIT_CODE.store(code as u64, Ordering::Relaxed);
+            crate::task::finish_user(crate::task::RunOutcome::Exit(code));
         }
-
-        // Linux SYS_SCHED_YIELD (24)
+        _ => frame.rax = 0xc0000002,
+    }
+}
+fn dispatch_linux_syscall(frame: &mut SyscallFrame) {
+    match frame.rax {
+        1 => {
+            if !matches!(frame.rdi, 1 | 2) {
+                frame.rax = Errno::EBADF.as_ret_val() as u64;
+                return;
+            }
+            let space = crate::task::get_active_address_space();
+            let mut bytes = [0; 256];
+            match safe_copy_from_user(&mut bytes, frame.rsi, frame.rdx as usize, &space) {
+                Ok(count) => {
+                    write_serial(&bytes[..count]);
+                    frame.rax = count as u64;
+                }
+                Err(error) => frame.rax = error.as_ret_val() as u64,
+            }
+        }
         24 => {
-            serial_println!("[Kernel Syscall] SYS_SCHED_YIELD invoked by Linux ELF64 task.");
+            frame.rax = 0;
             crate::task::save_active_thread_registers(frame);
             crate::task::trigger_user_yield();
         }
-
-        // Linux SYS_EXIT (60) or SYS_EXIT_GROUP (231): status = rdi
         60 | 231 => {
-            let exit_code = frame.rdi as i32;
-            serial_println!(
-                "[Kernel Syscall] Linux sys_exit invoked (status={})",
-                exit_code
-            );
-            LAST_SYSCALL_EXIT_CODE.store(exit_code as u64, Ordering::SeqCst);
-            crate::task::trigger_user_abort(exit_code);
+            let code = frame.rdi as i32;
+            LAST_SYSCALL_EXIT_CODE.store(code as u64, Ordering::Relaxed);
+            crate::task::finish_user(crate::task::RunOutcome::Exit(code));
         }
-
-        _ => {
-            serial_println!("[Kernel Syscall] Unknown Linux syscall nr: {}", syscall_nr);
-            frame.rax = Errno::ENOSYS.as_ret_val() as u64;
-        }
+        _ => frame.rax = Errno::ENOSYS.as_ret_val() as u64,
     }
 }
 
-#[cfg(all(target_arch = "x86_64", not(test)))]
+#[cfg(any(target_os = "uefi", target_os = "none"))]
 core::arch::global_asm!(
     r#"
     .global asm_syscall_entry
     asm_syscall_entry:
-        // 1. Save user RSP to scratch variable
         mov [rip + USER_RSP_SCRATCH], rsp
-
-        // 2. Load dedicated kernel stack
         mov rsp, [rip + KERNEL_RSP_SCRATCH]
-
-        // 3. Push saved user context
-        push qword ptr [rip + USER_RSP_SCRATCH] // Saved User RSP
-        push r11                                // Saved User RFLAGS
-        push rcx                                // Saved User RIP
+        sub rsp, 16 // FS/GS slots filled by dispatcher
+        push qword ptr [rip + USER_RSP_SCRATCH]
+        push r11
+        push rcx
         push rbp
         push rbx
         push r12
@@ -277,15 +266,17 @@ core::arch::global_asm!(
         push r9
         push r10
         push rax
-
-        // 4. Pass pointer to SyscallFrame
+        fxsave64 [rip + USER_FX]
+        // User floating-point controls must not affect Rust kernel code.
+        fxrstor64 [rip + KERNEL_SAVED_CTX + 0x60]
+        cld
         mov rcx, rsp
-        mov rdi, rsp
-        sub rsp, 40 // Shadow space
+        sub rsp, 32 // Win64 shadow space; pre-CALL RSP aligned to 16
         call raw_syscall_dispatcher
-        add rsp, 40
-
-        // 5. Restore user context
+        add rsp, 32
+        fxrstor64 [rip + USER_FX]
+    .global asm_restore_user_frame
+    asm_restore_user_frame:
         pop rax
         pop r10
         pop r9
@@ -299,57 +290,50 @@ core::arch::global_asm!(
         pop r12
         pop rbx
         pop rbp
-        pop rcx // Restore user RIP into RCX
-        pop r11 // Restore user RFLAGS into R11
-        pop rsp // Restore user RSP directly
-
-        sysretq
-    "#
+        pop rcx
+        pop r11
+        // IRET avoids non-canonical SYSRET faults in Ring 0, and never loads user RSP in Ring 0.
+        push 0x1b
+        push qword ptr [rsp + 8]
+        push r11
+        push 0x23
+        push rcx
+        iretq
+"#
 );
-
-#[cfg(all(target_arch = "x86_64", not(test)))]
+#[cfg(any(target_os = "uefi", target_os = "none"))]
 extern "C" {
     pub fn asm_syscall_entry();
 }
-
-#[cfg(any(not(target_arch = "x86_64"), test))]
+#[cfg(not(any(target_os = "uefi", target_os = "none")))]
 pub extern "C" fn asm_syscall_entry() {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mem::vmm::AddressSpace;
     use nexus_types::PhysicalAddress;
-
     #[test]
     fn test_user_buffer_bounds_check() {
-        let dummy_as = AddressSpace::from_pml4(PhysicalAddress::new(0x1000));
-
-        // Canonical user addresses: 0x400000
-        assert!(validate_user_buffer(0x0040_0000, 32, false, &dummy_as).is_ok());
-
-        // Kernel higher addresses: 0xFFFF_8000_0000_0000 -> Must return EFAULT
-        assert_eq!(
-            validate_user_buffer(0xFFFF_8000_0000_0000, 32, false, &dummy_as),
-            Err(Errno::EFAULT)
-        );
-
-        // Address overflowing past canonical ceiling: 0x0000_7FFF_FFFF_FFF0 with len 0x100 -> EFAULT
-        assert_eq!(
-            validate_user_buffer(0x0000_7FFF_FFFF_FFF0, 0x100, false, &dummy_as),
-            Err(Errno::EFAULT)
-        );
-
-        // Integer overflow -> EFAULT
-        assert_eq!(
-            validate_user_buffer(u64::MAX - 10, 20, false, &dummy_as),
-            Err(Errno::EFAULT)
-        );
-
-        // Null pointer -> EFAULT
-        assert_eq!(
-            validate_user_buffer(0, 16, false, &dummy_as),
-            Err(Errno::EFAULT)
-        );
+        let space = AddressSpace::from_pml4(PhysicalAddress::new(0x1000));
+        for (ptr, len) in [
+            (0x400000, 32),
+            (0xffff800000000000, 32),
+            (0x7ffffffffff0, 256),
+            (u64::MAX - 10, 20),
+            (0, 16),
+        ] {
+            assert_eq!(
+                validate_user_buffer(ptr, len, false, &space),
+                Err(Errno::EFAULT)
+            );
+        }
+        assert_eq!(validate_user_buffer(0, 0, false, &space), Ok(()));
+    }
+    #[test]
+    fn frame_layout_matches_hardware_entry() {
+        assert_eq!(core::mem::offset_of!(SyscallFrame, rsp), 0x78);
+        assert_eq!(core::mem::offset_of!(SyscallFrame, fs_base), 0x80);
+        assert_eq!(core::mem::offset_of!(SyscallFrame, gs_base), 0x88);
+        assert_eq!(core::mem::size_of::<SyscallFrame>(), 144);
     }
 }

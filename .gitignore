@@ -1,6 +1,5 @@
 # Rust / Cargo
 /target/
-Cargo.lock
 **/*.rs.bk
 
 # C / C++ / CMake
@@ -34,6 +33,8 @@ ehthumbs.db
 
 # OS Build Artifacts
 build/
+__pycache__/
+*.pyc
 dist/
 *.iso
 *.img

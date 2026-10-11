@@ -36,7 +36,17 @@ impl FramebufferConsole {
     }
 
     pub fn init(&mut self, fb: Option<FramebufferInfo>) {
-        self.fb = fb;
+        self.fb = fb.filter(|f| {
+            f.width > 0
+                && f.height > 0
+                && f.pixels_per_scan_line >= f.width
+                && (f.pixels_per_scan_line as usize)
+                    .checked_mul(f.height as usize)
+                    .and_then(|pixels| pixels.checked_mul(4))
+                    .is_some_and(|bytes| bytes <= f.size)
+                && f.base_address.as_u64() % 4 == 0
+                && f.base_address.as_u64().checked_add(f.size as u64).is_some()
+        });
         self.cursor_x = 0;
         self.cursor_y = 0;
     }
@@ -90,12 +100,15 @@ impl FramebufferConsole {
                 let py = y + row;
                 if px < fb.width as usize && py < fb.height as usize {
                     let offset = py * (fb.pixels_per_scan_line as usize) + px;
-                    #[cfg(all(target_arch = "x86_64", not(test)))]
+                    #[cfg(all(
+                        target_arch = "x86_64",
+                        any(target_os = "uefi", target_os = "none")
+                    ))]
                     unsafe {
                         let ptr = fb.base_address.as_u64() as *mut u32;
                         core::ptr::write_volatile(ptr.add(offset), pixel_color);
                     }
-                    #[cfg(test)]
+                    #[cfg(not(any(target_os = "uefi", target_os = "none")))]
                     let _ = (offset, pixel_color);
                 }
             }
