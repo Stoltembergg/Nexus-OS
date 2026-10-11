@@ -3,14 +3,14 @@
 [![CI Status](https://github.com/Stoltembergg/Nexus-OS/actions/workflows/ci.yml/badge.svg)](https://github.com/Stoltembergg/Nexus-OS/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0_OR_MIT-blue.svg)](LICENSE)
 [![Target](https://img.shields.io/badge/Target-x86__64_UEFI-orange.svg)](#architecture)
-[![Phase](https://img.shields.io/badge/Phase-3.5_Closed_%7C_3.7_Open-orange.svg)](docs/04-roadmap-and-phases.md)
+[![Phase](https://img.shields.io/badge/Phase-3.5_Closed_%7C_3.7_Closed-brightgreen.svg)](docs/04-roadmap-and-phases.md)
 
-> **Current status (2026-10-11, `main` @ `a06ea9e`):** all evidence below comes from an **emulated QEMU/OVMF guest** and host tests in CI. **Nothing has been validated on physical hardware.** This is **not** Windows, Linux, third-party driver or Vanguard compatibility.
+> **Current status (2026-10-11; Phase 3.7 evidence: [PR #10, CI run 38163656509](https://github.com/Stoltembergg/Nexus-OS/actions/runs/38163656509), tested code revision `40f985e`):** evidence below comes from an **emulated QEMU/OVMF guest**, a hosted Windows runner and host tests in CI. **Nothing has been validated on physical hardware.** This is **not** Windows, Linux, third-party driver or Vanguard compatibility.
 >
-> - [Phase 3.5 kernel hardening](docs/09-phase3.5-kernel-hardening.md) is **closed**: the audited defects are fixed, each with a test that fails if the fix is reverted, and CI is green on all 5 jobs (PRs #3–#6).
-> - [Phase 3.7 NT driver hardening](docs/12-phase3.7-nt-driver-hardening.md) is **open**. Proven in QEMU: W^X on driver images verified by reading back every PTE, a fail-closed driver loader with a DIR64 relocation fixture, leak-free driver lifecycles, and minimal NT semantics (IRQL direction checks, events, pool tags, device extensions) with bugchecks. Pending: rebuilding the test drivers with the official WDK and aligning NT structs to the real `wdm.h`.
-> - **IRQL is routed to CR8 but masks no interrupts**: interrupts stay disabled and there is no APIC yet. Real interrupt-aware IRQL, waits with threads/timers and object reference counting move to Phase 4.
-> - Physical installation, Vulkan acceleration, Nexus Shell and OTA are not implemented.
+> - [Phase 3.5 kernel hardening](docs/09-phase3.5-kernel-hardening.md) is **closed**: audited defects have regression tests; its five-job closure run was green (PRs #3–#6).
+> - [Phase 3.7 NT driver hardening](docs/12-phase3.7-nt-driver-hardening.md) is **closed within its revised scope**. CI run 38163656509 passed all six jobs: 62/62 official WDK ABI entries match; three MSVC-built test drivers compile, link, load and run; layout/import negative controls reject injected faults; MSVC outputs pass the guest QEMU suite; and committed fixtures reproduce with clang-cl 19.1.7.
+> - **IRQL is routed to CR8 but masks no interrupts**: interrupts stay disabled and there is no APIC yet. Hardware-aware IRQL, real waits/timers/threads, object references and full IRP completion remain Phase 4 work.
+> - Physical installation, Vulkan acceleration, Nexus Shell and OTA are not implemented; Phase 4 has not been implemented by this work.
 
 **Nexus OS** is an open-source, research-driven hybrid operating system designed to execute Windows (PE/PE32+) and Linux (ELF64) binaries natively on x86_64 bare-metal hardware without relying on virtual machines or emulation layers.
 
@@ -139,8 +139,8 @@ See the [authoritative roadmap](docs/04-roadmap-and-phases.md) for dependency ga
 - [x] **Phase 3** — Freestanding dual PE32+/ELF64 cooperative execution (QEMU)
 - [x] **Phase 3.5** — kernel hardening and architecture validation (**closed 2026-10-11**; QEMU + CI evidence, [criteria](docs/09-phase3.5-kernel-hardening.md))
 - [x] **Phase 3.6** — targeted MSVC-compiled WDM driver Ring 0 PoC (not general driver support)
-- [ ] **Phase 3.7** — NT driver runtime hardening (**open**): W^X, fail-closed loader, lifecycle and minimal NT semantics proven in QEMU; WDK rebuild (PR-5) and struct alignment (PR-6) pending. Interrupt-aware IRQL moved to Phase 4
-- [ ] **Phase 4+** — interrupts/APIC and real IRQL, threads/timers and blocking waits, object manager, storage, runtimes, graphics, hardware and real applications (planned; starts after 3.7 closes)
+- [x] **Phase 3.7** — NT driver runtime hardening (**closed within revised scope**, PR #10): official WDK/MSVC ABI and driver checks, negative controls, compiler-specific fixture reproducibility and guest execution passed in CI run 38163656509. Interrupt-aware IRQL remains Phase 4 work.
+- [ ] **Phase 4+** — planned, not implemented here: ACPI/APIC and real IRQL, preemption, threads/timers and blocking waits, Object Manager, IRP Manager, storage, runtimes, graphics, hardware and real applications.
 
 **Graphical interface decision:** **Nexus Shell** uses the **Niri compositor + iNiR Shell**, ported/adapted to Nexus APIs (Wayland, Qt/QML/Quickshell integration); **not running yet**. See the [architecture](docs/03-system-architecture.md) and [graphics feasibility review](docs/06-drm-kms-feasibility-revision.md).
 
