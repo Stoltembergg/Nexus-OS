@@ -25,6 +25,16 @@ def coff(sections):
 
 
 class WdkAbiTests(unittest.TestCase):
+    def test_fixture_manifest_keys_normalize_windows_and_posix_paths(self):
+        posix = 'tests/fixtures/nt_driver/nexus_driver.sys'
+        windows = r'tests\fixtures\nt_driver\nexus_driver.sys'
+        self.assertEqual(wdk_abi.fixture_key(windows), posix)
+        self.assertEqual(wdk_abi.fixture_key(posix), posix)
+        manifest = {'drivers': {posix: 'sha256'}}
+        self.assertEqual(wdk_abi.fixture_hash(manifest, windows), 'sha256')
+        legacy_manifest = {'drivers': {windows: 'legacy-sha256'}}
+        self.assertEqual(wdk_abi.fixture_hash(legacy_manifest, posix), 'legacy-sha256')
+
     def test_package_paths_are_absolute_for_compiler_working_directory(self):
         with tempfile.TemporaryDirectory(dir=wdk_abi.REPO) as tmp:
             root = Path(tmp)

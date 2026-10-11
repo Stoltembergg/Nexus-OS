@@ -369,6 +369,17 @@ def check_exports(lib: Path):
 MANIFEST = FIXTURES / 'wdk-fixtures.json'
 
 
+def fixture_key(path: str) -> str:
+    """Use POSIX separators for fixture paths stored in the manifest."""
+    return str(path).replace('\\', '/')
+
+
+def fixture_hash(manifest, path: str):
+    drivers = manifest.get('drivers', {})
+    key = fixture_key(path)
+    return drivers.get(key, drivers.get(key.replace('/', '\\')))
+
+
 def clang_version() -> str:
     exe = shutil.which('clang-cl') or shutil.which('clang-cl-19') or 'clang-cl'
     res = run([exe, '--version'])
@@ -412,8 +423,8 @@ def compare_fixtures(drivers, update: bool, lib: Path):
             fixture.write_bytes(built)
         d['fixture_match'] = fixture.exists() and fixture.read_bytes() == built
         if update:
-            manifest['drivers'][d['fixture']] = hashlib.sha256(built).hexdigest()
-        elif manifest['drivers'].get(d['fixture']) != hashlib.sha256(fixture.read_bytes()).hexdigest():
+            manifest['drivers'][fixture_key(d['fixture'])] = hashlib.sha256(built).hexdigest()
+        elif fixture_hash(manifest, d['fixture']) != hashlib.sha256(fixture.read_bytes()).hexdigest():
             d['fixture_match'] = False
     if update:
         MANIFEST.write_text(json.dumps(manifest, indent=2) + '\n')
