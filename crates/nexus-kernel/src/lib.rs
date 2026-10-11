@@ -188,15 +188,22 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
         report.lifecycles_verified, 3,
         "driver lifecycle evidence missing"
     );
-    assert!(
-        report.wx_pages_verified >= 3 * 4,
-        "driver PTE W^X evidence missing"
+    assert_eq!(
+        report.wx_pages_verified, report.wx_pages_expected,
+        "driver PTE W^X evidence must cover exactly every page of the 3 fixtures"
     );
     serial_println!("NEXUS_CHECK:driver-wx:PASS");
     serial_println!(
-        "NEXUS_DRIVER_WX:pages_verified={}",
-        report.wx_pages_verified
+        "NEXUS_DRIVER_WX:pages_verified={}:expected={}",
+        report.wx_pages_verified,
+        report.wx_pages_expected
     );
+    assert_eq!(
+        report.nt_semantics_checks, 13,
+        "NT semantics self-test incomplete"
+    );
+    serial_println!("NEXUS_CHECK:nt-semantics:PASS");
+    serial_println!("NEXUS_NT_SEMANTICS:checks={}", report.nt_semantics_checks);
     serial_println!("NEXUS_CHECK:driver-lifecycle:PASS");
     serial_println!(
         "NEXUS_DRIVER_LIFECYCLE:drivers={}:heap_balanced=true:pool_balanced=true:devices_deleted=true",

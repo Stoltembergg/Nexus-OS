@@ -235,6 +235,11 @@ Objetivo: compilar no CI, a cada push, um driver de teste que **só inclui `<wdm
 
 ### 8.3 Bloqueios para a Fase 4
 
+**Dependências do PR-4 para a Fase 4 (registradas para não se perderem):**
+- **Spin lock do registro de pool:** o `PoolTracker` (registro de blocos de pool) é protegido por um spin lock simples (`AtomicBool`) que **não eleva o IRQL nem desabilita interrupções**. Isso só é correto enquanto nenhum ISR ou DPC aloca ou libera pool. Quando a Fase 4 permitir que ISRs/DPCs aloquem, esse lock precisa elevar para `DISPATCH_LEVEL` (para DPCs) ou desabilitar interrupções (para ISRs) durante a seção crítica. Caso contrário, uma interrupção no meio de `ExAllocatePoolWithTag` que tente alocar fica presa no lock para sempre (deadlock).
+- **Espera:** `KeWaitForSingleObject` não bloqueia, porque não existem outras threads nem timer. Ver as notas do PR-4 na seção 10. A Fase 4 precisa de scheduler, lista de waiters e timer para implementar a espera real.
+- **IRQL:** as verificações de direção do PR-4 são de software. Elas **não** tornam o IRQL equivalente ao do Windows. O mascaramento real por APIC/CR8 continua na Fase 4.
+
 A Fase 4 **não deve começar** enquanto o PR-1 não estiver verde e as decisões sobre C4 e C5 não estiverem tomadas e documentadas. Os PRs 2 a 4 são pequenos e podem fechar a 3.5 e boa parte da 3.7 rapidamente. O PR-5 e o C5 definem se a 3.7 é encerrada com escopo reduzido ou só depois do APIC.
 
 ---
@@ -253,7 +258,8 @@ A Fase 4 **não deve começar** enquanto o PR-1 não estiver verde e as decisõe
 |---|---|---|
 | #3 (PR-1) | C1, C2 (pin temporário; issue #2), C3 | Merged em `main` (`2040ea5`). A mudança no workflow (pin explícito e `fail-fast: false`) ficou pendente porque o token não tinha permissão de workflow. |
 | #4 (PR-2) | A1, A3, M7 e o `DriverName` pendurado (ver abaixo) | Merged em `main` (`02a9db8`). |
-| PR-3 | FP1–FP7, M3, M5, M6, M8, B2, B3 (B4 parcial) | Em revisão. |
+| #5 (PR-3) | FP1–FP7, M3, M5, M6, M8, B2, B3 (B4 parcial) | Merged em `main` (`7152e44`). |
+| PR-4 | M1, M2, M4, A2, B4 e as notas de revisão do PR-3 (limite do registro de pool, contagem exata de páginas W^X) | Em revisão. |
 
 **PR-2 (loader de drivers fail-closed):**
 - **A1:** `load_driver` propaga os erros de `parse_relocations`/`parse_imports` com `?`, antes de alocar memória. Cópia de seção, alvo de relocação e slot de IAT fora da imagem viram `ImageOutOfBounds`/`RelocationFailed`, e não são mais ignorados.
@@ -271,3 +277,16 @@ A Fase 4 **não deve começar** enquanto o PR-1 não estiver verde e as decisõe
 - **FP5:** o teste de evento continua passando com o stub atual porque sinaliza antes de esperar. A mensagem e o comentário agora dizem isso explicitamente. A semântica de espera fica para o PR-4.
 - **M8:** com `hardening-tests`, um trap em Ring 0 escreve `0x12` (status 37) e um pânico escreve `0x11` (status 35) no `isa-debug-exit`. O runner nomeia essas falhas, em vez de esperar até o timeout.
 - **Mutações verificadas no QEMU** (aplicadas e revertidas): sem W^X no `nexus_driver`, o resultado é `#PF` em Ring 0 e status 37 em cerca de 3 s; com `WRITABLE` forçado nas páginas, pânico de W+X e status 35; com 64 bytes vazados no ciclo do driver, pânico de heap desbalanceado e status 35.
+
+**PR-4 (semântica NT mínima; resolve M1, M2, M4, A2 e B4):**
+- **Caminho de bugcheck:** o host NT ganhou `bug_check(code, params)`. No guest, o handler imprime `NEXUS_BUGCHECK: code=… params=…` e, com `hardening-tests`, escreve `0x13` no `isa-debug-exit` (status 39, que o runner nomeia). Sem handler instalado, o bugcheck vira pânico e nunca é ignorado em silêncio. Os códigos `0x09` (`IRQL_NOT_GREATER_OR_EQUAL`), `0x0A` (`IRQL_NOT_LESS_OR_EQUAL`) e `0xC2` (`BAD_POOL_CALLER`) são códigos do Windows. Já os **subcódigos** de `0xC2` (1 = tag errada, 2 = bloco desconhecido ou double free) e o código `0x4E580001` (espera infinita impossível de satisfazer) são **específicos do Nexus**, não códigos do Windows.
+- **M1:** `IoDeleteDevice` remove o device da lista em qualquer posição (cabeça, meio ou cauda).
+- **M2:** `IoCreateDevice` aloca `DeviceExtensionSize` bytes zerados e alinhados a 16, no mesmo bloco do `DEVICE_OBJECT`, liberados por `IoDeleteDevice`. Com tamanho 0, a extensão é nula. Acima de 1 MiB, retorna `STATUS_INSUFFICIENT_RESOURCES`.
+- **M4:** `KeRaiseIrql` para um IRQL menor ou acima de `HIGH_LEVEL` (15) gera bugcheck `0x09`. `KeLowerIrql` para um IRQL maior gera bugcheck `0x0A`. Nos dois casos o IRQL fica inalterado. `KeAcquireSpinLock` acima de `DISPATCH_LEVEL` também gera bugcheck e não toma o lock. Continua sendo um IRQL de software, roteado para o CR8; não há equivalência com o Windows (ver 8.3).
+- **A2:** `SynchronizationEvent` faz auto-reset quando uma espera é satisfeita. `NotificationEvent` continua sinalizado até `KeResetEvent`. `KeSetEvent`/`KeResetEvent` retornam o estado anterior. A espera infinita (`Timeout = NULL`) num evento não sinalizado **nunca** retorna `STATUS_TIMEOUT`: como não há outra thread que possa sinalizá-lo, ela gera bugcheck `0x4E580001` e retorna `STATUS_POSSIBLE_DEADLOCK`. Timeout zero ou finito retorna `STATUS_TIMEOUT` imediatamente: não há timer nem outra thread até a Fase 4, então o resultado é o mesmo de esperar o prazo inteiro, mas sem passagem de tempo real. Esperar em `DISPATCH_LEVEL` com timeout diferente de zero, ou acima de `DISPATCH_LEVEL`, gera bugcheck `0x0A`.
+- **B4:** `ExFreePoolWithTag` com tag errada, double free ou ponteiro desconhecido gera bugcheck `0xC2` (o bloco continua vivo e a violação é contada).
+- **Nota de revisão (a):** quando o registro de 256 blocos enche, a alocação continua retornando nulo, mas agora incrementa `pool_tracker_exhausted()` e imprime `NEXUS_POOL_TRACKER_EXHAUSTED: capacity=256 refused_total=N` (no serial do guest e por um sink de diagnóstico no host).
+- **Nota de revisão (b):** `wx_pages_verified >= 12` virou igualdade exata. O kernel calcula as páginas esperadas a partir da tabela de seções de cada fixture (cabeçalhos até a primeira seção, mais o intervalo de páginas de cada seção), e o runner exige `NEXUS_DRIVER_WX:pages_verified=N:expected=N` com N igual nos dois lados (17 hoje).
+- **Prova no guest:** `nt_semantics_self_test()` roda em Ring 0 antes de carregar os drivers e executa 13 verificações, com um handler de bugcheck que só registra. O runner exige `NEXUS_CHECK:nt-semantics:PASS` e `NEXUS_NT_SEMANTICS:checks=13`. O `NEXUS_POOL_TRACKER_EXHAUSTED` que aparece no serial é o próprio autoteste enchendo o registro de propósito.
+- **Testes de host:** são testes novos por comportamento (direção do IRQL, eventos e espera, extensão e remoção de device, esgotamento do registro, bugcheck sem handler, autoteste). Todos seguram `lock_nt_host_state_for_tests()`, que também limpa o handler de bugcheck e o sink de diagnóstico.
+- **Mutações verificadas** (aplicadas e revertidas): sem auto-reset, remoção só na cabeça, raise que pode abaixar, lower que pode subir, espera infinita retornando timeout, tag errada aceita, esgotamento sem contador, e extensão sem zerar. Cada uma faz falhar o teste de host específico e o autoteste. No QEMU: um free com tag errada no guest termina com `NEXUS_BUGCHECK: code=0xc2` e status 39; uma contagem esperada de W^X errada em 1 termina em pânico (status 35); sem auto-reset, o autoteste do guest falha com pânico (status 35).

@@ -543,6 +543,8 @@ pub fn run() {
 pub const EXIT_CODE_PANIC: u32 = 0x11;
 /// `isa-debug-exit` value written on an unrecoverable Ring 0 trap (QEMU exit status 37).
 pub const EXIT_CODE_RING0_TRAP: u32 = 0x12;
+/// `isa-debug-exit` value written on an NT bugcheck raised by the driver host (status 39).
+pub const EXIT_CODE_NT_BUGCHECK: u32 = 0x13;
 
 /// Terminates QEMU with a failure status so the runner fails immediately instead of
 /// waiting for its timeout (audit finding M8). Any value other than 0x10 is a failure.
