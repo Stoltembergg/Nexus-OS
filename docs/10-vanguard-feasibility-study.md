@@ -1,5 +1,8 @@
 # Nexus OS — Estudo Técnico Profundo: Viabilidade de Execução Legítima do Riot Vanguard (League of Legends & Valorant)
 
+> **Revisão de evidências (11/10/2026):** este documento é um estudo, não uma especificação interna comprovada do Riot Vanguard. Os detalhes de `TPM2_Quote`, seleção de PCRs, listas de hashes, verificação específica nos servidores da Riot e exigências universais de VBS/HVCI são **hipóteses não verificadas publicamente**, salvo quando citadas em fonte oficial aplicável. O verdadeiro bloqueio externo é a **aceitação/homologação do ambiente pela Riot**, e a compatibilidade NT também está longe de ser completa. A execução experimental de um único driver WDM no Nexus não comprova execução do `vgk.sys`. Ver [roadmap atual](04-roadmap-and-phases.md) e [Fase 3.6](11-phase3.6-nt-driver-validation.md).
+
+
 **Documento:** `docs/10-vanguard-feasibility-study.md`  
 **Status:** Atualizado e Corrigido (Pós-Fase 3.6 NT Driver Validation)  
 **Data:** Outubro de 2026  
@@ -13,8 +16,8 @@
 Este relatório apresenta a auditoria técnica de engenharia de sistemas referente à viabilidade de suportar o anti-cheat **Riot Vanguard** (`vgk.sys` / `vgc.exe`) diretamente sobre o **Nexus OS**, garantindo a execução integral e sem penalidades de **League of Legends** e **Valorant**.
 
 ### Veredito Fundamental
-1. **Compatibilidade Técnica de ABI (Execução de Drivers `.sys`):** **Comprovada em Ring 0 na Fase 3.6.** É plenamente factível construir no Nexus OS um subsistema WDM/KMDF (`nexus-loader` + `driver_host`) capaz de mapear, realocar, resolver símbolos de `ntoskrnl.exe`, inicializar via `DriverEntry`, despachar IRPs síncronos/assíncronos, manipular IRQLs de hardware e descarregar com segurança drivers de modo kernel PE32+ (`IMAGE_SUBSYSTEM_NATIVE`).
-2. **Autorização Criptográfica e Confiança Remota (Atestação TPM 2.0 / PCR 7 / HVCI):** **Bloqueio Criptográfico Rígido Externo (Hard Blocker).** O Vanguard moderno não avalia apenas a conformidade da ABI do kernel; ele realiza **atestação remota de integridade de hardware** via chip TPM 2.0 (`TPM2_Quote`). A assinatura das medições de boot (PCR 7 / Secure Boot) é confrontada nos servidores da Riot Games contra a cadeia criptográfica raiz da Microsoft Windows UEFI CA e políticas de integridade de código reforçada por hipervisor (HVCI).
+1. **Compatibilidade Técnica de ABI (Execução de Drivers `.sys`):** **Demonstrada apenas para um driver WDM de teste em Ring 0 (Fase 3.6).** A ampliação para WDM/KMDF de terceiros continua sendo pesquisa; é possível investigar um subsistema (`nexus-loader` + `driver_host`) capaz de mapear, realocar, resolver símbolos de `ntoskrnl.exe`, inicializar via `DriverEntry`, despachar IRPs síncronos/assíncronos, manipular IRQLs de hardware e descarregar com segurança drivers de modo kernel PE32+ (`IMAGE_SUBSYSTEM_NATIVE`).
+2. **Autorização Criptográfica e Confiança Remota (Atestação TPM 2.0 / PCR 7 / HVCI):** **Bloqueio externo de aceitação e confiança ainda não caracterizado.** Há requisitos públicos de plataforma e integridade, mas a hipótese de uma verificação específica de `TPM2_Quote`/PCR 7 contra uma allowlist exclusiva da Microsoft nos servidores da Riot **não foi comprovada**. Mesmo com ABI WDM funcional, a aceitação depende dos mecanismos e políticas reais da Riot.
 3. **Regra de Não-Evasão:** Em estrita observância à diretiva do projeto (*sem spoofing, falsificação de PCRs, hypervisor de camuflagem ou bypasses*), a execução legítima em um sistema operacional independente depende de canais oficiais ou de compatibilidade homologada com a Riot Games, ou da emulação autorizada da pilha de atestação.
 
 ---
@@ -251,6 +254,6 @@ Diferente da fase exploratória inicial (onde a compatibilidade foi avaliada em 
 ## 9. Conclusão e Diretrizes para as Próximas Fases
 
 1. **A compatibilidade de drivers `.sys` em Ring 0 não é mais uma incógnita teórica:** O Nexus OS possui agora a fundação arquitetural e comprovada para carregar e executar drivers Windows nativos.
-2. **O obstáculo remanescente para o Vanguard é a confiança e atestação remota:** O desafio não é executar `vgk.sys`, mas sim fazer com que os servidores da Riot Games aceitem a medição de hardware de um sistema que não é o Windows original da Microsoft.
+2. **Obstáculos remanescentes:** executar `vgk.sys` ainda não foi demonstrado; a camada WDM é experimental e incompleta. A aceitação legítima do Nexus pela Riot constitui uma segunda dependência, independente da compatibilidade técnica. Requisitos proprietários de atestação não devem ser descritos como comprovados sem evidência.
 3. **Respeito à Diretiva de Não-Evasão:** O projeto mantém o compromisso estrito de não implementar bypasses ou spoofing.
 4. **Prosseguimento do Roadmap:** Conforme o planejamento do Nexus OS, a validação da Fase 3.6 fornece a base técnica necessária para a evolução dos subsistemas centrais, mantendo o Niri + iNiR como interface oficial e pavimentando o caminho para os drivers de GPU e o subsistema gráfico da Fase 4.
