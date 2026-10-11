@@ -183,6 +183,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libc"
+version = "0.2.190"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,6 +252,7 @@ version = "0.1.0-alpha.0"
 dependencies = [
  "bitflags 2.13.2",
  "byteorder",
+ "libc",
  "log",
  "nexus-types",
  "thiserror",

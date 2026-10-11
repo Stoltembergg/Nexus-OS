@@ -1,0 +1,9 @@
+# Pin temporário: o Rust estável 1.99.0 falha ao linkar o kernel UEFI
+# (`rust-lld: undefined symbol: wcslen`, porque o kernel ainda linka `std` no alvo
+# x86_64-unknown-uefi). Versões 1.90.0–1.98.0 compilam. Ver docs/13-auditoria-fases-3.5-3.7.md
+# e a issue de acompanhamento. Remover o pin quando o kernel for `no_std` no alvo UEFI.
+[toolchain]
+channel = "1.98.0"
+targets = ["x86_64-unknown-uefi"]
+components = ["clippy", "rustfmt"]
+profile = "minimal"
