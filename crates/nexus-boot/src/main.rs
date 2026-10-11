@@ -19,6 +19,25 @@ pub unsafe extern "win64" fn efi_main(
         }
 
         let st = &*system_table;
+        let table_bytes = match nexus_boot::checked_configuration_table_size(
+            st.configuration_table,
+            st.number_of_table_entries,
+        ) {
+            Ok(size) => size,
+            Err(status) => return status,
+        };
+        let rsdp = if table_bytes == 0 {
+            None
+        } else {
+            let entries = core::slice::from_raw_parts(
+                st.configuration_table as *const EfiConfigurationTable,
+                st.number_of_table_entries,
+            );
+            match nexus_boot::select_acpi_rsdp(entries) {
+                Ok(value) => value,
+                Err(status) => return status,
+            }
+        };
         if st.boot_services.is_null() {
             return EfiStatus::NOT_FOUND;
         }
@@ -102,6 +121,7 @@ pub unsafe extern "win64" fn efi_main(
         // 3. Prepare Boot Handover Structure
         let mut boot_info = BootHandoverInfo::new();
         boot_info.framebuffer = fb_info;
+        boot_info.rsdp_address = rsdp;
 
         let mut loaded: *mut core::ffi::c_void = core::ptr::null_mut();
         let status = (bs.handle_protocol)(image_handle, &EfiGuid::LOADED_IMAGE_GUID, &mut loaded);

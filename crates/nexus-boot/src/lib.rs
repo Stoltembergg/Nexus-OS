@@ -8,6 +8,48 @@ pub use nexus_types::{
 };
 use proto::EfiMemoryDescriptorRaw;
 
+/// Return the checked byte extent of the UEFI configuration-table array.
+pub fn checked_configuration_table_size(
+    base: usize,
+    count: usize,
+) -> Result<usize, proto::EfiStatus> {
+    if count > 256 {
+        return Err(proto::EfiStatus::INVALID_PARAMETER);
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let stride = core::mem::size_of::<proto::EfiConfigurationTable>();
+    if base == 0 || !base.is_multiple_of(core::mem::align_of::<proto::EfiConfigurationTable>()) {
+        return Err(proto::EfiStatus::INVALID_PARAMETER);
+    }
+    let size = count
+        .checked_mul(stride)
+        .ok_or(proto::EfiStatus::INVALID_PARAMETER)?;
+    base.checked_add(size)
+        .ok_or(proto::EfiStatus::INVALID_PARAMETER)?;
+    Ok(size)
+}
+
+/// Select ACPI 2.0's RSDP when advertised; use ACPI 1.0 only if it is absent.
+pub fn select_acpi_rsdp(
+    entries: &[proto::EfiConfigurationTable],
+) -> Result<Option<PhysicalAddress>, proto::EfiStatus> {
+    let preferred = entries
+        .iter()
+        .find(|entry| entry.vendor_guid == proto::EfiGuid::ACPI_20_GUID);
+    let selected = preferred.or_else(|| {
+        entries
+            .iter()
+            .find(|entry| entry.vendor_guid == proto::EfiGuid::ACPI_10_GUID)
+    });
+    match selected {
+        None => Ok(None),
+        Some(entry) if entry.vendor_table.is_null() => Err(proto::EfiStatus::INVALID_PARAMETER),
+        Some(entry) => Ok(Some(PhysicalAddress::new(entry.vendor_table as u64))),
+    }
+}
+
 /// Validate the memory layout of the actual UEFI-loaded kernel PE, not its raw file offsets.
 pub fn decode_kernel_code(
     base: u64,
@@ -153,6 +195,48 @@ impl From<EfiMemoryDescriptorRaw> for MemoryDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::ffi::c_void;
+
+    fn acpi10(address: usize) -> proto::EfiConfigurationTable {
+        proto::EfiConfigurationTable {
+            vendor_guid: proto::EfiGuid::ACPI_10_GUID,
+            vendor_table: address as *const c_void,
+        }
+    }
+    fn acpi20(address: usize) -> proto::EfiConfigurationTable {
+        proto::EfiConfigurationTable {
+            vendor_guid: proto::EfiGuid::ACPI_20_GUID,
+            vendor_table: address as *const c_void,
+        }
+    }
+
+    #[test]
+    fn selects_acpi_rsdp_preference_fallback_and_absence() {
+        assert_eq!(checked_configuration_table_size(0, 0).unwrap(), 0);
+        assert_eq!(
+            select_acpi_rsdp(&[acpi10(0x1000), acpi20(0x2000)]).unwrap(),
+            Some(PhysicalAddress::new(0x2000))
+        );
+        assert_eq!(
+            select_acpi_rsdp(&[acpi10(0x1000)]).unwrap(),
+            Some(PhysicalAddress::new(0x1000))
+        );
+        assert_eq!(select_acpi_rsdp(&[]).unwrap(), None);
+        assert!(select_acpi_rsdp(&[acpi20(0)]).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_configuration_table_extents() {
+        assert!(checked_configuration_table_size(0, 1).is_err());
+        assert!(checked_configuration_table_size(0x1000, 257).is_err());
+        assert!(checked_configuration_table_size(0x1001, 1).is_err());
+        assert!(checked_configuration_table_size(
+            usize::MAX - (core::mem::size_of::<proto::EfiConfigurationTable>() - 1),
+            1
+        )
+        .is_err());
+    }
+
     fn loaded_pe() -> Vec<u8> {
         let mut image = vec![0; 0x4000];
         image[..2].copy_from_slice(&0x5a4du16.to_le_bytes());

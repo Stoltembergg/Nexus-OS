@@ -58,6 +58,31 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
         usable_mb
     );
 
+    // Phase 4.1 inventory only: read firmware ACPI tables without enabling IF
+    // or touching APIC MMIO registers.
+    let if_before_acpi = interrupts_disabled();
+    assert!(if_before_acpi, "IF must remain clear before ACPI discovery");
+    match arch::x86_64::acpi::discover(boot_info) {
+        Ok(None) => serial_println!("[!] ACPI unavailable: firmware supplied no RSDP."),
+        Ok(Some(inventory)) => {
+            assert!(
+                interrupts_disabled(),
+                "IF must remain clear after ACPI discovery"
+            );
+            serial_println!("NEXUS_CHECK:acpi:PASS");
+            serial_println!(
+                "NEXUS_ACPI:revision={}:madt={:#x}:lapic={:#x}:processors={}:ioapics={}:overrides={}:if_clear=true",
+                inventory.revision,
+                inventory.madt_address,
+                inventory.lapic_address,
+                inventory.processor_count,
+                inventory.io_apic_count,
+                inventory.override_count
+            );
+        }
+        Err(error) => panic!("Advertised ACPI data failed validation: {:?}", error),
+    }
+
     // 4. SYSCALL / SYSRET Hardware MSR Configuration
     syscall::init_syscall_msrs(task::syscall::asm_syscall_entry as *const () as usize as u64);
     serial_println!("[+] IA32_EFER.SCE & IA32_LSTAR Configured with Secure Pointer Validation.");
@@ -220,6 +245,19 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
 
     #[cfg(feature = "hardening-tests")]
     hardening::exit_success();
+}
+
+#[cfg(any(target_os = "uefi", target_os = "none"))]
+#[inline]
+fn interrupts_disabled() -> bool {
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
+    {
+        let flags: u64;
+        unsafe {
+            core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(nomem, preserves_flags));
+        }
+        flags & (1 << 9) == 0
+    }
 }
 
 #[cfg(not(any(target_os = "uefi", target_os = "none")))]
