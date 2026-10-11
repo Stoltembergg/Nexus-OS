@@ -1,7 +1,10 @@
 # Nexus OS — Fase 3.6: Validação de Compatibilidade de Drivers NT em Ring 0
 
+> **Escopo da evidência (11/10/2026):** relatório histórico da PoC em **guest QEMU/OVMF**, não teste de instalação em hardware físico. O driver `.sys` foi compilado com MSVC, mas elaborado especificamente para a superfície de dez APIs expostas pelo Nexus; isso não prova suporte genérico a drivers NT. O estado do código relatado inclui páginas supervisor **RWX** e IRQL implementado com registrador atômico; ambos devem ser corrigidos/validados em testes de hardware de interrupções antes de qualquer alegação de compatibilidade com HVCI ou segurança de kernel. A [Fase 3.5](09-phase3.5-kernel-hardening.md) permanece em aberto e a [Fase 3.7](04-roadmap-and-phases.md) é o próximo bloqueio de segurança. Não confundir com suporte ao Vanguard ou aceitação da Riot.
+
+
 **Documento:** `docs/11-phase3.6-nt-driver-validation.md`  
-**Status:** Concluído / Validado com Sucesso  
+**Status:** PoC funcional relatada no QEMU/OVMF; hardening e compatibilidade geral pendentes  
 **Data:** Outubro de 2026  
 **Autores:** Nexus OS Core Architecture Group  
 **Critério de Conclusão:** *Um driver Windows `.sys` real, compilado independentemente do Nexus, deve carregar, executar, processar operações de I/O e descarregar no kernel Nexus, com resultados verificados por testes automatizados em bare-metal / QEMU.*
@@ -218,7 +221,7 @@ Hello from Nexus OS Ring 3 (Linux ELF64)!
 
 ## 8. Conclusão da Fase 3.6 e Transição para a Fase 4
 
-A **Fase 3.6 foi concluída com êxito absoluto**. Todos os objetivos mandatados pelo usuário foram integralmente satisfeitos:
+A **prova de conceito delimitada da Fase 3.6** atingiu seus critérios originais de demonstração, porém a validação de segurança, hardware físico e drivers externos permanece pendente:
 1. Um driver `.sys` real compilado de forma independente foi executado com sucesso no kernel próprio em Ring 0.
 2. Não foram utilizados mocks ou rotinas simuladas para mascarar a compatibilidade real.
 3. Não foram criados desvios ou mecanismos de evasão para burlar anti-cheats.
