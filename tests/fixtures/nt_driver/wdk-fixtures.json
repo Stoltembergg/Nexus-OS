@@ -1,0 +1,12 @@
+{
+  "producer": "scripts/wdk-abi.py --cc clang-cl --update-fixtures",
+  "clang_cl": "19.1.7",
+  "link": "lld-link /Brepro",
+  "ntoskrnl_lib": "ntoskrnl.lib",
+  "wdk_package": "microsoft.windows.wdk.x64.10.0.26100.6584",
+  "drivers": {
+    "tests/fixtures/nt_driver/nexus_driver.sys": "706ce1161833760f21bfec18077729f1538e4cde5ec3c7c8e3a526df61852144",
+    "tests/fixtures/nt_driver/standard_wdm.sys": "5891f8c06eee7709532b459acabecb2e1ae20daf81527b24c9a88e13741a7677",
+    "tests/fixtures/nt_driver/wdk/wdk_min.sys": "675ada80b1d8de81cb2ad86e9031c4eb72865ecfa465d53a135274a73dadab0f"
+  }
+}

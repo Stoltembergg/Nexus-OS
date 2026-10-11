@@ -263,8 +263,8 @@ A Fase 4 **não deve começar** enquanto o PR-1 não estiver verde e as decisõe
 | #5 (PR-3) | FP1–FP7, M3, M5, M6, M8, B2, B3 (B4 parcial) | Merged em `main` (`7152e44`). |
 | #6 (PR-4) | M1, M2, M4, A2, B4, as notas de revisão do PR-3 (limite do registro de pool, contagem exata de páginas W^X) e o `IoDeleteDevice` inválido | Merged em `main` (`a06ea9e`). |
 | PR de documentação | A5 e o entregável 9 (docs 04, 09, 11, 12 e README alinhados à evidência) | Em revisão. **3.5 encerrada** (critérios em `docs/09`); **3.7 aberta** (escopo revisado em `docs/12`). |
-| PR-5 | A4, FP8, FP9 (job WDK `windows-latest`, tabela `sizeof`/`offsetof`, pin do CI) | Preparado localmente; bloqueado pela permissão de workflow do token. |
-| PR-6 | C4 (structs alinhadas ao WDK) | Não iniciado; depende do PR-5. |
+| PR-5 | A4, FP8, FP9 (tabela `sizeof`/`offsetof` com o WDK oficial, rebuild dos drivers, sonda de carga) | Ferramentas no mesmo PR do PR-6 (1º commit), sem mudança de workflow. O job `windows-latest` e o pin do CI ficam para um PR só de workflow, quando houver a permissão Workflows. |
+| PR-6 | C4, A4 (structs alinhadas ao WDK x64, exports reais `IofCompleteRequest`/`KfRaiseIrql`/`KeAcquireSpinLockRaiseToDpc`, fixtures sobre `<ntddk.h>` sem código estático do `ntoskrnl.lib`, `wdk_min` executado no host e no guest, `--enforce`) | 2º commit do mesmo PR. Local: 62/62 entradas, 3/3 drivers linkam, carregam e executam (ver `docs/14`). A 3.7 só fecha com o job WDK verde (PR de workflow). |
 
 **PR-2 (loader de drivers fail-closed):**
 - **A1:** `load_driver` propaga os erros de `parse_relocations`/`parse_imports` com `?`, antes de alocar memória. Cópia de seção, alvo de relocação e slot de IAT fora da imagem viram `ImageOutOfBounds`/`RelocationFailed`, e não são mais ignorados.

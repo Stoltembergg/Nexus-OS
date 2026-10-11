@@ -205,7 +205,7 @@ fn corrupted_relocation_directory_is_rejected() {
     LE::write_u32(&mut b[o..o + 4], 0x7FFF_0000);
     assert_eq!(load_err(&b), CORRUPTED);
 
-    // Também em uma imagem sem .reloc (as fixtures MSVC): RVA inválida não vira "sem relocações".
+    // Também em uma imagem sem .reloc (nexus_driver.sys, só RIP-relativo): RVA inválida não vira "sem relocações".
     let mut b = NEXUS_DRIVER.to_vec();
     let o = data_dir_off(&b, IMAGE_DIRECTORY_ENTRY_BASERELOC);
     LE::write_u32(&mut b[o..o + 4], 0x7FFF_0000);

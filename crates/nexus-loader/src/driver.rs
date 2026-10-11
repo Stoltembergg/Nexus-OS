@@ -13,9 +13,10 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use nexus_types::driver::{
     DeviceObject, DriverEntryFn, DriverObject, DriverSectionMapping, Irp, KEvent, Kirql,
-    UnicodeString, DISPATCH_LEVEL, HIGH_LEVEL, IMAGE_SUBSYSTEM_NATIVE, IRP_MJ_MAXIMUM_FUNCTION,
-    PASSIVE_LEVEL, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
-    STATUS_POSSIBLE_DEADLOCK, STATUS_SUCCESS, STATUS_TIMEOUT,
+    UnicodeString, DISPATCH_LEVEL, DO_DEVICE_INITIALIZING, DO_EXCLUSIVE, HIGH_LEVEL,
+    IMAGE_SUBSYSTEM_NATIVE, IRP_MJ_MAXIMUM_FUNCTION, PASSIVE_LEVEL, STATUS_INSUFFICIENT_RESOURCES,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_POSSIBLE_DEADLOCK, STATUS_SUCCESS,
+    STATUS_TIMEOUT,
 };
 
 use crate::error::LoaderError;
@@ -587,6 +588,13 @@ impl NtoskrnlTable {
             "IoCompleteRequest",
             stub_io_complete_request as *const () as usize,
         );
+        // x64 <wdm.h>: `#define IoCompleteRequest(a,b) IofCompleteRequest(a,b)`, so every
+        // driver built with the official headers imports this name.
+        table.register(
+            "NTOSKRNL.EXE",
+            "IofCompleteRequest",
+            stub_io_complete_request as *const () as usize,
+        );
 
         // Hardware / Software IRQL Management
         table.register(
@@ -594,10 +602,12 @@ impl NtoskrnlTable {
             "KeGetCurrentIrql",
             stub_ke_get_current_irql as *const () as usize,
         );
+        // x64 <wdm.h>: `#define KeRaiseIrql(a,b) *(b) = KfRaiseIrql(a)`. `KeRaiseIrql` is
+        // not an x64 ntoskrnl export, so (like the real kernel) Nexus does not export it.
         table.register(
             "NTOSKRNL.EXE",
-            "KeRaiseIrql",
-            stub_ke_raise_irql as *const () as usize,
+            "KfRaiseIrql",
+            stub_kf_raise_irql as *const () as usize,
         );
         table.register(
             "NTOSKRNL.EXE",
@@ -648,10 +658,13 @@ impl NtoskrnlTable {
             "KeInitializeSpinLock",
             stub_ke_initialize_spin_lock as *const () as usize,
         );
+        // x64 <wdm.h>: `#define KeAcquireSpinLock(l, o) *(o) = KeAcquireSpinLockRaiseToDpc(l)`;
+        // `KeAcquireSpinLock` itself is not an x64 export. `KeInitializeSpinLock` is
+        // inline on x64 (`*SpinLock = 0`) but is also a real export, so it stays.
         table.register(
             "NTOSKRNL.EXE",
-            "KeAcquireSpinLock",
-            stub_ke_acquire_spin_lock as *const () as usize,
+            "KeAcquireSpinLockRaiseToDpc",
+            stub_ke_acquire_spin_lock_raise_to_dpc as *const () as usize,
         );
         table.register(
             "NTOSKRNL.EXE",
@@ -686,6 +699,11 @@ impl NtoskrnlTable {
     pub fn register(&mut self, dll: &str, function: &str, address: usize) {
         self.exports
             .insert((dll.to_uppercase(), function.to_string()), address);
+    }
+
+    /// `(dll, function)` names of every registered export, in sorted order.
+    pub fn export_names(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.exports.keys().map(|(d, f)| (d.as_str(), f.as_str()))
     }
 
     /// Resolves a requested import symbol.
@@ -880,6 +898,10 @@ impl NtDriverHost {
         Self {
             kernel_table: NtoskrnlTable::new(),
         }
+    }
+
+    pub fn kernel_table(&self) -> &NtoskrnlTable {
+        &self.kernel_table
     }
 
     pub fn kernel_table_mut(&mut self) -> &mut NtoskrnlTable {
@@ -1113,6 +1135,20 @@ pub unsafe extern "win64" fn stub_ke_raise_irql(new_irql: Kirql, old_irql: *mut 
     set_irql(new_irql);
 }
 
+/// x64 `KfRaiseIrql` export (what the WDK `KeRaiseIrql` macro calls): raises to
+/// `new_irql` and returns the previous IRQL. Same direction checks as
+/// [`stub_ke_raise_irql`]; on a bugcheck the IRQL is unchanged and the current IRQL is
+/// returned.
+///
+/// # Safety
+///
+/// Same contract as [`stub_ke_raise_irql`].
+pub unsafe extern "win64" fn stub_kf_raise_irql(new_irql: Kirql) -> Kirql {
+    let mut old = stub_ke_get_current_irql();
+    stub_ke_raise_irql(new_irql, &mut old);
+    old
+}
+
 /// WDM KeLowerIrql export stub.
 ///
 /// Lowering to a higher IRQL than the current one is a caller bug: bugcheck
@@ -1194,7 +1230,7 @@ pub unsafe extern "win64" fn stub_io_create_device(
     _device_name: *mut UnicodeString,
     device_type: u32,
     characteristics: u32,
-    _exclusive: u8,
+    exclusive: u8,
     device_object: *mut *mut DeviceObject,
 ) -> i32 {
     if driver_object.is_null() || device_object.is_null() {
@@ -1234,6 +1270,13 @@ pub unsafe extern "win64" fn stub_io_create_device(
         characteristics,
         device_extension: extension,
         size: (core::mem::size_of::<DeviceObject>() + extension_size).min(u16::MAX as usize) as u16,
+        // As the NT I/O manager does: the driver clears DO_DEVICE_INITIALIZING when ready.
+        flags: DO_DEVICE_INITIALIZING | if exclusive != 0 { DO_EXCLUSIVE } else { 0 },
+        device_lock: KEvent {
+            header_type: SYNCHRONIZATION_EVENT,
+            signal_state: 1,
+            ..KEvent::default()
+        },
         ..Default::default()
     });
 
@@ -1520,6 +1563,20 @@ pub unsafe extern "win64" fn stub_ke_acquire_spin_lock(
             core::hint::spin_loop();
         }
     }
+}
+
+/// x64 `KeAcquireSpinLockRaiseToDpc` export (what the WDK `KeAcquireSpinLock` macro
+/// calls): raises to `DISPATCH_LEVEL`, takes the lock and returns the previous IRQL.
+///
+/// # Safety
+///
+/// `spin_lock` must be null or point to a `KSPIN_LOCK`.
+pub unsafe extern "win64" fn stub_ke_acquire_spin_lock_raise_to_dpc(
+    spin_lock: *mut usize,
+) -> Kirql {
+    let mut old = stub_ke_get_current_irql();
+    stub_ke_acquire_spin_lock(spin_lock, &mut old);
+    old
 }
 
 /// WDM KeReleaseSpinLock export stub.
@@ -1978,7 +2035,7 @@ mod tests {
         let _host_state = lock_nt_host_state_for_tests();
         let host = NtDriverHost::new();
 
-        // 1. Load real MSVC-compiled WDM driver
+        // 1. Load the WDK-built WDM driver (official headers + ntoskrnl.lib)
         let mut driver = host
             .load_driver(
                 REAL_DRIVER_BYTES,
@@ -2023,19 +2080,13 @@ mod tests {
         // 5. Test IOCTL_NEXUS_GET_VERSION
         let mut ver_output: u32 = 0;
         let mut ioctl_irp_ver = Irp {
-            user_buffer: &mut ver_output as *mut u32 as *mut c_void,
+            associated_irp: &mut ver_output as *mut u32 as *mut c_void,
             ..Default::default()
         };
         let mut ioctl_stack_ver = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
             device_object: dev_ptr,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_NEXUS_GET_VERSION,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_NEXUS_GET_VERSION, 0, 4),
             ..Default::default()
         };
         ioctl_irp_ver.current_stack_location = &mut ioctl_stack_ver;
@@ -2052,19 +2103,13 @@ mod tests {
         // 6. Test IOCTL_NEXUS_ECHO
         let mut text_buf = *b"Hello Nexus OS Kernel!\0";
         let mut ioctl_irp_echo = Irp {
-            user_buffer: text_buf.as_mut_ptr() as *mut c_void,
+            associated_irp: text_buf.as_mut_ptr() as *mut c_void,
             ..Default::default()
         };
         let mut ioctl_stack_echo = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
             device_object: dev_ptr,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 22,
-                input_buffer_length: 22,
-                io_control_code: IOCTL_NEXUS_ECHO,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_NEXUS_ECHO, 22, 22),
             ..Default::default()
         };
         ioctl_irp_echo.current_stack_location = &mut ioctl_stack_echo;
@@ -2078,19 +2123,13 @@ mod tests {
         // 7. Test IOCTL_NEXUS_RAISE_IRQL_TEST
         let mut irql_test_result: u32 = 0;
         let mut ioctl_irp_irql = Irp {
-            user_buffer: &mut irql_test_result as *mut u32 as *mut c_void,
+            associated_irp: &mut irql_test_result as *mut u32 as *mut c_void,
             ..Default::default()
         };
         let mut ioctl_stack_irql = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
             device_object: dev_ptr,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_NEXUS_RAISE_IRQL_TEST,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_NEXUS_RAISE_IRQL_TEST, 0, 4),
             ..Default::default()
         };
         ioctl_irp_irql.current_stack_location = &mut ioctl_stack_irql;
@@ -2108,7 +2147,7 @@ mod tests {
         // 8. Test IRP_MJ_READ
         let mut read_buf = [0u8; 32];
         let mut read_irp = Irp {
-            user_buffer: read_buf.as_mut_ptr() as *mut c_void,
+            associated_irp: read_buf.as_mut_ptr() as *mut c_void,
             ..Default::default()
         };
         let mut read_stack = IoStackLocation {
@@ -2200,19 +2239,13 @@ mod tests {
         // 4. Test Pool Allocation & Memory Verification IOCTL
         let mut pool_test_val: u32 = 0;
         let mut ioctl_irp_mem = Irp {
-            user_buffer: &mut pool_test_val as *mut u32 as *mut c_void,
+            associated_irp: &mut pool_test_val as *mut u32 as *mut c_void,
             ..Default::default()
         };
         let mut ioctl_stack_mem = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
             device_object: dev_ptr,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_WDM_SAMPLE_MEM_TEST,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDM_SAMPLE_MEM_TEST, 0, 4),
             ..Default::default()
         };
         ioctl_irp_mem.current_stack_location = &mut ioctl_stack_mem;
@@ -2224,19 +2257,13 @@ mod tests {
         // 5. Test SpinLock & Hardware IRQL IOCTL
         let mut counter_val: u32 = 0;
         let mut ioctl_irp_spin = Irp {
-            user_buffer: &mut counter_val as *mut u32 as *mut c_void,
+            associated_irp: &mut counter_val as *mut u32 as *mut c_void,
             ..Default::default()
         };
         let mut ioctl_stack_spin = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
             device_object: dev_ptr,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_WDM_SAMPLE_SPINLOCK_IRQL,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDM_SAMPLE_SPINLOCK_IRQL, 0, 4),
             ..Default::default()
         };
         ioctl_irp_spin.current_stack_location = &mut ioctl_stack_spin;
@@ -2252,19 +2279,13 @@ mod tests {
         // event. It does NOT prove blocking or wake-up semantics (no waiters exist yet).
         let mut event_val: u32 = 0;
         let mut ioctl_irp_evt = Irp {
-            user_buffer: &mut event_val as *mut u32 as *mut c_void,
+            associated_irp: &mut event_val as *mut u32 as *mut c_void,
             ..Default::default()
         };
         let mut ioctl_stack_evt = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
             device_object: dev_ptr,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_WDM_SAMPLE_EVENT_TEST,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDM_SAMPLE_EVENT_TEST, 0, 4),
             ..Default::default()
         };
         ioctl_irp_evt.current_stack_location = &mut ioctl_stack_evt;
@@ -2276,7 +2297,7 @@ mod tests {
         // 7. Test Read Payload
         let mut read_buf = [0u8; 32];
         let mut read_irp = Irp {
-            user_buffer: read_buf.as_mut_ptr() as *mut c_void,
+            associated_irp: read_buf.as_mut_ptr() as *mut c_void,
             ..Default::default()
         };
         let mut read_stack = IoStackLocation {
@@ -2576,7 +2597,7 @@ mod tests {
             ..Default::default()
         };
         let mut irp = Irp {
-            user_buffer: &mut counter_val as *mut u32 as *mut c_void,
+            associated_irp: &mut counter_val as *mut u32 as *mut c_void,
             current_stack_location: &mut stack,
             ..Default::default()
         };
@@ -2591,6 +2612,155 @@ mod tests {
 
     fn with_recorder() {
         BUGCHECK_HANDLER.store(record_bugcheck_only as *mut (), Ordering::SeqCst);
+    }
+
+    const WDK_MIN_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/nt_driver/wdk/wdk_min.sys");
+    /// `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)` in wdk_min.c.
+    const IOCTL_WDK_MIN_ECHO: u32 = 0x0022_2400;
+
+    #[test]
+    fn test_only_real_x64_ntoskrnl_names_are_exported() {
+        let table = NtoskrnlTable::new();
+        for name in [
+            "IofCompleteRequest",
+            "KfRaiseIrql",
+            "KeAcquireSpinLockRaiseToDpc",
+        ] {
+            assert!(
+                table.resolve("ntoskrnl.exe", name).is_some(),
+                "{name} must be exported"
+            );
+        }
+        // Macros on x64 (<wdm.h>), not ntoskrnl exports: a WDK-built driver never imports
+        // them, and offering them would hide a driver built against the wrong headers.
+        for name in ["KeRaiseIrql", "KeAcquireSpinLock"] {
+            assert!(
+                table.resolve("ntoskrnl.exe", name).is_none(),
+                "{name} must not be exported"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kf_raise_irql_and_acquire_raise_to_dpc_return_previous_irql() {
+        let _host_state = lock_nt_host_state_for_tests();
+        with_recorder();
+        unsafe {
+            assert_eq!(
+                bugcheck_raised_by(|| assert_eq!(stub_kf_raise_irql(APC_LEVEL), PASSIVE_LEVEL)),
+                None
+            );
+            assert_eq!(stub_ke_get_current_irql(), APC_LEVEL);
+            // Negative control: KfRaiseIrql to a lower IRQL bugchecks 0x09 and leaves it.
+            let mut returned = 0xEE;
+            assert_eq!(
+                bugcheck_raised_by(|| returned = stub_kf_raise_irql(PASSIVE_LEVEL)),
+                Some(BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL)
+            );
+            assert_eq!(
+                (returned, stub_ke_get_current_irql()),
+                (APC_LEVEL, APC_LEVEL)
+            );
+            stub_ke_lower_irql(PASSIVE_LEVEL);
+
+            let mut lock: usize = 0;
+            let old = stub_ke_acquire_spin_lock_raise_to_dpc(&mut lock);
+            assert_eq!(
+                (old, lock, stub_ke_get_current_irql()),
+                (PASSIVE_LEVEL, 1, DISPATCH_LEVEL)
+            );
+            stub_ke_release_spin_lock(&mut lock, old);
+            assert_eq!((lock, stub_ke_get_current_irql()), (0, PASSIVE_LEVEL));
+        }
+        BUGCHECK_HANDLER.store(core::ptr::null_mut(), Ordering::SeqCst);
+    }
+
+    /// `wdk_min.sys` uses nothing but the official WDK headers, so it only works if the
+    /// Nexus DEVICE_OBJECT / IRP / IO_STACK_LOCATION layouts are the WDK ones: it writes
+    /// `Flags` (0x30), reads `DeviceExtension` (0x40), `Tail.Overlay.CurrentStackLocation`
+    /// (0xB8) and `AssociatedIrp.SystemBuffer` (0x18).
+    #[test]
+    fn test_wdk_min_runs_with_official_layout() {
+        use nexus_types::driver::{DO_BUFFERED_IO, IRP_MJ_CLOSE};
+        let _host_state = lock_nt_host_state_for_tests();
+        let host = NtDriverHost::new();
+        let mut driver = host
+            .load_driver(WDK_MIN_BYTES, "\\Driver\\NexusWdkMin", "\\Registry\\Test")
+            .expect("wdk_min.sys must load");
+        driver.apply_platform_protection().expect("W^X");
+        let (reg, _backing) = UnicodeString::from_str_vec("\\Registry\\Test");
+        assert_eq!(unsafe { driver.init(&reg) }, STATUS_SUCCESS);
+        let dev = driver.driver_object.device_object;
+        assert!(!dev.is_null());
+        let (flags, ext) = unsafe { ((*dev).flags, (*dev).device_extension) };
+        assert!(
+            !ext.is_null(),
+            "IoCreateDevice(sizeof(WDK_MIN_EXTENSION)) extension"
+        );
+        assert_eq!(
+            flags & (DO_BUFFERED_IO | DO_DEVICE_INITIALIZING),
+            DO_BUFFERED_IO
+        );
+        for major in [IRP_MJ_CREATE, IRP_MJ_CLOSE] {
+            let mut stack = IoStackLocation {
+                major_function: major as u8,
+                device_object: dev,
+                ..Default::default()
+            };
+            let mut irp = Irp {
+                current_stack_location: &mut stack,
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe { driver.dispatch(major, dev, &mut irp) },
+                STATUS_SUCCESS
+            );
+        }
+        let mut value: u32 = 0x1234_5678;
+        let mut stack = IoStackLocation {
+            major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev,
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDK_MIN_ECHO, 4, 4),
+            ..Default::default()
+        };
+        let mut irp = Irp {
+            associated_irp: &mut value as *mut u32 as *mut c_void,
+            current_stack_location: &mut stack,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev, &mut irp) },
+            STATUS_SUCCESS
+        );
+        assert_eq!((value, irp.io_status.information), (!0x1234_5678u32, 4));
+        let requests = unsafe { *((ext as *const u8).add(8) as *const u32) };
+        assert_eq!(requests, 1);
+        assert_eq!(unsafe { stub_ke_get_current_irql() }, PASSIVE_LEVEL);
+
+        // Negative control: the same IOCTL with the buffer only in UserBuffer (the old,
+        // non-WDM convention of the hand-written fixtures) is not seen by a WDK driver.
+        let mut untouched: u32 = 7;
+        let mut stack = IoStackLocation {
+            major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev,
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDK_MIN_ECHO, 4, 4),
+            ..Default::default()
+        };
+        let mut sentinel: u32 = 0;
+        let mut irp = Irp {
+            associated_irp: &mut sentinel as *mut u32 as *mut c_void,
+            user_buffer: &mut untouched as *mut u32 as *mut c_void,
+            current_stack_location: &mut stack,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev, &mut irp) },
+            STATUS_SUCCESS
+        );
+        assert_eq!((untouched, sentinel), (7, u32::MAX));
+
+        unsafe { driver.unload() }.expect("unload deletes the device and balances pool");
     }
 
     #[test]
