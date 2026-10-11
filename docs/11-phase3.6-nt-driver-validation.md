@@ -1,6 +1,8 @@
 # Nexus OS — Fase 3.6: Validação de Compatibilidade de Drivers NT em Ring 0
 
-> **Escopo da evidência (11/10/2026):** relatório histórico da PoC em **guest QEMU/OVMF**, não teste de instalação em hardware físico. O driver `.sys` foi compilado com MSVC, mas elaborado especificamente para a superfície de dez APIs expostas pelo Nexus; isso não prova suporte genérico a drivers NT. O estado do código relatado inclui páginas supervisor **RWX** e IRQL implementado com registrador atômico; ambos devem ser corrigidos/validados em testes de hardware de interrupções antes de qualquer alegação de compatibilidade com HVCI ou segurança de kernel. A [Fase 3.5](09-phase3.5-kernel-hardening.md) permanece em aberto e a [Fase 3.7](04-roadmap-and-phases.md) é o próximo bloqueio de segurança. Não confundir com suporte ao Vanguard ou aceitação da Riot.
+> **Escopo da evidência (11/10/2026):** relatório histórico da PoC em **guest QEMU/OVMF**, não teste em hardware físico. O driver `.sys` foi compilado com MSVC, mas foi escrito especificamente para a superfície de APIs do Nexus e usa **structs NT definidas à mão, que divergem do `wdm.h` real** (doc 13, achado C4). Isso não prova suporte genérico a drivers NT.
+>
+> **Revisão de 2026-10-11 (depois dos PRs #3 a #6):** várias afirmações deste relatório histórico estavam erradas ou não tinham evidência. As correções estão marcadas com **[Revisão]** ao longo do texto. Em resumo: (1) "bare-metal" aqui significa **guest QEMU emulado**, não hardware físico; (2) as fixtures da 3.6 **não tinham relocações** (a primeira fixture com DIR64 veio no PR #4); (3) o IRQL era um inteiro atômico de software, e hoje é roteado para o CR8 **sem nenhum mascaramento de interrupções** (interrupções desabilitadas até a Fase 4); (4) `DbgPrint` não imprime nada; (5) o mapeamento original era RWX (o W^X verificado por PTE veio no PR #5). O estado atual da 3.7 está em `docs/12-phase3.7-nt-driver-hardening.md`; a 3.5 foi encerrada (`docs/09-phase3.5-kernel-hardening.md`). Nenhuma compatibilidade com Windows, Linux ou Vanguard é declarada.
 
 
 **Documento:** `docs/11-phase3.6-nt-driver-validation.md`  
@@ -13,14 +15,14 @@
 
 ## 1. Sumário Executivo
 
-A **Fase 3.6** estabelece um marco histórico no desenvolvimento do **Nexus OS**: a **execução real de um driver de dispositivo Windows NT nativo (`.sys`) em Ring 0 no kernel próprio do Nexus**, sem depender do kernel Windows original (`ntoskrnl.exe`), sem máquinas virtuais e sem simulações ou mocks.
+A **Fase 3.6** estabelece um marco histórico no desenvolvimento do **Nexus OS**: a **execução real de um driver de dispositivo Windows NT nativo (`.sys`) em Ring 0 no kernel próprio do Nexus**, sem depender do kernel Windows original (`ntoskrnl.exe`) e sem máquinas virtuais. **[Revisão]** "Sem simulações ou mocks" não se sustenta: várias rotinas eram stubs (eventos, `DbgPrint`, links simbólicos), e as structs NT são próprias do Nexus (doc 13, §5 e C4).
 
 ### Resultados Obtidos
 1. **Auditoria da PoC `NtDriverHost`:** Foram identificadas e corrigidas vulnerabilidades de segurança e limitações funcionais da PoC anterior (alocação sem permissão de execução, ausência de máquina de estados de IRQL, falta de rotinas de descarregamento e limpeza de dispositivos).
 2. **Driver WDM em C Independente:** Foi desenvolvido o driver `tests/fixtures/nt_driver/nexus_driver.c` e seu pipeline autônomo de compilação com o compilador oficial da Microsoft (`cl.exe /kernel /O2 /GS-` + `link.exe /SUBSYSTEM:NATIVE /DRIVER`), gerando o binário `nexus_driver.sys` (PE32+ de 4.608 bytes).
-3. **Mapeamento, Relocações e Importações NT:** O `NtDriverHost` mapeou as seções do binário, corrigiu relocações de 64 bits (`IMAGE_REL_BASED_DIR64`) e conectou dinamicamente a tabela de importação (IAT) a 10 rotinas fundamentais do executivo NT.
-4. **Execução Bare-Metal em Ring 0 (Milestone 4):** O kernel do Nexus OS carregou o driver, configurou as permissões de páginas no VMM com `protect_kernel_page(PRESENT | WRITABLE)` limpando o bit `NO_EXECUTE`, invocou `DriverEntry` em modo supervisor, validou a criação de `DEVICE_OBJECT`, despachou IRPs e descarregou o driver com segurança.
-5. **Verificação Automatizada no QEMU / OVMF:** O teste de ponta a ponta executou sob firmware UEFI genuíno com 128 MiB de RAM, validou 100% dos 8 checks de hardening, confirmou o sucesso do Milestone 4 e finalizou via `isa-debug-exit` (código de saída 33).
+3. **Mapeamento, Relocações e Importações NT:** O `NtDriverHost` mapeou as seções do binário (**[Revisão]** a fixture não tinha relocações; DIR64 só passou a ser testado com `reloc_driver.sys` no PR #4) e conectou dinamicamente a tabela de importação (IAT) a 10 rotinas fundamentais do executivo NT.
+4. **Execução em Ring 0 no guest QEMU (Milestone 4)** (**[Revisão]** não é hardware físico; as páginas eram RWX nesta versão): O kernel do Nexus OS carregou o driver, configurou as permissões de páginas no VMM com `protect_kernel_page(PRESENT | WRITABLE)` limpando o bit `NO_EXECUTE`, invocou `DriverEntry` em modo supervisor, validou a criação de `DEVICE_OBJECT`, despachou IRPs e descarregou o driver com segurança.
+5. **Verificação Automatizada no QEMU / OVMF:** O teste de ponta a ponta executou sob firmware UEFI OVMF (emulado) com 128 MiB de RAM, validou 100% dos 8 checks de hardening, confirmou o sucesso do Milestone 4 e finalizou via `isa-debug-exit` (código de saída 33).
 
 ---
 
@@ -102,8 +104,8 @@ O subsistema de carregamento e execução de drivers Windows NT é dividido de f
 
 ### 4.1 Resolução da IAT e Tabela de Exportações (`NtoskrnlTable`)
 A tabela de exportações `NtoskrnlTable` fornece os stubs canônicos com a convenção de chamada Microsoft x64 (`extern "win64"`):
-* `DbgPrint`: Impressão de mensagens de depuração do driver no console serial do kernel.
-* `KeGetCurrentIrql`: Leitura atômica do registrador de IRQL.
+* `DbgPrint`: **[Revisão]** no-op; as mensagens dos drivers não aparecem no serial.
+* `KeGetCurrentIrql`: leitura do IRQL (**[Revisão]** inteiro atômico de software na 3.6; hoje é roteado para o CR8, sem mascaramento de interrupções).
 * `KeRaiseIrql`: Elevação de prioridade com salvamento do IRQL anterior.
 * `KeLowerIrql`: Restauração da prioridade anterior.
 * `RtlInitUnicodeString`: Inicialização de buffers UTF-16 a partir de strings literais.
@@ -116,7 +118,7 @@ A tabela de exportações `NtoskrnlTable` fornece os stubs canônicos com a conv
 
 ## 5. Execução em Ring 0 e Descoberta Crítica de Memória VMM
 
-Durante a primeira execução do driver no ambiente bare-metal sob QEMU, a equipe de engenharia identificou uma descoberta crítica de proteção de páginas x86_64:
+Durante a primeira execução do driver no guest QEMU, a equipe de engenharia identificou uma descoberta crítica de proteção de páginas x86_64:
 
 ### 5.1 O Trap de Proteção de Escrita (#PF Vector 14, Error Code 0x3)
 Ao invocar `DriverEntry` em Ring 0, o processador gerou imediatamente a exceção de falta de página:
@@ -162,7 +164,7 @@ Executado via `cargo test --workspace`:
 Executado via `cargo clippy --workspace --all-targets -- -D warnings`:
 * **Resultado:** **Zero avisos e zero erros** em todo o repositório.
 
-### 6.3 Execução em Bare-Metal Convidado QEMU / OVMF
+### 6.3 Execução no guest QEMU / OVMF (emulado)
 Executado via `powershell -File scripts/test-boot.ps1`:
 * **Configuração:** RAM = 128 MiB, CPU = `qemu64`, Firmware = `edk2-x86_64-code.fd`.
 * **Log Serial do Milestone 4 Registrado pelo Convidado:**
@@ -204,7 +206,7 @@ Hello from Nexus OS Ring 3 (Linux ELF64)!
  NEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0
 ============================================================
 ```
-* **Código de Retorno QEMU:** `33` (`isa-debug-exit` indicando sucesso absoluto de todos os testes de guest).
+* **Código de Retorno QEMU:** `33` (`isa-debug-exit` indicando que os checks do guest daquela versão passaram; **[Revisão]** naquela versão os marcadores da 3.6 eram impressos sem prova e o CI nunca tinha passado, ver doc 13, FP1 e C3).
 * **Artefato de Verificação:** Registrado em `build/hardening-128-qemu64-debug/result.json` com `phase3_6_nt_driver_verified: true`.
 
 ---
@@ -214,18 +216,18 @@ Hello from Nexus OS Ring 3 (Linux ELF64)!
 | Risco Técnico | Severidade | Mitigação no Nexus OS |
 | :--- | :--- | :--- |
 | **Corrupção de Memória em Ring 0 por Drivers Legados** | Alta | Drivers são mapeados em páginas isoladas e controladas pelo VMM do Nexus; funções críticas utilizam verificações de limites e tipos seguros em Rust. |
-| **Bloqueio por Inversão de Prioridade em IRQLs Elevados** | Média | O registrador de IRQL utiliza operações atômicas com ordenação sequencial estrita (`SeqCst`), prevenindo race conditions em sistemas SMP. |
-| **Vazamento de Recursos no Descarregamento de Drivers** | Média | `DriverUnload` rastreia todos os `DEVICE_OBJECT` associados e libera a memória das extensões antes de devolver o controle ao kernel. |
+| **Bloqueio por Inversão de Prioridade em IRQLs Elevados** | Média | **[Revisão]** Não mitigado: um inteiro atômico não implementa IRQL. Não há SMP nem interrupções habilitadas; o IRQL real com APIC foi transferido para a Fase 4. |
+| **Vazamento de Recursos no Descarregamento de Drivers** | Média | **[Revisão]** Na 3.6, `unload()` escondia devices vazados e não havia extensões. Hoje (PRs #5 e #6) o unload falha se sobrarem devices ou pool, e o heap do kernel é verificado em cada ciclo de vida. |
 
 ---
 
 ## 8. Conclusão da Fase 3.6 e Transição para a Fase 4
 
 A **prova de conceito delimitada da Fase 3.6** atingiu seus critérios originais de demonstração, porém a validação de segurança, hardware físico e drivers externos permanece pendente:
-1. Um driver `.sys` real compilado de forma independente foi executado com sucesso no kernel próprio em Ring 0.
-2. Não foram utilizados mocks ou rotinas simuladas para mascarar a compatibilidade real.
+1. Um driver `.sys` compilado com MSVC foi executado no kernel próprio em Ring 0, no guest QEMU (**[Revisão]** com structs NT próprias do Nexus, não com os cabeçalhos do WDK).
+2. **[Revisão]** Havia rotinas simuladas (stubs). Ver doc 13, §5.
 3. Não foram criados desvios ou mecanismos de evasão para burlar anti-cheats.
 4. O estudo do Vanguard (`docs/10-vanguard-feasibility-study.md`) foi corrigido e estruturado com distinção clara entre fatos, hipóteses e viabilidade de homologação institucional.
 5. O Shell oficial **Niri + iNiR** permanece como a interface gráfica padrão do sistema.
 
-Com a validação dos drivers NT consolidada, o **Nexus OS está oficialmente pronto para avançar para a Fase 4 — Core Subsystems & Graphics Architecture** (drivers de GPU DRM/KMS, Mesa/Vulkan, VFS e ambiente de desktop oficial).
+**[Revisão]** A afirmação original de que o Nexus estava "oficialmente pronto para avançar para a Fase 4" foi retirada. A Fase 4 depende do encerramento da 3.7 (validação com o WDK oficial e alinhamento das structs; ver `docs/12-phase3.7-nt-driver-hardening.md`) e do roadmap em `docs/04-roadmap-and-phases.md`.

@@ -86,7 +86,7 @@ O driver `vgk.sys` importa e utiliza extensivamente primitivas do subsistema exe
 | :--- | :--- | :--- | :--- |
 | **Abordagem Central** | Microkernel Rust limpo; executivo compartilhado com roteador duplo de syscalls (Linux ABI + NT ABI). | Monolítico C derivado do NT 5.2 (Windows Server 2003/XP 64-bit), adicionando ABI Linux. | Kernel Linux padrão (C) com módulo de compatibilidade LKM (ex: Longene / NDISwrapper). |
 | **Isolamento e Segurança** | **Excelente.** Memória segura em Rust, VMM isolado por espaço de endereçamento, transições estritas Ring 0/3. | **Crítico.** Vulnerável a corrupções de ponteiro do C; complexidade imensa para modernizar para NT 10.0+. | **Boa.** Robustez e estabilidade comprovadas do Linux kernel em hardware heterogêneo. |
-| **Compatibilidade com Drivers `.sys` Modernos** | **Validada na Fase 3.6.** Carregamento e execução em Ring 0 de drivers WDM reais com IRPs e IRQLs. | Possui infraestrutura WDM/KMDF preliminar, porém defasada (focada em XP/Win7, sem suporte a drivers Win10/11). | Complexo. O modelo de IRPs e IRQLs colide diretamente com a arquitetura de bloqueio e threads do Linux (`bottom halves`, RCU). |
+| **Compatibilidade com Drivers `.sys` Modernos** | **PoC em QEMU (Fases 3.6/3.7).** Carregamento e execução em Ring 0, em guest QEMU emulado, de drivers de teste com structs NT próprias do Nexus (ainda não alinhadas ao WDK). Não há validação em hardware nem compatibilidade com drivers de terceiros. | Possui infraestrutura WDM/KMDF preliminar, porém defasada (focada em XP/Win7, sem suporte a drivers Win10/11). | Complexo. O modelo de IRPs e IRQLs colide diretamente com a arquitetura de bloqueio e threads do Linux (`bottom halves`, RCU). |
 | **Execução de Binários Linux (ELF64)** | **Nativa de primeiro nível.** Sem penalidade de tradução ou overhead de virtualização. | **Severamente limitada.** O subsistema POSIX do NT é lento e incompatível com chamadas modernas (epoll, io_uring, futex). | **Nativa 100%.** |
 | **Execução de Drivers Gráficos Modernos** | Drivers DRM/KMS nativos compilados em Rust/C ou bridge isolado em userland/ring0. | Dependência do subsistema `win32k.sys` acoplado ao kernel; ausência de drivers DirectX 12 / Vulkan modernos. | Suporte imediato via drivers oficiais da NVIDIA/AMD/Intel (Mesa/DRM). |
 | **Vanguard: Barreira de Atestação TPM** | Idêntica para todos: Bloqueio na assinatura de medições PCR 7 da Microsoft. | Idêntica: ReactOS não possui assinatura da Microsoft CA nem VBS/HVCI. | Idêntica: O kernel Linux não passa na validação PCR 7 do Vanguard. |
@@ -208,19 +208,13 @@ Diferente da Epic Games e da BattlEye, a Riot Games adota uma filosofia de segur
 
 ## 8. Conquistas da Fase 3.6 e Fase 3.7: Execução e Hardening de Drivers WDM em Ring 0
 
-Diferente da fase exploratória inicial (onde a compatibilidade foi avaliada em nível de tipos e protótipos), as **Fases 3.6 e 3.7 validaram na prática a execução e o isolamento de drivers Windows NT no kernel Nexus**:
+> **Revisão de 2026-10-11:** esta seção afirmava "IRQLs de Hardware Reais… mascaram interrupções no nível de hardware", "comprovada pelo silício… em hardware real" e "driver WDM autêntico… sem adaptações". Nenhuma dessas afirmações tem evidência: só existe execução em **guest QEMU/OVMF emulado**, o kernel roda com interrupções desabilitadas e sem APIC, e as fixtures usam structs NT próprias do Nexus. O estado verificado está em `docs/12-phase3.7-nt-driver-hardening.md` (a 3.7 continua **aberta**).
 
-1. **Eliminação de Páginas RWX e Aplicação Estrita de W^X (Fase 3.7):**
-   * Eliminou-se qualquer buffer de supervisor RWX persistente.
-   * Seções de código (`.text`) são estritamente `PAGE_EXECUTE_READ` (RX), seções de dados mutáveis (`.data`, `INIT`) são `PAGE_READWRITE` (RW), e cabeçalhos PE são `PAGE_READONLY` (RO).
-   * A proteção é comprovada pelo silício: o bit `CR0.WP` (Supervisor Write Protect) do x86_64 foi auditado em hardware real/QEMU, gerando `#PF` imediato caso ocorra qualquer escrita não autorizada em páginas de código ou somente leitura.
-2. **IRQLs de Hardware Reais via Registrador CR8 (Local APIC TPR):**
-   * Substituiu-se qualquer simulação por atomicidade de software pelo uso direto do registrador `CR8`.
-   * Elevações via `KeRaiseIrql` para `DISPATCH_LEVEL` (`CR8=2`) mascaram interrupções no nível de hardware e bloqueiam preempção no escalonador cooperativo do Nexus OS.
-3. **Validação com Dois Drivers Reais Distintos:**
-   * **`nexus_driver.sys`:** Validação de ciclo básico, criação de dispositivos (`\Device\NexusDrv0`), elevação de IRQL e leitura de dados.
-   * **`standard_wdm.sys`:** Driver WDM autêntico compilado via MSVC 2022 sem adaptações proprietárias, exercitando `ExAllocatePoolWithTag` (Non-Paged Pool), `KeInitializeSpinLock`, `KeAcquireSpinLock`, `KeReleaseSpinLock`, `KeInitializeEvent`, `KeSetEvent`, `KeWaitForSingleObject` e `DriverUnload`.
-4. **Resolução Dinâmica de 23 Exportações WDM:** O subsistema `ntoskrnl` do Nexus OS suporta agora as rotinas essenciais de sincronização, alocação de pool por tag e operações de memória de modo kernel.
+O que as Fases 3.6 e 3.7 demonstram hoje, **somente em QEMU/OVMF**:
+
+1. **W^X nas imagens de driver**, verificado relendo cada PTE no guest: `.text` RX, cabeçalhos e dados constantes RO+NX, dados mutáveis RW+NX, nenhuma página W+X. O `CR0.WP` é habilitado no init; a falta em escrita numa página RX de driver só foi observada pela sonda da auditoria, sem teste versionado.
+2. **IRQL validado em software e roteado para o CR8**, sem nenhum mascaramento de interrupções (as interrupções estão desabilitadas até a Fase 4). Direção e limites inválidos geram bugcheck.
+3. **Três drivers de teste** (`nexus_driver.sys`, `standard_wdm.sys` e `reloc_driver.sys`), escritos para a superfície de APIs do Nexus, com loader fail-closed, relocações DIR64 testadas e ciclos de vida sem vazamento.
 
 > [!CAUTION]
 > ### 8.1 Isenção de Responsabilidade Técnica (Disclaimers Mandatórios)
@@ -236,9 +230,9 @@ Diferente da fase exploratória inicial (onde a compatibilidade foi avaliada em 
 1. **Driver `.sys` Compilado de Forma Independente:**
    * Desenvolvido em C padrão (`tests/fixtures/nt_driver/nexus_driver.c`) e compilado com o compilador oficial da Microsoft (`cl.exe /kernel /O2 /GS-` + `link.exe /SUBSYSTEM:NATIVE /DRIVER`).
    * Gera um binário executável PE32+ autêntico de 4.608 bytes com `IMAGE_SUBSYSTEM_NATIVE`.
-2. **Execução Real em Ring 0 sob QEMU / OVMF:**
-   * Mapeamento integral em memória executável de supervisor.
-   * Correção e aplicação de relocations DIR64 para a base alocada.
+2. **Execução em Ring 0 sob QEMU / OVMF (emulado):**
+   * Mapeamento integral em memória executável de supervisor (RWX nesta versão; o W^X veio depois).
+   * **[Revisão]** Este driver não tinha relocações; DIR64 só passou a ser testado com `reloc_driver.sys`.
    * Resolução dinâmica da IAT contra 10 funções do `ntoskrnl.exe`.
    * Chamada de `DriverEntry` em Ring 0 com retorno `STATUS_SUCCESS` (0).
    * Criação e registro dinâmico do `DeviceObject` (`\Device\NexusDrv0`).
@@ -253,7 +247,7 @@ Diferente da fase exploratória inicial (onde a compatibilidade foi avaliada em 
 
 ## 9. Conclusão e Diretrizes para as Próximas Fases
 
-1. **A compatibilidade de drivers `.sys` em Ring 0 não é mais uma incógnita teórica:** O Nexus OS possui agora a fundação arquitetural e comprovada para carregar e executar drivers Windows nativos.
+1. **Drivers `.sys` de teste executam em Ring 0 num guest QEMU**, mas com structs NT próprias do Nexus. Carregar drivers compilados com o WDK oficial ainda não foi demonstrado (PR-5/PR-6), e não há validação em hardware físico.
 2. **Obstáculos remanescentes:** executar `vgk.sys` ainda não foi demonstrado; a camada WDM é experimental e incompleta. A aceitação legítima do Nexus pela Riot constitui uma segunda dependência, independente da compatibilidade técnica. Requisitos proprietários de atestação não devem ser descritos como comprovados sem evidência.
 3. **Respeito à Diretiva de Não-Evasão:** O projeto mantém o compromisso estrito de não implementar bypasses ou spoofing.
-4. **Prosseguimento do Roadmap:** Conforme o planejamento do Nexus OS, a validação da Fase 3.6 fornece a base técnica necessária para a evolução dos subsistemas centrais, mantendo o Niri + iNiR como interface oficial e pavimentando o caminho para os drivers de GPU e o subsistema gráfico da Fase 4.
+4. **Prosseguimento do Roadmap:** Conforme o planejamento do Nexus OS, a Fase 4 só começa depois do encerramento da 3.7, e a PoC da Fase 3.6 serve de ponto de partida para a evolução dos subsistemas centrais, mantendo o Niri + iNiR como interface oficial e pavimentando o caminho para os drivers de GPU e o subsistema gráfico da Fase 4.

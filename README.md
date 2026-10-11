@@ -3,9 +3,14 @@
 [![CI Status](https://github.com/Stoltembergg/Nexus-OS/actions/workflows/ci.yml/badge.svg)](https://github.com/Stoltembergg/Nexus-OS/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0_OR_MIT-blue.svg)](LICENSE)
 [![Target](https://img.shields.io/badge/Target-x86__64_UEFI-orange.svg)](#architecture)
-[![Phase](https://img.shields.io/badge/Phase-3.7_Planned_%7C_3.5_Audit_Open-orange.svg)](docs/04-roadmap-and-phases.md)
+[![Phase](https://img.shields.io/badge/Phase-3.5_Closed_%7C_3.7_Open-orange.svg)](docs/04-roadmap-and-phases.md)
 
-> **Current status (2026-10-11):** Freestanding PE32+/ELF64 execution in QEMU and an MSVC-built WDM `.sys` driver PoC running in guest Ring 0 have been reported. This is **not** general Windows/Linux or third-party driver compatibility. [Phase 3.5 hardening](docs/09-phase3.5-kernel-hardening.md) remains open; [Phase 3.7 driver hardening](docs/04-roadmap-and-phases.md) is planned. Physical hardware installation, Vulkan acceleration, Nexus Shell and OTA are not yet implemented.
+> **Current status (2026-10-11, `main` @ `a06ea9e`):** all evidence below comes from an **emulated QEMU/OVMF guest** and host tests in CI. **Nothing has been validated on physical hardware.** This is **not** Windows, Linux, third-party driver or Vanguard compatibility.
+>
+> - [Phase 3.5 kernel hardening](docs/09-phase3.5-kernel-hardening.md) is **closed**: the audited defects are fixed, each with a test that fails if the fix is reverted, and CI is green on all 5 jobs (PRs #3–#6).
+> - [Phase 3.7 NT driver hardening](docs/12-phase3.7-nt-driver-hardening.md) is **open**. Proven in QEMU: W^X on driver images verified by reading back every PTE, a fail-closed driver loader with a DIR64 relocation fixture, leak-free driver lifecycles, and minimal NT semantics (IRQL direction checks, events, pool tags, device extensions) with bugchecks. Pending: rebuilding the test drivers with the official WDK and aligning NT structs to the real `wdm.h`.
+> - **IRQL is routed to CR8 but masks no interrupts**: interrupts stay disabled and there is no APIC yet. Real interrupt-aware IRQL, waits with threads/timers and object reference counting move to Phase 4.
+> - Physical installation, Vulkan acceleration, Nexus Shell and OTA are not implemented.
 
 **Nexus OS** is an open-source, research-driven hybrid operating system designed to execute Windows (PE/PE32+) and Linux (ELF64) binaries natively on x86_64 bare-metal hardware without relying on virtual machines or emulation layers.
 
@@ -68,7 +73,7 @@ Existing solutions either:
 +-------------+---------------------+---------------------------+
 ```
 
-1. **Bare Metal Execution**: Boots directly on UEFI x86_64 machines.
+1. **Bare Metal Execution (goal)**: boot directly on UEFI x86_64 machines. Today this is demonstrated **only in an emulated QEMU/OVMF guest**; no physical machine has been tested.
 2. **Dual-Personality Dispatch**: Fast system call routing distinguishing NT syscalls from Linux syscalls with zero hypervisor overhead.
 3. **Unified Memory & Address Space**: PE images (default 0x140000000) and ELF binaries (default 0x400000 or ASLR base) mapped seamlessly using standard 4-level x86_64 page tables.
 4. **Anti-Cheat research:** standard NT drivers can be validated independently; Vanguard compatibility and vendor acceptance remain unproven and may need cooperation with Riot. No bypass, spoofing or hidden hypervisor strategy.
@@ -95,7 +100,8 @@ tests/fixtures/nt_driver/      # test WDM driver code and fixture
 ## 4. Quickstart & Phase 0 Verification
 
 ### Prerequisites
-- **Rust Toolchain**: `stable` (1.88+ recommended, x86_64 target)
+- **Rust Toolchain**: pinned to **1.98.0** by `rust-toolchain.toml` (installed automatically by `rustup`; includes the `x86_64-unknown-uefi` target). Rust 1.99.0 fails to link the UEFI kernel ([issue #2](https://github.com/Stoltembergg/Nexus-OS/issues/2)).
+- **QEMU + OVMF** and **Python 3** for the guest test suite
 - **CMake**: 3.20+
 - **Git**
 
@@ -113,8 +119,12 @@ cargo test --workspace
 # Run the Phase 0 interactive loader demonstration
 cargo run -p nexus-poc
 
-# On a configured QEMU/OVMF development machine
-python scripts/test-hardening.py
+# Negative tests for the QEMU runner itself
+python3 scripts/test-hardening-runner.py
+
+# On a configured QEMU/OVMF development machine (emulated guest, not hardware)
+cargo build --locked -p nexus-boot --target x86_64-unknown-uefi
+python3 scripts/test-hardening.py --ram 256 --cpu max --timeout 120
 ```
 
 ---
@@ -127,10 +137,10 @@ See the [authoritative roadmap](docs/04-roadmap-and-phases.md) for dependency ga
 - [x] **Phase 1** — UEFI/GOP boot demonstration (QEMU/OVMF)
 - [x] **Phase 2** — Minimal freestanding ELF64 Ring 3 and syscall demonstration (QEMU)
 - [x] **Phase 3** — Freestanding dual PE32+/ELF64 cooperative execution (QEMU)
-- [ ] **Phase 3.5** — kernel hardening and architecture validation (**open**)
+- [x] **Phase 3.5** — kernel hardening and architecture validation (**closed 2026-10-11**; QEMU + CI evidence, [criteria](docs/09-phase3.5-kernel-hardening.md))
 - [x] **Phase 3.6** — targeted MSVC-compiled WDM driver Ring 0 PoC (not general driver support)
-- [ ] **Phase 3.7** — W^X, real interrupt-aware IRQL, broader third-party driver tests
-- [ ] **Phase 4+** — executive, storage, runtimes, graphics, hardware and real applications (planned)
+- [ ] **Phase 3.7** — NT driver runtime hardening (**open**): W^X, fail-closed loader, lifecycle and minimal NT semantics proven in QEMU; WDK rebuild (PR-5) and struct alignment (PR-6) pending. Interrupt-aware IRQL moved to Phase 4
+- [ ] **Phase 4+** — interrupts/APIC and real IRQL, threads/timers and blocking waits, object manager, storage, runtimes, graphics, hardware and real applications (planned; starts after 3.7 closes)
 
 **Graphical interface decision:** **Nexus Shell** uses the **Niri compositor + iNiR Shell**, ported/adapted to Nexus APIs (Wayland, Qt/QML/Quickshell integration); **not running yet**. See the [architecture](docs/03-system-architecture.md) and [graphics feasibility review](docs/06-drm-kms-feasibility-revision.md).
 
