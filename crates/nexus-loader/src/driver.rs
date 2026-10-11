@@ -10,11 +10,12 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use byteorder::{ByteOrder, LittleEndian};
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use nexus_types::driver::{
     DeviceObject, DriverEntryFn, DriverObject, DriverSectionMapping, Irp, KEvent, Kirql,
-    UnicodeString, DISPATCH_LEVEL, IMAGE_SUBSYSTEM_NATIVE, IRP_MJ_MAXIMUM_FUNCTION, PASSIVE_LEVEL,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
+    UnicodeString, DISPATCH_LEVEL, HIGH_LEVEL, IMAGE_SUBSYSTEM_NATIVE, IRP_MJ_MAXIMUM_FUNCTION,
+    PASSIVE_LEVEL, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
+    STATUS_POSSIBLE_DEADLOCK, STATUS_SUCCESS, STATUS_TIMEOUT,
 };
 
 use crate::error::LoaderError;
@@ -32,13 +33,101 @@ pub static HARDWARE_IRQL_GETTER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_
 /// Hardware IRQL setter callback hook (e.g. writing CR8 / TPR on bare metal).
 pub static HARDWARE_IRQL_SETTER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
+// ---------------------------------------------------------------------------
+// Bugcheck and diagnostics hooks
+// ---------------------------------------------------------------------------
+
+/// `IRQL_NOT_GREATER_OR_EQUAL`: `KeRaiseIrql` to a lower IRQL (Windows stop code 0x09).
+pub const BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL: u32 = 0x09;
+/// `IRQL_NOT_LESS_OR_EQUAL`: `KeLowerIrql` to a higher IRQL, or a wait above
+/// `DISPATCH_LEVEL` (Windows stop code 0x0A).
+pub const BUGCHECK_IRQL_NOT_LESS_OR_EQUAL: u32 = 0x0A;
+/// `BAD_POOL_CALLER` (Windows stop code 0xC2). Parameter 1 uses the Nexus subcodes below.
+pub const BUGCHECK_BAD_POOL_CALLER: u32 = 0xC2;
+/// Nexus subcode for `BAD_POOL_CALLER`: `ExFreePoolWithTag` with a tag that does not match.
+pub const BAD_POOL_TAG_MISMATCH: usize = 1;
+/// Nexus subcode for `BAD_POOL_CALLER`: free of a block that is not live (double free or
+/// a pointer never returned by the pool).
+pub const BAD_POOL_UNKNOWN_BLOCK: usize = 2;
+/// Nexus-specific stop code (not a Windows code): a wait that can never be satisfied.
+///
+/// The host has a single cooperative thread and no kernel threads, timers or DPCs, so an
+/// infinite wait on a non-signaled object is a guaranteed deadlock. Windows would block
+/// forever; Nexus fails loudly instead of returning `STATUS_TIMEOUT`.
+pub const BUGCHECK_NEXUS_UNSATISFIABLE_WAIT: u32 = 0x4E58_0001;
+/// Nexus-specific stop code (not a Windows code): invalid `IoDeleteDevice`. Parameter 1 is
+/// one of the `DEVICE_DELETE_*` subcodes, parameter 2 the pointer passed in. In none of
+/// these cases is the device freed or its host header read.
+pub const BUGCHECK_NEXUS_INVALID_DEVICE_DELETE: u32 = 0x4E58_0002;
+/// Subcode: the pointer is not a live device created by `IoCreateDevice` (double delete,
+/// or a pointer that never was a device). The pointer is not dereferenced at all.
+pub const DEVICE_DELETE_NOT_LIVE: usize = 1;
+/// Subcode: live device whose `DriverObject` is null.
+pub const DEVICE_DELETE_NO_DRIVER: usize = 2;
+/// Subcode: live device that is not in its driver's device list.
+pub const DEVICE_DELETE_NOT_IN_LIST: usize = 3;
+
+/// Bugcheck handler: `(stop code, parameters)`. The kernel's handler does not return.
+pub type BugCheckHandler = fn(u32, [usize; 4]);
+
+/// Installed bugcheck handler. When null, a bugcheck panics.
+pub static BUGCHECK_HANDLER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+static BUGCHECK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static LAST_BUGCHECK: AtomicU32 = AtomicU32::new(0);
+static LAST_BUGCHECK_PARAMS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// Parameters of the most recent bugcheck.
+pub fn last_bugcheck_params() -> [usize; 4] {
+    core::array::from_fn(|i| LAST_BUGCHECK_PARAMS[i].load(Ordering::SeqCst))
+}
+
+/// Number of bugchecks raised by the NT host since boot (monotonic).
+pub fn bugcheck_count() -> usize {
+    BUGCHECK_COUNT.load(Ordering::SeqCst)
+}
+
+/// Stop code of the most recent bugcheck (0 if none).
+pub fn last_bugcheck() -> u32 {
+    LAST_BUGCHECK.load(Ordering::SeqCst)
+}
+
+/// Raises an NT-style bugcheck. Only returns if the installed handler returns (test
+/// handlers do); the calling stub must then abort the offending operation.
+fn bug_check(code: u32, params: [usize; 4]) {
+    LAST_BUGCHECK.store(code, Ordering::SeqCst);
+    for (slot, value) in LAST_BUGCHECK_PARAMS.iter().zip(params) {
+        slot.store(value, Ordering::SeqCst);
+    }
+    BUGCHECK_COUNT.fetch_add(1, Ordering::SeqCst);
+    let handler = BUGCHECK_HANDLER.load(Ordering::SeqCst);
+    if handler.is_null() {
+        panic!("NT bugcheck {code:#x} params {params:x?}");
+    }
+    // SAFETY: only `BugCheckHandler` values are stored in BUGCHECK_HANDLER.
+    let handler: BugCheckHandler = unsafe { core::mem::transmute(handler) };
+    handler(code, params);
+}
+
+/// Diagnostic sink (`fn(&str)`): the kernel points it at the serial port.
+pub static DIAGNOSTIC_SINK: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+fn diagnostic(message: &str) {
+    let sink = DIAGNOSTIC_SINK.load(Ordering::SeqCst);
+    if !sink.is_null() {
+        // SAFETY: only `fn(&str)` values are stored in DIAGNOSTIC_SINK.
+        let sink: fn(&str) = unsafe { core::mem::transmute(sink) };
+        sink(message);
+    }
+}
+
 /// Serializes host tests that touch the NT host's process-global state.
 #[cfg(not(any(target_os = "uefi", target_os = "none")))]
 static NT_HOST_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Test support (host builds only): takes exclusive ownership of the NT host's
 /// process-global state (software IRQL, hardware IRQL hooks, pool registry) and resets
-/// IRQL to `PASSIVE_LEVEL` with no hardware hooks installed.
+/// IRQL to `PASSIVE_LEVEL` with no hardware, bugcheck or diagnostic hooks installed.
+/// Rule: every host test that runs driver code or calls the NT stubs must hold this guard.
 ///
 /// `cargo test` runs tests in parallel threads; without this, one test lowering the
 /// global IRQL while another holds a spin lock made `standard_wdm`'s spin-lock IOCTL
@@ -51,6 +140,8 @@ pub fn lock_nt_host_state_for_tests() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     HARDWARE_IRQL_GETTER.store(core::ptr::null_mut(), Ordering::SeqCst);
     HARDWARE_IRQL_SETTER.store(core::ptr::null_mut(), Ordering::SeqCst);
+    BUGCHECK_HANDLER.store(core::ptr::null_mut(), Ordering::SeqCst);
+    DIAGNOSTIC_SINK.store(core::ptr::null_mut(), Ordering::SeqCst);
     CURRENT_IRQL.store(PASSIVE_LEVEL, Ordering::SeqCst);
     guard
 }
@@ -66,16 +157,19 @@ type PoolSlot = (usize, usize, u32);
 /// Frees are validated against this registry instead of reading a header in front of the
 /// pointer, so a double free or a foreign pointer is detected without touching freed memory.
 /// The registry never allocates, so it does not perturb kernel heap accounting.
-struct PoolTracker {
+/// Also used (with `usize` slots) for the live-device registry.
+struct SlotRegistry<S, const N: usize> {
     lock: AtomicBool,
-    slots: core::cell::UnsafeCell<[PoolSlot; POOL_TRACKER_CAPACITY]>,
+    slots: core::cell::UnsafeCell<[S; N]>,
 }
 
-// SAFETY: every access to `slots` happens while `lock` is held.
-unsafe impl Sync for PoolTracker {}
+type PoolTracker = SlotRegistry<PoolSlot, POOL_TRACKER_CAPACITY>;
 
-impl PoolTracker {
-    fn with<R>(&self, f: impl FnOnce(&mut [PoolSlot; POOL_TRACKER_CAPACITY]) -> R) -> R {
+// SAFETY: every access to `slots` happens while `lock` is held.
+unsafe impl<S: Send, const N: usize> Sync for SlotRegistry<S, N> {}
+
+impl<S, const N: usize> SlotRegistry<S, N> {
+    fn with<R>(&self, f: impl FnOnce(&mut [S; N]) -> R) -> R {
         while self
             .lock
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -95,8 +189,37 @@ static POOL_TRACKER: PoolTracker = PoolTracker {
     slots: core::cell::UnsafeCell::new([(0, 0, 0); POOL_TRACKER_CAPACITY]),
 };
 
+/// Maximum number of simultaneously live device objects.
+pub const DEVICE_TRACKER_CAPACITY: usize = 256;
+
+/// Registry of live device objects (address; 0 marks a free slot). `IoDeleteDevice`
+/// checks it before dereferencing the pointer, so a double delete or a foreign pointer
+/// never reads freed memory.
+static DEVICE_TRACKER: SlotRegistry<usize, DEVICE_TRACKER_CAPACITY> = SlotRegistry {
+    lock: AtomicBool::new(false),
+    slots: core::cell::UnsafeCell::new([0; DEVICE_TRACKER_CAPACITY]),
+};
+
+/// Number of device objects currently alive (created and not yet deleted).
+pub fn live_device_objects() -> usize {
+    DEVICE_TRACKER.with(|slots| slots.iter().filter(|&&s| s != 0).count())
+}
+
+fn device_is_live(device: *mut DeviceObject) -> bool {
+    DEVICE_TRACKER.with(|slots| slots.contains(&(device as usize)))
+}
+
 /// Count of rejected pool frees (double free, unknown pointer, tag mismatch).
 static POOL_VIOLATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Count of allocations refused because the pool registry was full.
+static POOL_TRACKER_EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of `ExAllocatePoolWithTag` calls refused because all
+/// [`POOL_TRACKER_CAPACITY`] registry slots were in use (monotonic).
+pub fn pool_tracker_exhausted() -> usize {
+    POOL_TRACKER_EXHAUSTED.load(Ordering::SeqCst)
+}
 
 /// Number of pool blocks currently allocated through `ExAllocatePoolWithTag`.
 pub fn live_pool_allocations() -> usize {
@@ -955,36 +1078,59 @@ pub unsafe extern "win64" fn stub_ke_get_current_irql() -> Kirql {
     }
 }
 
+fn set_irql(new_irql: Kirql) {
+    let fn_ptr = HARDWARE_IRQL_SETTER.load(Ordering::Acquire);
+    if !fn_ptr.is_null() {
+        // SAFETY: only `unsafe fn(u8)` values are stored in HARDWARE_IRQL_SETTER.
+        unsafe {
+            let setter: unsafe fn(u8) = core::mem::transmute(fn_ptr);
+            setter(new_irql);
+        }
+    }
+    CURRENT_IRQL.store(new_irql, Ordering::SeqCst);
+}
+
 /// WDM KeRaiseIrql export stub.
+///
+/// Raising to a lower IRQL than the current one, or above `HIGH_LEVEL` (15 on x64), is a
+/// caller bug: bugcheck `IRQL_NOT_GREATER_OR_EQUAL` and leave the IRQL unchanged.
 ///
 /// # Safety
 ///
 /// If `old_irql` is non-null, it must be writable for a single byte.
 pub unsafe extern "win64" fn stub_ke_raise_irql(new_irql: Kirql, old_irql: *mut Kirql) {
     let current = stub_ke_get_current_irql();
+    if new_irql < current || new_irql > HIGH_LEVEL {
+        bug_check(
+            BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL,
+            [current as usize, new_irql as usize, 0, 0],
+        );
+        return;
+    }
     if !old_irql.is_null() {
         *old_irql = current;
     }
-    let fn_ptr = HARDWARE_IRQL_SETTER.load(Ordering::Acquire);
-    if !fn_ptr.is_null() {
-        let setter: unsafe fn(u8) = core::mem::transmute(fn_ptr);
-        setter(new_irql);
-    }
-    CURRENT_IRQL.store(new_irql, Ordering::SeqCst);
+    set_irql(new_irql);
 }
 
 /// WDM KeLowerIrql export stub.
+///
+/// Lowering to a higher IRQL than the current one is a caller bug: bugcheck
+/// `IRQL_NOT_LESS_OR_EQUAL` and leave the IRQL unchanged.
 ///
 /// # Safety
 ///
 /// Restores previously recorded hardware or software IRQL.
 pub unsafe extern "win64" fn stub_ke_lower_irql(new_irql: Kirql) {
-    let fn_ptr = HARDWARE_IRQL_SETTER.load(Ordering::Acquire);
-    if !fn_ptr.is_null() {
-        let setter: unsafe fn(u8) = core::mem::transmute(fn_ptr);
-        setter(new_irql);
+    let current = stub_ke_get_current_irql();
+    if new_irql > current {
+        bug_check(
+            BUGCHECK_IRQL_NOT_LESS_OR_EQUAL,
+            [current as usize, new_irql as usize, 0, 0],
+        );
+        return;
     }
-    CURRENT_IRQL.store(new_irql, Ordering::SeqCst);
+    set_irql(new_irql);
 }
 
 /// WDM RtlInitUnicodeString export stub.
@@ -1015,7 +1161,28 @@ pub unsafe extern "win64" fn stub_rtl_init_unicode_string(
     (*dest).buffer = source as *mut u16;
 }
 
+/// Bytes reserved in front of every device object for the host's own bookkeeping
+/// (the extension size). Drivers never see this header.
+const DEVICE_HEADER: usize = 16;
+/// Offset of the device extension inside the device allocation (after the object).
+const DEVICE_EXTENSION_OFFSET: usize = core::mem::size_of::<DeviceObject>().div_ceil(16) * 16;
+/// Largest device extension the host accepts.
+pub const MAX_DEVICE_EXTENSION_SIZE: usize = 1024 * 1024;
+
+fn device_layout(extension_size: usize) -> Option<alloc::alloc::Layout> {
+    alloc::alloc::Layout::from_size_align(
+        DEVICE_HEADER + DEVICE_EXTENSION_OFFSET + extension_size,
+        16.max(core::mem::align_of::<DeviceObject>()),
+    )
+    .ok()
+}
+
 /// WDM IoCreateDevice export stub.
+///
+/// Like the NT I/O manager, the device extension (`DeviceExtensionSize` bytes, zeroed,
+/// 16-byte aligned) lives in the same allocation, right after the device object;
+/// `DeviceExtension` is null when the size is 0. New devices are appended to the
+/// driver's device list.
 ///
 /// # Safety
 ///
@@ -1023,7 +1190,7 @@ pub unsafe extern "win64" fn stub_rtl_init_unicode_string(
 /// to writable pointer storage.
 pub unsafe extern "win64" fn stub_io_create_device(
     driver_object: *mut DriverObject,
-    _device_extension_size: u32,
+    device_extension_size: u32,
     _device_name: *mut UnicodeString,
     device_type: u32,
     characteristics: u32,
@@ -1033,13 +1200,42 @@ pub unsafe extern "win64" fn stub_io_create_device(
     if driver_object.is_null() || device_object.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-
-    let dev = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(DeviceObject {
+    let extension_size = device_extension_size as usize;
+    if extension_size > MAX_DEVICE_EXTENSION_SIZE {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let Some(layout) = device_layout(extension_size) else {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    };
+    let base = alloc::alloc::alloc_zeroed(layout);
+    if base.is_null() {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    (base as *mut usize).write(extension_size);
+    let dev = base.add(DEVICE_HEADER) as *mut DeviceObject;
+    let registered = DEVICE_TRACKER.with(|slots| {
+        slots
+            .iter_mut()
+            .find(|s| **s == 0)
+            .map(|slot| *slot = dev as usize)
+    });
+    if registered.is_none() {
+        alloc::alloc::dealloc(base, layout);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    let extension = if extension_size == 0 {
+        core::ptr::null_mut()
+    } else {
+        (dev as *mut u8).add(DEVICE_EXTENSION_OFFSET) as *mut c_void
+    };
+    dev.write(DeviceObject {
         driver_object,
         device_type,
         characteristics,
+        device_extension: extension,
+        size: (core::mem::size_of::<DeviceObject>() + extension_size).min(u16::MAX as usize) as u16,
         ..Default::default()
-    }));
+    });
 
     if (*driver_object).device_object.is_null() {
         (*driver_object).device_object = dev;
@@ -1057,16 +1253,61 @@ pub unsafe extern "win64" fn stub_io_create_device(
 
 /// WDM IoDeleteDevice export stub.
 ///
+/// Unlinks the device from its driver's list at any position (head, middle or tail) and
+/// frees it together with its extension. The extension size comes from the host's own
+/// header, not from fields the driver could have modified.
+///
+/// The device is freed only if it is live and was found and unlinked from its driver's
+/// list. Otherwise this bugchecks with [`BUGCHECK_NEXUS_INVALID_DEVICE_DELETE`] and frees
+/// nothing: a pointer that is not a live device (double delete, foreign pointer) is not
+/// dereferenced at all, and the host header is never read.
+///
 /// # Safety
 ///
-/// `device_object` must point to an active `DeviceObject` allocated via `IoCreateDevice`.
+/// `device_object` must be null or a pointer the caller believes came from
+/// `IoCreateDevice`; anything else is detected through the live-device registry.
 pub unsafe extern "win64" fn stub_io_delete_device(device_object: *mut DeviceObject) {
-    if !device_object.is_null() {
-        let drv = (*device_object).driver_object;
-        if !drv.is_null() && (*drv).device_object == device_object {
-            (*drv).device_object = (*device_object).next_device;
+    if device_object.is_null() {
+        return;
+    }
+    let invalid = |subcode: usize| {
+        bug_check(
+            BUGCHECK_NEXUS_INVALID_DEVICE_DELETE,
+            [subcode, device_object as usize, 0, 0],
+        )
+    };
+    if !device_is_live(device_object) {
+        invalid(DEVICE_DELETE_NOT_LIVE);
+        return;
+    }
+    let drv = (*device_object).driver_object;
+    if drv.is_null() {
+        invalid(DEVICE_DELETE_NO_DRIVER);
+        return;
+    }
+    let mut unlinked = false;
+    let mut link: *mut *mut DeviceObject = &mut (*drv).device_object;
+    while !(*link).is_null() {
+        if *link == device_object {
+            *link = (*device_object).next_device;
+            unlinked = true;
+            break;
         }
-        let _ = alloc::boxed::Box::from_raw(device_object);
+        link = &mut (**link).next_device;
+    }
+    if !unlinked {
+        invalid(DEVICE_DELETE_NOT_IN_LIST);
+        return;
+    }
+    DEVICE_TRACKER.with(|slots| {
+        if let Some(slot) = slots.iter_mut().find(|s| **s == device_object as usize) {
+            *slot = 0;
+        }
+    });
+    let base = (device_object as *mut u8).sub(DEVICE_HEADER);
+    let extension_size = (base as *const usize).read();
+    if let Some(layout) = device_layout(extension_size) {
+        alloc::alloc::dealloc(base, layout);
     }
 }
 
@@ -1133,6 +1374,13 @@ pub unsafe extern "win64" fn stub_ex_allocate_pool_with_tag(
     });
     if recorded.is_none() {
         alloc::alloc::dealloc(ptr, layout);
+        let refused = POOL_TRACKER_EXHAUSTED.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut line = NumberLine::new();
+        line.push("NEXUS_POOL_TRACKER_EXHAUSTED: capacity=");
+        line.push_usize(POOL_TRACKER_CAPACITY);
+        line.push(" refused_total=");
+        line.push_usize(refused);
+        diagnostic(line.as_str());
         return core::ptr::null_mut();
     }
     ptr as *mut c_void
@@ -1142,30 +1390,37 @@ pub unsafe extern "win64" fn stub_ex_allocate_pool_with_tag(
 ///
 /// # Safety
 ///
-/// Frees only blocks present in the pool registry. Unknown pointers (including double
-/// frees) and tag mismatches are rejected without dereferencing `p` and counted in
-/// [`pool_violations`]; the block is then left allocated (so it also shows up as a leak).
+/// Frees only blocks present in the pool registry. A tag mismatch or a block that is not
+/// live (double free, foreign pointer) is a `BAD_POOL_CALLER` bugcheck; it is also counted
+/// in [`pool_violations`], `p` is never dereferenced, and the block (if any) stays
+/// allocated so it also shows up as a leak if the handler returns.
 pub unsafe extern "win64" fn stub_ex_free_pool_with_tag(p: *mut c_void, tag: u32) {
     if p.is_null() {
         return;
     }
     let removed = POOL_TRACKER.with(|slots| {
-        let slot = slots.iter_mut().find(|s| s.0 == p as usize)?;
+        let Some(slot) = slots.iter_mut().find(|s| s.0 == p as usize) else {
+            return Err((BAD_POOL_UNKNOWN_BLOCK, 0));
+        };
         if tag != 0 && slot.2 != tag {
-            return None;
+            return Err((BAD_POOL_TAG_MISMATCH, slot.2 as usize));
         }
         let size = slot.1;
         *slot = (0, 0, 0);
-        Some(size)
+        Ok(size)
     });
     match removed {
-        Some(size) => {
+        Ok(size) => {
             if let Ok(layout) = alloc::alloc::Layout::from_size_align(size, 16) {
                 alloc::alloc::dealloc(p as *mut u8, layout);
             }
         }
-        None => {
+        Err((subcode, recorded_tag)) => {
             POOL_VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+            bug_check(
+                BUGCHECK_BAD_POOL_CALLER,
+                [subcode, p as usize, recorded_tag, tag as usize],
+            );
         }
     }
 }
@@ -1251,7 +1506,11 @@ pub unsafe extern "win64" fn stub_ke_acquire_spin_lock(
     spin_lock: *mut usize,
     old_irql: *mut Kirql,
 ) {
+    let checks_before = bugcheck_count();
     stub_ke_raise_irql(DISPATCH_LEVEL, old_irql);
+    if bugcheck_count() != checks_before {
+        return; // acquiring above DISPATCH_LEVEL: bugchecked, do not take the lock
+    }
     if !spin_lock.is_null() {
         let lock_ptr = spin_lock as *const core::sync::atomic::AtomicUsize;
         while (*lock_ptr)
@@ -1276,6 +1535,11 @@ pub unsafe extern "win64" fn stub_ke_release_spin_lock(spin_lock: *mut usize, ne
     stub_ke_lower_irql(new_irql);
 }
 
+/// `EVENT_TYPE::NotificationEvent`: stays signaled until explicitly reset.
+pub const NOTIFICATION_EVENT: u8 = 0;
+/// `EVENT_TYPE::SynchronizationEvent`: a satisfied wait resets it automatically.
+pub const SYNCHRONIZATION_EVENT: u8 = 1;
+
 /// WDM KeInitializeEvent export stub.
 ///
 /// # Safety
@@ -1297,11 +1561,24 @@ pub unsafe extern "win64" fn stub_ke_initialize_event(
     }
 }
 
-/// WDM KeSetEvent export stub.
+fn set_event_state(event: *mut KEvent, signaled: bool) -> i32 {
+    // SAFETY: callers pass a valid, non-null event.
+    unsafe {
+        let previous = (*event).signal_state;
+        (*event).signal_state = signaled as i32;
+        (*event).header_signaled = signaled as u8;
+        previous
+    }
+}
+
+/// WDM KeSetEvent export stub. Signals the event and returns the previous state.
+///
+/// There are no waiter threads in the single-threaded host, so nothing is woken: the
+/// state change is what a later `KeWaitForSingleObject` observes.
 ///
 /// # Safety
 ///
-/// Signals `KEvent` and returns previous state.
+/// `event` must be null or point to an initialized `KEvent`.
 pub unsafe extern "win64" fn stub_ke_set_event(
     event: *mut KEvent,
     _increment: i32,
@@ -1310,47 +1587,347 @@ pub unsafe extern "win64" fn stub_ke_set_event(
     if event.is_null() {
         return 0;
     }
-    let prev = (*event).signal_state;
-    (*event).signal_state = 1;
-    (*event).header_signaled = 1;
-    prev
+    set_event_state(event, true)
 }
 
-/// WDM KeResetEvent export stub.
+/// WDM KeResetEvent export stub. Clears the event and returns the previous state.
 ///
 /// # Safety
 ///
-/// Clears signaled state of `KEvent`.
+/// `event` must be null or point to an initialized `KEvent`.
 pub unsafe extern "win64" fn stub_ke_reset_event(event: *mut KEvent) -> i32 {
     if event.is_null() {
         return 0;
     }
-    let prev = (*event).signal_state;
-    (*event).signal_state = 0;
-    (*event).header_signaled = 0;
-    prev
+    set_event_state(event, false)
 }
 
-/// WDM KeWaitForSingleObject export stub.
+/// WDM KeWaitForSingleObject export stub (events only).
+///
+/// Semantics:
+/// - Waiting above `DISPATCH_LEVEL`, or at `DISPATCH_LEVEL` with a non-zero timeout, is a
+///   caller bug: bugcheck `IRQL_NOT_LESS_OR_EQUAL`.
+/// - Signaled event: `STATUS_SUCCESS`; a `SynchronizationEvent` is reset by the satisfied
+///   wait, a `NotificationEvent` stays signaled.
+/// - Non-signaled with a zero timeout (poll): `STATUS_TIMEOUT`.
+/// - Non-signaled with a finite non-zero timeout: `STATUS_TIMEOUT` is returned at once.
+///   No other thread, DPC or timer exists that could signal the event before the timeout,
+///   so the result is the one Windows would produce; the host does not sleep for the
+///   duration (no timer until Phase 4).
+/// - Non-signaled with an infinite timeout (`NULL`): a guaranteed deadlock. Bugcheck
+///   `BUGCHECK_NEXUS_UNSATISFIABLE_WAIT` (Nexus-specific); if a test handler returns,
+///   `STATUS_POSSIBLE_DEADLOCK`. It never reports `STATUS_TIMEOUT`.
+/// - Objects that are not events: `STATUS_INVALID_PARAMETER`.
 ///
 /// # Safety
 ///
-/// Verifies object signal state and returns `STATUS_SUCCESS`.
+/// `object` must be null or point to an initialized `KEvent`; `timeout` must be null or
+/// point to a readable `i64` (100 ns units, negative = relative).
 pub unsafe extern "win64" fn stub_ke_wait_for_single_object(
     object: *mut c_void,
     _wait_reason: u32,
     _wait_mode: u8,
     _alertable: u8,
-    _timeout: *const i64,
+    timeout: *const i64,
 ) -> i32 {
     if object.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    let irql = stub_ke_get_current_irql();
+    let zero_timeout = !timeout.is_null() && *timeout == 0;
+    if irql > DISPATCH_LEVEL || (irql == DISPATCH_LEVEL && !zero_timeout) {
+        bug_check(
+            BUGCHECK_IRQL_NOT_LESS_OR_EQUAL,
+            [object as usize, irql as usize, 0, 0],
+        );
+        return STATUS_INVALID_PARAMETER;
+    }
     let event = object as *mut KEvent;
+    let event_type = (*event).header_type;
+    if event_type != NOTIFICATION_EVENT && event_type != SYNCHRONIZATION_EVENT {
+        return STATUS_INVALID_PARAMETER;
+    }
     if (*event).signal_state > 0 {
-        STATUS_SUCCESS
-    } else {
-        0x00000102 // STATUS_TIMEOUT
+        if event_type == SYNCHRONIZATION_EVENT {
+            set_event_state(event, false);
+        }
+        return STATUS_SUCCESS;
+    }
+    if timeout.is_null() {
+        bug_check(
+            BUGCHECK_NEXUS_UNSATISFIABLE_WAIT,
+            [object as usize, event_type as usize, irql as usize, 0],
+        );
+        return STATUS_POSSIBLE_DEADLOCK;
+    }
+    STATUS_TIMEOUT
+}
+
+fn record_bugcheck_only(_code: u32, _params: [usize; 4]) {}
+
+/// Runs `f` and returns the stop code of the bugcheck it raised (`None` if none).
+fn bugcheck_raised_by(f: impl FnOnce()) -> Option<u32> {
+    let before = bugcheck_count();
+    f();
+    (bugcheck_count() != before).then(last_bugcheck)
+}
+
+/// Self-test of the minimal NT semantics, shared by host tests and the QEMU guest.
+///
+/// Temporarily installs a recording bugcheck handler (so each expected bugcheck can be
+/// observed), restores the previous handler and `PASSIVE_LEVEL` before returning, and
+/// returns the number of checks that passed or the name of the first failing check.
+/// Must run at `PASSIVE_LEVEL` with no other NT host activity.
+pub fn nt_semantics_self_test() -> Result<usize, &'static str> {
+    let previous = BUGCHECK_HANDLER.swap(record_bugcheck_only as *mut (), Ordering::SeqCst);
+    let result = unsafe { run_nt_semantics_checks() };
+    set_irql(PASSIVE_LEVEL);
+    BUGCHECK_HANDLER.store(previous, Ordering::SeqCst);
+    result
+}
+
+unsafe fn run_nt_semantics_checks() -> Result<usize, &'static str> {
+    fn check(ok: bool, name: &'static str, passed: &mut usize) -> Result<(), &'static str> {
+        if ok {
+            *passed += 1;
+            Ok(())
+        } else {
+            Err(name)
+        }
+    }
+    let mut passed = 0usize;
+    if stub_ke_get_current_irql() != PASSIVE_LEVEL {
+        return Err("precondition: PASSIVE_LEVEL");
+    }
+
+    // IRQL direction.
+    let mut old = 0xFF;
+    stub_ke_raise_irql(DISPATCH_LEVEL, &mut old);
+    let code = bugcheck_raised_by(|| stub_ke_raise_irql(PASSIVE_LEVEL, core::ptr::null_mut()));
+    check(
+        code == Some(BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL)
+            && stub_ke_get_current_irql() == DISPATCH_LEVEL,
+        "raise-to-lower-irql",
+        &mut passed,
+    )?;
+    let code = bugcheck_raised_by(|| stub_ke_raise_irql(HIGH_LEVEL + 1, core::ptr::null_mut()));
+    check(
+        code == Some(BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL),
+        "raise-above-high-level",
+        &mut passed,
+    )?;
+    let code = bugcheck_raised_by(|| {
+        let mut ev: KEvent = core::mem::zeroed();
+        stub_ke_initialize_event(&mut ev, SYNCHRONIZATION_EVENT as u32, 0);
+        stub_ke_wait_for_single_object(
+            &mut ev as *mut _ as *mut c_void,
+            0,
+            0,
+            0,
+            core::ptr::null(),
+        );
+    });
+    check(
+        code == Some(BUGCHECK_IRQL_NOT_LESS_OR_EQUAL),
+        "infinite-wait-at-dispatch",
+        &mut passed,
+    )?;
+    stub_ke_lower_irql(old);
+    let code = bugcheck_raised_by(|| stub_ke_lower_irql(DISPATCH_LEVEL));
+    check(
+        code == Some(BUGCHECK_IRQL_NOT_LESS_OR_EQUAL)
+            && stub_ke_get_current_irql() == PASSIVE_LEVEL,
+        "lower-to-higher-irql",
+        &mut passed,
+    )?;
+
+    // Events and waits.
+    let wait = |ev: &mut KEvent, timeout: *const i64| {
+        stub_ke_wait_for_single_object(ev as *mut KEvent as *mut c_void, 0, 0, 0, timeout)
+    };
+    let zero: i64 = 0;
+    let finite: i64 = -10_000; // 1 ms, relative
+    let mut sync: KEvent = core::mem::zeroed();
+    stub_ke_initialize_event(&mut sync, SYNCHRONIZATION_EVENT as u32, 0);
+    stub_ke_set_event(&mut sync, 0, 0);
+    let first = wait(&mut sync, core::ptr::null());
+    let second = wait(&mut sync, &zero);
+    check(
+        first == STATUS_SUCCESS && second == STATUS_TIMEOUT && sync.signal_state == 0,
+        "synchronization-event-auto-reset",
+        &mut passed,
+    )?;
+    let mut notification: KEvent = core::mem::zeroed();
+    stub_ke_initialize_event(&mut notification, NOTIFICATION_EVENT as u32, 0);
+    stub_ke_set_event(&mut notification, 0, 0);
+    let first = wait(&mut notification, core::ptr::null());
+    let second = wait(&mut notification, core::ptr::null());
+    check(
+        first == STATUS_SUCCESS && second == STATUS_SUCCESS && notification.signal_state == 1,
+        "notification-event-stays-signaled",
+        &mut passed,
+    )?;
+    stub_ke_reset_event(&mut notification);
+    let mut status = 0;
+    let code = bugcheck_raised_by(|| status = wait(&mut notification, core::ptr::null()));
+    check(
+        code == Some(BUGCHECK_NEXUS_UNSATISFIABLE_WAIT)
+            && status == STATUS_POSSIBLE_DEADLOCK
+            && status != STATUS_TIMEOUT,
+        "infinite-wait-never-times-out",
+        &mut passed,
+    )?;
+    let code = bugcheck_raised_by(|| status = wait(&mut notification, &finite));
+    check(
+        code.is_none() && status == STATUS_TIMEOUT,
+        "finite-wait-times-out",
+        &mut passed,
+    )?;
+
+    // Pool tags and double free.
+    let block = stub_ex_allocate_pool_with_tag(0, 48, 0x7473_6554);
+    let code = bugcheck_raised_by(|| stub_ex_free_pool_with_tag(block, 0x4241_4442));
+    let still_live = POOL_TRACKER.with(|slots| slots.iter().any(|s| s.0 == block as usize));
+    check(
+        !block.is_null() && code == Some(BUGCHECK_BAD_POOL_CALLER) && still_live,
+        "pool-wrong-tag-bugchecks",
+        &mut passed,
+    )?;
+    let code = bugcheck_raised_by(|| stub_ex_free_pool_with_tag(block, 0x7473_6554));
+    let code_again = bugcheck_raised_by(|| stub_ex_free_pool_with_tag(block, 0x7473_6554));
+    check(
+        code.is_none() && code_again == Some(BUGCHECK_BAD_POOL_CALLER),
+        "pool-double-free-bugchecks",
+        &mut passed,
+    )?;
+
+    // Devices: extensions and deletion at any list position.
+    let mut drv = DriverObject::default();
+    let mut devs = [core::ptr::null_mut::<DeviceObject>(); 3];
+    for (dev, ext) in devs.iter_mut().zip([0u32, 64, 4096]) {
+        if stub_io_create_device(&mut drv, ext, core::ptr::null_mut(), 0x22, 0, 0, dev)
+            != STATUS_SUCCESS
+        {
+            return Err("device-create");
+        }
+    }
+    let ext1 = (*devs[1]).device_extension as *const u8;
+    let ext2 = (*devs[2]).device_extension as *const u8;
+    check(
+        (*devs[0]).device_extension.is_null()
+            && !ext1.is_null()
+            && (ext1 as usize).is_multiple_of(16)
+            && core::slice::from_raw_parts(ext1, 64)
+                .iter()
+                .all(|&b| b == 0)
+            && !ext2.is_null()
+            && core::slice::from_raw_parts(ext2, 4096)
+                .iter()
+                .all(|&b| b == 0),
+        "device-extension-allocated-zeroed",
+        &mut passed,
+    )?;
+    stub_io_delete_device(devs[1]); // middle
+    let after_middle = drv.device_object == devs[0] && (*devs[0]).next_device == devs[2];
+    stub_io_delete_device(devs[2]); // tail
+    let after_tail = drv.device_object == devs[0] && (*devs[0]).next_device.is_null();
+    stub_io_delete_device(devs[0]); // head
+    check(
+        after_middle && after_tail && drv.device_object.is_null(),
+        "device-delete-any-position",
+        &mut passed,
+    )?;
+
+    // Invalid deletes bugcheck and free nothing: double delete, and a pointer that never
+    // was a device (its bytes, including the 16 in front, must be left untouched).
+    let live_devices = live_device_objects();
+    let mut dev = core::ptr::null_mut();
+    if stub_io_create_device(&mut drv, 32, core::ptr::null_mut(), 0x22, 0, 0, &mut dev)
+        != STATUS_SUCCESS
+    {
+        return Err("device-create");
+    }
+    stub_io_delete_device(dev);
+    let double = bugcheck_raised_by(|| stub_io_delete_device(dev));
+    let double_params = last_bugcheck_params();
+    let mut fake = [0xA5u8; 256];
+    let fake_dev = fake.as_mut_ptr().add(64) as *mut DeviceObject;
+    let foreign = bugcheck_raised_by(|| stub_io_delete_device(fake_dev));
+    let foreign_params = last_bugcheck_params();
+    check(
+        double == Some(BUGCHECK_NEXUS_INVALID_DEVICE_DELETE)
+            && double_params[..2] == [DEVICE_DELETE_NOT_LIVE, dev as usize]
+            && foreign == Some(BUGCHECK_NEXUS_INVALID_DEVICE_DELETE)
+            && foreign_params[..2] == [DEVICE_DELETE_NOT_LIVE, fake_dev as usize]
+            && fake.iter().all(|&b| b == 0xA5)
+            && live_device_objects() == live_devices
+            && drv.device_object.is_null(),
+        "device-invalid-delete-bugchecks",
+        &mut passed,
+    )?;
+
+    // Pool registry exhaustion is reported, not silent.
+    let exhausted_before = pool_tracker_exhausted();
+    let live_before = live_pool_allocations();
+    let mut taken = alloc::vec::Vec::with_capacity(POOL_TRACKER_CAPACITY);
+    loop {
+        let block = stub_ex_allocate_pool_with_tag(0, 16, 0x6C6C_7546);
+        if block.is_null() {
+            break;
+        }
+        taken.push(block);
+        if taken.len() > POOL_TRACKER_CAPACITY {
+            break;
+        }
+    }
+    let refused = pool_tracker_exhausted() - exhausted_before;
+    for block in taken.drain(..) {
+        stub_ex_free_pool_with_tag(block, 0x6C6C_7546);
+    }
+    drop(taken);
+    check(
+        refused == 1 && live_pool_allocations() == live_before,
+        "pool-tracker-exhaustion-reported",
+        &mut passed,
+    )?;
+    Ok(passed)
+}
+
+/// Fixed-capacity, allocation-free text buffer for diagnostics (no heap use, so it does
+/// not perturb heap accounting while the pool is exhausted).
+struct NumberLine {
+    buf: [u8; 128],
+    len: usize,
+}
+
+impl NumberLine {
+    fn new() -> Self {
+        Self {
+            buf: [0; 128],
+            len: 0,
+        }
+    }
+    fn push(&mut self, text: &str) {
+        let n = text.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&text.as_bytes()[..n]);
+        self.len += n;
+    }
+    fn push_usize(&mut self, mut value: usize) {
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        // SAFETY: ASCII digits are valid UTF-8.
+        self.push(unsafe { core::str::from_utf8_unchecked(&digits[i..]) });
+    }
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
     }
 }
 
@@ -1358,9 +1935,10 @@ pub unsafe extern "win64" fn stub_ke_wait_for_single_object(
 mod tests {
     use super::*;
     use nexus_types::driver::{
-        IoStackLocation, ParametersDeviceIoControl, IOCTL_NEXUS_ECHO, IOCTL_NEXUS_GET_VERSION,
-        IOCTL_NEXUS_RAISE_IRQL_TEST, IOCTL_WDM_SAMPLE_EVENT_TEST, IOCTL_WDM_SAMPLE_MEM_TEST,
-        IOCTL_WDM_SAMPLE_SPINLOCK_IRQL, IRP_MJ_CREATE, IRP_MJ_DEVICE_CONTROL, IRP_MJ_READ,
+        IoStackLocation, ParametersDeviceIoControl, APC_LEVEL, IOCTL_NEXUS_ECHO,
+        IOCTL_NEXUS_GET_VERSION, IOCTL_NEXUS_RAISE_IRQL_TEST, IOCTL_WDM_SAMPLE_EVENT_TEST,
+        IOCTL_WDM_SAMPLE_MEM_TEST, IOCTL_WDM_SAMPLE_SPINLOCK_IRQL, IRP_MJ_CREATE,
+        IRP_MJ_DEVICE_CONTROL, IRP_MJ_READ,
     };
 
     const REAL_DRIVER_BYTES: &[u8] =
@@ -1863,6 +2441,8 @@ mod tests {
     #[test]
     fn test_pool_tag_verification_and_double_free() {
         let _host_state = lock_nt_host_state_for_tests();
+        BUGCHECK_HANDLER.store(record_bugcheck_only as *mut (), Ordering::SeqCst);
+        let bugchecks0 = bugcheck_count();
         let live0 = live_pool_allocations();
         let violations0 = pool_violations();
         unsafe {
@@ -1873,8 +2453,10 @@ mod tests {
             let bytes = core::slice::from_raw_parts(ptr as *const u8, 128);
             assert!(bytes.iter().all(|&b| b == 0), "pool must be zeroed");
 
-            // Mismatched tag: rejected, counted, block stays allocated.
+            // Mismatched tag: BAD_POOL_CALLER bugcheck, counted, block stays allocated.
             stub_ex_free_pool_with_tag(ptr, 0x99999999);
+            assert_eq!(bugcheck_count(), bugchecks0 + 1);
+            assert_eq!(last_bugcheck(), BUGCHECK_BAD_POOL_CALLER);
             assert_eq!(pool_violations(), violations0 + 1);
             assert_eq!(live_pool_allocations(), live0 + 1);
 
@@ -1885,6 +2467,7 @@ mod tests {
 
             // Double free: rejected via the registry, without reading freed memory.
             stub_ex_free_pool_with_tag(ptr, 0x41424344);
+            assert_eq!(bugcheck_count(), bugchecks0 + 2);
             assert_eq!(pool_violations(), violations0 + 2);
             assert_eq!(live_pool_allocations(), live0);
 
@@ -1938,7 +2521,8 @@ mod tests {
         );
         unsafe { stub_ex_free_pool_with_tag(leaked, 0x4B41454C) };
 
-        // 3. Invalid free during the driver's lifetime -> PoolViolations.
+        // 3. Invalid free during the driver's lifetime -> BAD_POOL_CALLER + PoolViolations.
+        BUGCHECK_HANDLER.store(record_bugcheck_only as *mut (), Ordering::SeqCst);
         let mut driver = host
             .load_driver(REAL_DRIVER_BYTES, "\\Driver\\Leak", "\\Registry\\Leak")
             .unwrap();
@@ -2003,5 +2587,315 @@ mod tests {
         assert_eq!(FAKE_CR8_MAX.load(Ordering::SeqCst), DISPATCH_LEVEL);
         assert_eq!(FAKE_CR8.load(Ordering::SeqCst), PASSIVE_LEVEL);
         unsafe { driver.unload() }.unwrap();
+    }
+
+    fn with_recorder() {
+        BUGCHECK_HANDLER.store(record_bugcheck_only as *mut (), Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_nt_semantics_self_test_passes() {
+        let _host_state = lock_nt_host_state_for_tests();
+        assert_eq!(nt_semantics_self_test(), Ok(14));
+        assert!(
+            BUGCHECK_HANDLER.load(Ordering::SeqCst).is_null(),
+            "handler restored"
+        );
+        assert_eq!(unsafe { stub_ke_get_current_irql() }, PASSIVE_LEVEL);
+    }
+
+    #[test]
+    fn test_irql_direction_is_enforced() {
+        let _host_state = lock_nt_host_state_for_tests();
+        with_recorder();
+        unsafe {
+            // Control: legal raise/lower sequence produces no bugcheck.
+            let mut old = 0xFF;
+            assert_eq!(
+                bugcheck_raised_by(|| stub_ke_raise_irql(APC_LEVEL, &mut old)),
+                None
+            );
+            assert_eq!(old, PASSIVE_LEVEL);
+            assert_eq!(
+                bugcheck_raised_by(|| stub_ke_raise_irql(APC_LEVEL, &mut old)),
+                None
+            );
+            assert_eq!(old, APC_LEVEL, "raising to the same IRQL is legal");
+            // Raise to lower -> 0x09, IRQL and old_irql untouched.
+            old = 0xEE;
+            assert_eq!(
+                bugcheck_raised_by(|| stub_ke_raise_irql(PASSIVE_LEVEL, &mut old)),
+                Some(BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL)
+            );
+            assert_eq!((stub_ke_get_current_irql(), old), (APC_LEVEL, 0xEE));
+            // Raise above HIGH_LEVEL (15 on x64) -> 0x09.
+            assert_eq!(
+                bugcheck_raised_by(|| stub_ke_raise_irql(16, core::ptr::null_mut())),
+                Some(BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL)
+            );
+            // Lower to higher -> 0x0A.
+            assert_eq!(
+                bugcheck_raised_by(|| stub_ke_lower_irql(DISPATCH_LEVEL)),
+                Some(BUGCHECK_IRQL_NOT_LESS_OR_EQUAL)
+            );
+            assert_eq!(stub_ke_get_current_irql(), APC_LEVEL);
+            assert_eq!(
+                bugcheck_raised_by(|| stub_ke_lower_irql(PASSIVE_LEVEL)),
+                None
+            );
+            // Spin lock acquired above DISPATCH_LEVEL -> 0x09 and the lock is NOT taken.
+            stub_ke_raise_irql(HIGH_LEVEL, core::ptr::null_mut());
+            let mut lock = 0usize;
+            let mut old_irql = 0;
+            assert_eq!(
+                bugcheck_raised_by(|| stub_ke_acquire_spin_lock(&mut lock, &mut old_irql)),
+                Some(BUGCHECK_IRQL_NOT_GREATER_OR_EQUAL)
+            );
+            assert_eq!(lock, 0);
+            stub_ke_lower_irql(PASSIVE_LEVEL);
+        }
+    }
+
+    #[test]
+    fn test_unhandled_bugcheck_is_fatal() {
+        // Without a handler a bugcheck must not be silently ignored.
+        let _host_state = lock_nt_host_state_for_tests();
+        let result = std::panic::catch_unwind(|| {
+            bug_check(BUGCHECK_BAD_POOL_CALLER, [BAD_POOL_TAG_MISMATCH, 0, 0, 0])
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_event_and_wait_semantics() {
+        let _host_state = lock_nt_host_state_for_tests();
+        with_recorder();
+        unsafe {
+            let wait = |ev: &mut KEvent, timeout: *const i64| {
+                stub_ke_wait_for_single_object(ev as *mut KEvent as *mut c_void, 0, 0, 0, timeout)
+            };
+            let zero = 0i64;
+            let finite = -10_000i64;
+            // Synchronization event: satisfied wait resets it.
+            let mut sync: KEvent = core::mem::zeroed();
+            stub_ke_initialize_event(&mut sync, SYNCHRONIZATION_EVENT as u32, 1);
+            assert_eq!(wait(&mut sync, core::ptr::null()), STATUS_SUCCESS);
+            assert_eq!(sync.signal_state, 0);
+            assert_eq!(wait(&mut sync, &zero), STATUS_TIMEOUT);
+            // Notification event: stays signaled across waits until reset.
+            let mut notif: KEvent = core::mem::zeroed();
+            stub_ke_initialize_event(&mut notif, NOTIFICATION_EVENT as u32, 0);
+            assert_eq!(stub_ke_set_event(&mut notif, 0, 0), 0, "previous state");
+            for _ in 0..3 {
+                assert_eq!(wait(&mut notif, core::ptr::null()), STATUS_SUCCESS);
+            }
+            assert_eq!(stub_ke_reset_event(&mut notif), 1, "previous state");
+            // Poll and finite timeout: STATUS_TIMEOUT, no bugcheck.
+            assert_eq!(
+                bugcheck_raised_by(|| assert_eq!(wait(&mut notif, &zero), STATUS_TIMEOUT)),
+                None
+            );
+            assert_eq!(
+                bugcheck_raised_by(|| assert_eq!(wait(&mut notif, &finite), STATUS_TIMEOUT)),
+                None
+            );
+            // Infinite wait that can never be satisfied: bugcheck, never STATUS_TIMEOUT.
+            let mut status = STATUS_TIMEOUT;
+            assert_eq!(
+                bugcheck_raised_by(|| status = wait(&mut notif, core::ptr::null())),
+                Some(BUGCHECK_NEXUS_UNSATISFIABLE_WAIT)
+            );
+            assert_eq!(status, STATUS_POSSIBLE_DEADLOCK);
+            // Waiting at DISPATCH_LEVEL: only a zero timeout is legal.
+            stub_ke_raise_irql(DISPATCH_LEVEL, core::ptr::null_mut());
+            assert_eq!(
+                bugcheck_raised_by(|| assert_eq!(wait(&mut notif, &zero), STATUS_TIMEOUT)),
+                None
+            );
+            assert_eq!(
+                bugcheck_raised_by(|| {
+                    wait(&mut notif, &finite);
+                }),
+                Some(BUGCHECK_IRQL_NOT_LESS_OR_EQUAL)
+            );
+            stub_ke_lower_irql(PASSIVE_LEVEL);
+            // Non-event dispatcher object: rejected.
+            let mut other: KEvent = core::mem::zeroed();
+            other.header_type = 5;
+            other.signal_state = 1;
+            assert_eq!(
+                wait(&mut other, core::ptr::null()),
+                STATUS_INVALID_PARAMETER
+            );
+        }
+    }
+
+    #[test]
+    fn test_device_extension_and_delete_any_position() {
+        let _host_state = lock_nt_host_state_for_tests();
+        unsafe {
+            let mut drv = DriverObject::default();
+            let mut devs = [core::ptr::null_mut::<DeviceObject>(); 4];
+            for (dev, ext) in devs.iter_mut().zip([0u32, 24, 64, 1]) {
+                assert_eq!(
+                    stub_io_create_device(&mut drv, ext, core::ptr::null_mut(), 0x22, 0, 0, dev),
+                    STATUS_SUCCESS
+                );
+            }
+            assert!(
+                (*devs[0]).device_extension.is_null(),
+                "size 0 -> no extension"
+            );
+            for (dev, ext) in devs.iter().zip([0usize, 24, 64, 1]).skip(1) {
+                let p = (**dev).device_extension as *mut u8;
+                assert!(!p.is_null());
+                assert!((p as usize).is_multiple_of(16));
+                let bytes = core::slice::from_raw_parts_mut(p, ext);
+                assert!(bytes.iter().all(|&b| b == 0));
+                bytes.fill(0xAB); // writable for its full size (Miri/ASan would flag overflow)
+            }
+            let order = |drv: &DriverObject| {
+                let mut v = Vec::new();
+                let mut cur = drv.device_object;
+                while !cur.is_null() {
+                    v.push(cur);
+                    cur = (*cur).next_device;
+                }
+                v
+            };
+            assert_eq!(order(&drv), devs.to_vec());
+            stub_io_delete_device(devs[2]); // middle
+            assert_eq!(order(&drv), vec![devs[0], devs[1], devs[3]]);
+            stub_io_delete_device(devs[3]); // tail
+            assert_eq!(order(&drv), vec![devs[0], devs[1]]);
+            stub_io_delete_device(devs[0]); // head
+            assert_eq!(order(&drv), vec![devs[1]]);
+            stub_io_delete_device(devs[1]);
+            assert!(drv.device_object.is_null());
+            // Recycled memory: dirty a freed extension, then the next device with the same
+            // extension size (same allocation size, reused by the allocator) must be zeroed.
+            for _ in 0..4 {
+                let mut dirty = core::ptr::null_mut();
+                stub_io_create_device(&mut drv, 200, core::ptr::null_mut(), 0x22, 0, 0, &mut dirty);
+                core::ptr::write_bytes((*dirty).device_extension as *mut u8, 0xCD, 200);
+                stub_io_delete_device(dirty);
+                let mut fresh = core::ptr::null_mut();
+                stub_io_create_device(&mut drv, 200, core::ptr::null_mut(), 0x22, 0, 0, &mut fresh);
+                let ext = core::slice::from_raw_parts((*fresh).device_extension as *const u8, 200);
+                assert!(
+                    ext.iter().all(|&b| b == 0),
+                    "device extension must be zeroed"
+                );
+                stub_io_delete_device(fresh);
+            }
+            assert!(drv.device_object.is_null());
+            // Oversized extensions are refused instead of truncated.
+            let mut dev = core::ptr::null_mut();
+            assert_eq!(
+                stub_io_create_device(
+                    &mut drv,
+                    (MAX_DEVICE_EXTENSION_SIZE + 1) as u32,
+                    core::ptr::null_mut(),
+                    0x22,
+                    0,
+                    0,
+                    &mut dev
+                ),
+                STATUS_INSUFFICIENT_RESOURCES
+            );
+            assert!(drv.device_object.is_null());
+        }
+    }
+
+    static DIAG_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    fn capture_diag(line: &str) {
+        DIAG_LINES.lock().unwrap().push(line.to_string());
+    }
+
+    #[test]
+    fn test_pool_tracker_exhaustion_is_counted_and_logged() {
+        let _host_state = lock_nt_host_state_for_tests();
+        DIAGNOSTIC_SINK.store(capture_diag as *mut (), Ordering::SeqCst);
+        DIAG_LINES.lock().unwrap().clear();
+        let refused0 = pool_tracker_exhausted();
+        let live0 = live_pool_allocations();
+        let mut blocks = Vec::new();
+        unsafe {
+            for _ in live0..POOL_TRACKER_CAPACITY {
+                let b = stub_ex_allocate_pool_with_tag(0, 8, 0x6C6C_7546);
+                assert!(!b.is_null(), "registry slots must be usable up to capacity");
+                blocks.push(b);
+            }
+            assert!(stub_ex_allocate_pool_with_tag(0, 8, 0x6C6C_7546).is_null());
+            assert!(stub_ex_allocate_pool_with_tag(0, 8, 0x6C6C_7546).is_null());
+            for b in blocks {
+                stub_ex_free_pool_with_tag(b, 0x6C6C_7546);
+            }
+        }
+        assert_eq!(pool_tracker_exhausted(), refused0 + 2);
+        let lines = DIAG_LINES.lock().unwrap().clone();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[1],
+            format!(
+                "NEXUS_POOL_TRACKER_EXHAUSTED: capacity={POOL_TRACKER_CAPACITY} refused_total={}",
+                refused0 + 2
+            )
+        );
+        assert_eq!(live_pool_allocations(), live0);
+    }
+
+    #[test]
+    fn test_invalid_device_delete_bugchecks_without_freeing() {
+        let _host_state = lock_nt_host_state_for_tests();
+        with_recorder();
+        unsafe {
+            let live0 = live_device_objects();
+            let mut drv = DriverObject::default();
+            let mut dev = core::ptr::null_mut();
+            let mut other = core::ptr::null_mut();
+            for d in [&mut dev, &mut other] {
+                assert_eq!(
+                    stub_io_create_device(&mut drv, 48, core::ptr::null_mut(), 0x22, 0, 0, d),
+                    STATUS_SUCCESS
+                );
+            }
+            assert_eq!(live_device_objects(), live0 + 2);
+            let expect = |ptr: *mut DeviceObject, subcode: usize| {
+                assert_eq!(
+                    bugcheck_raised_by(|| stub_io_delete_device(ptr)),
+                    Some(BUGCHECK_NEXUS_INVALID_DEVICE_DELETE)
+                );
+                assert_eq!(last_bugcheck_params()[..2], [subcode, ptr as usize]);
+            };
+
+            // Live device with a null DriverObject: bugcheck, nothing unlinked or freed.
+            (*dev).driver_object = core::ptr::null_mut();
+            expect(dev, DEVICE_DELETE_NO_DRIVER);
+            assert_eq!(live_device_objects(), live0 + 2);
+            assert_eq!(drv.device_object, dev);
+            (*dev).driver_object = &mut drv;
+
+            // Live device missing from its driver's list: bugcheck, not freed.
+            drv.device_object = other;
+            expect(dev, DEVICE_DELETE_NOT_IN_LIST);
+            assert_eq!(live_device_objects(), live0 + 2);
+            drv.device_object = dev;
+
+            // Valid deletes, then a double delete: bugcheck without touching freed memory.
+            stub_io_delete_device(dev);
+            stub_io_delete_device(other);
+            assert!(drv.device_object.is_null());
+            assert_eq!(live_device_objects(), live0);
+            expect(dev, DEVICE_DELETE_NOT_LIVE);
+            expect(other, DEVICE_DELETE_NOT_LIVE);
+
+            // Pointer that never was a device: not dereferenced, not freed.
+            let mut fake = [0x5Au8; 256];
+            let fake_dev = fake.as_mut_ptr().add(64) as *mut DeviceObject;
+            expect(fake_dev, DEVICE_DELETE_NOT_LIVE);
+            assert!(fake.iter().all(|&b| b == 0x5A));
+            assert_eq!(live_device_objects(), live0);
+        }
     }
 }

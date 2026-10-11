@@ -14,9 +14,9 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 CHECKS = {'msrs', 'permissions', 'context', 'faults', 'exit-and-boundary', 'rollback-oom', 'loader-bytes', 'stress'}
 # Emitted by the NT driver host after reading PTEs back / balancing heap, pool and devices.
-DRIVER_CHECKS = {'driver-wx', 'driver-lifecycle'}
+DRIVER_CHECKS = {'driver-wx', 'driver-lifecycle', 'nt-semantics'}
 # isa-debug-exit failure codes written by the guest (status = (code << 1) | 1).
-FAILURE_EXITS = {35: 'guest kernel panic (NEXUS_PANIC)', 37: 'unrecoverable Ring 0 trap (NEXUS_RING0_TRAP)'}
+FAILURE_EXITS = {35: 'guest kernel panic (NEXUS_PANIC)', 37: 'unrecoverable Ring 0 trap (NEXUS_RING0_TRAP)', 39: 'NT bugcheck (NEXUS_BUGCHECK)'}
 
 
 def validate(returncode, serial):
@@ -40,8 +40,11 @@ def validate(returncode, serial):
         raise RuntimeError('Relocation-bearing NT driver was not rebased and verified in guest Ring 0')
     if serial.count('NEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected') != 1:
         raise RuntimeError('NT driver loader did not reject corrupted import/relocation tables in guest')
-    if not re.search(r'^NEXUS_DRIVER_WX:pages_verified=([1-9][0-9]+)\r?$', serial, re.M):
-        raise RuntimeError('Driver W^X was not verified by reading PTEs back in the guest')
+    wx = re.search(r'^NEXUS_DRIVER_WX:pages_verified=([1-9][0-9]*):expected=([1-9][0-9]*)\r?$', serial, re.M)
+    if not wx or wx.group(1) != wx.group(2):
+        raise RuntimeError('Driver W^X was not verified by reading back exactly every expected PTE in the guest')
+    if serial.count('NEXUS_NT_SEMANTICS:checks=14') != 1:
+        raise RuntimeError('NT semantics self-test did not pass all 14 checks in guest Ring 0')
     if serial.count('NEXUS_DRIVER_LIFECYCLE:drivers=3:heap_balanced=true:pool_balanced=true:devices_deleted=true') != 1:
         raise RuntimeError('Driver lifecycles did not balance heap/pool/devices in the guest')
     if 'NEXUS_STRESS:cycles=64:processes=128:yields=1024:' not in serial:

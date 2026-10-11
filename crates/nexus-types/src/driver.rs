@@ -15,7 +15,8 @@ pub type Kirql = u8;
 pub const PASSIVE_LEVEL: Kirql = 0;
 pub const APC_LEVEL: Kirql = 1;
 pub const DISPATCH_LEVEL: Kirql = 2;
-pub const HIGH_LEVEL: Kirql = 31;
+/// Highest IRQL on x64 (`wdm.h` defines `HIGH_LEVEL` as 15 on AMD64; 31 is the x86 value).
+pub const HIGH_LEVEL: Kirql = 15;
 
 /// Standard NT Status Codes
 pub const STATUS_SUCCESS: i32 = 0x0000_0000;
@@ -24,6 +25,8 @@ pub const STATUS_NOT_IMPLEMENTED: i32 = -1073741822; // 0xC0000002
 pub const STATUS_BUFFER_TOO_SMALL: i32 = -1073741789; // 0xC0000023
 pub const STATUS_INSUFFICIENT_RESOURCES: i32 = -1073741801; // 0xC0000017
 pub const STATUS_UNSUCCESSFUL: i32 = -1073741823; // 0xC0000001
+pub const STATUS_TIMEOUT: i32 = 0x0000_0102;
+pub const STATUS_POSSIBLE_DEADLOCK: i32 = 0xC000_0194_u32 as i32;
 
 /// Standard Windows NT Device Control Definition Macro (`CTL_CODE`).
 pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {

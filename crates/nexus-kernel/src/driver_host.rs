@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 use nexus_loader::driver::{
     stub_ke_get_current_irql, stub_ke_lower_irql, stub_ke_raise_irql, NtDriverHost,
-    HARDWARE_IRQL_GETTER, HARDWARE_IRQL_SETTER,
+    BUGCHECK_HANDLER, DIAGNOSTIC_SINK, HARDWARE_IRQL_GETTER, HARDWARE_IRQL_SETTER,
 };
 use nexus_types::driver::{
     IoStackLocation, Irp, ParametersDeviceIoControl, UnicodeString, DISPATCH_LEVEL,
@@ -31,6 +31,10 @@ const FIXTURE_PREFERRED_BASE: u64 = 0x1_4000_0000;
 pub struct DriverValidationReport {
     /// Driver image pages whose PTEs were read back and matched the section's W^X policy.
     pub wx_pages_verified: usize,
+    /// Pages the 3 fixtures must have, derived independently from their PE section tables.
+    pub wx_pages_expected: usize,
+    /// Checks passed by `nexus_loader::driver::nt_semantics_self_test` in Ring 0.
+    pub nt_semantics_checks: usize,
     /// Driver lifecycles (load -> DriverEntry -> unload -> drop) with balanced heap and pool.
     pub lifecycles_verified: usize,
 }
@@ -190,6 +194,57 @@ fn validate_loader_relocations_and_fail_closed(host: &NtDriverHost) -> usize {
     wx_pages
 }
 
+/// Number of image pages W^X must cover for a fixture, computed from the raw PE file
+/// (headers up to the first section, then every section's page span). Used to require an
+/// exact `wx_pages_verified` instead of a lower bound.
+fn expected_wx_pages(image: &[u8]) -> usize {
+    let pe = nexus_loader::PeImage::parse(image).expect("fixture must parse");
+    let header_end = pe
+        .sections
+        .first()
+        .map_or(4096, |s| s.virtual_address as usize);
+    let mut pages = header_end.div_ceil(4096);
+    for sec in &pe.sections {
+        let size = if sec.virtual_size != 0 {
+            sec.virtual_size
+        } else {
+            sec.size_of_raw_data
+        } as usize;
+        let start = sec.virtual_address as usize;
+        pages += (start + size).div_ceil(4096) - start / 4096;
+    }
+    pages
+}
+
+/// Bugcheck handler for the guest: report the stop code and stop. Under the QEMU
+/// hardening suite it exits with a dedicated failure status (39).
+fn kernel_bugcheck_handler(code: u32, params: [usize; 4]) {
+    crate::serial_println!(
+        "NEXUS_BUGCHECK: code={:#x} params={:#x} {:#x} {:#x} {:#x}",
+        code,
+        params[0],
+        params[1],
+        params[2],
+        params[3]
+    );
+    #[cfg(all(
+        feature = "hardening-tests",
+        any(target_os = "uefi", target_os = "none")
+    ))]
+    crate::hardening::exit_failure(crate::hardening::EXIT_CODE_NT_BUGCHECK);
+    #[cfg(not(all(
+        feature = "hardening-tests",
+        any(target_os = "uefi", target_os = "none")
+    )))]
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+fn serial_diagnostic(line: &str) {
+    crate::serial_println!("{}", line);
+}
+
 fn hardware_cr8_getter() -> u8 {
     crate::arch::x86_64::read_cr8_irql()
 }
@@ -212,8 +267,31 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
     HARDWARE_IRQL_SETTER.store(hardware_cr8_setter as *mut (), Ordering::Release);
     crate::serial_println!("[+] Hardware CR8 / TPR IRQL hooks installed into NT Driver Host");
 
+    BUGCHECK_HANDLER.store(kernel_bugcheck_handler as *mut (), Ordering::Release);
+    DIAGNOSTIC_SINK.store(serial_diagnostic as *mut (), Ordering::Release);
+
     let host = NtDriverHost::new();
-    let mut report = DriverValidationReport::default();
+    let mut report = DriverValidationReport {
+        wx_pages_expected: [RELOC_DRIVER_BYTES, REAL_DRIVER_BYTES, STANDARD_WDM_BYTES]
+            .iter()
+            .map(|image| expected_wx_pages(image))
+            .sum(),
+        ..Default::default()
+    };
+
+    // Minimal NT semantics (IRQL direction, events/waits, pool tags, device extensions and
+    // deletion, pool registry exhaustion), before any driver is loaded. The self-test
+    // swaps in a recording bugcheck handler and restores kernel_bugcheck_handler after.
+    // The kernel heap must return exactly to its baseline: the invalid IoDeleteDevice
+    // checks (double delete, foreign pointer) must not free anything.
+    let heap_before_semantics = heap_used_bytes();
+    report.nt_semantics_checks = nexus_loader::driver::nt_semantics_self_test()
+        .unwrap_or_else(|failed| panic!("NT semantics self-test failed: {failed}"));
+    expect_heap_balanced(heap_before_semantics, "nt_semantics_self_test");
+    assert_eq!(
+        BUGCHECK_HANDLER.load(Ordering::SeqCst),
+        kernel_bugcheck_handler as *mut ()
+    );
     let heap_before_reloc = heap_used_bytes();
     report.wx_pages_verified += validate_loader_relocations_and_fail_closed(&host);
     expect_heap_balanced(heap_before_reloc, "reloc_driver.sys");
