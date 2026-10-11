@@ -58,7 +58,20 @@ pub const POOL_TYPE_NON_PAGED_NX: u32 = 512;
 /// NT Spinlock Type (`KSPIN_LOCK`).
 pub type KSpinLock = usize;
 
+/// `DEVICE_OBJECT.Flags`: `DO_EXCLUSIVE`.
+pub const DO_EXCLUSIVE: u32 = 0x0000_0008;
+/// `DEVICE_OBJECT.Flags`: `DO_BUFFERED_IO`.
+pub const DO_BUFFERED_IO: u32 = 0x0000_0004;
+/// `DEVICE_OBJECT.Flags`: `DO_DEVICE_INITIALIZING` (set by `IoCreateDevice`).
+pub const DO_DEVICE_INITIALIZING: u32 = 0x0000_0080;
+
 /// NT Event Synchronization Object (`KEVENT`).
+///
+/// x64 layout matches the WDK `KEVENT` / `DISPATCHER_HEADER`: the header
+/// bytes (`Type`, `Signalling`, `Size`, `Reserved1`) and `SignalState` come
+/// first, followed by `WaitListHead` as a `LIST_ENTRY` (`Flink` at 0x08,
+/// `Blink` at 0x10). Verified against the official headers by
+/// `scripts/wdk-abi.py`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KEvent {
@@ -67,8 +80,8 @@ pub struct KEvent {
     pub header_size: u8,
     pub header_reserved: u8,
     pub signal_state: i32,
-    pub wait_list_blink: *mut c_void,
     pub wait_list_flink: *mut c_void,
+    pub wait_list_blink: *mut c_void,
 }
 
 impl Default for KEvent {
@@ -76,11 +89,12 @@ impl Default for KEvent {
         Self {
             header_type: 0,
             header_signaled: 0,
-            header_size: core::mem::size_of::<Self>() as u8,
+            // DISPATCHER_HEADER.Size is in LONG (4-byte) units.
+            header_size: (core::mem::size_of::<Self>() / 4) as u8,
             header_reserved: 0,
             signal_state: 0,
-            wait_list_blink: core::ptr::null_mut(),
             wait_list_flink: core::ptr::null_mut(),
+            wait_list_blink: core::ptr::null_mut(),
         }
     }
 }
@@ -240,7 +254,13 @@ impl Default for DriverObject {
 }
 
 /// Windows NT Kernel Device Object (`DEVICE_OBJECT`).
-#[repr(C)]
+///
+/// Full x64 WDK layout (`sizeof == 0x150`, 16-byte aligned via
+/// `DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT)`). Members Nexus does not
+/// implement yet (`Queue`, `DeviceQueue`, `Dpc`, ...) are kept as opaque,
+/// zero-initialised byte blocks of the official size so that every offset a
+/// driver can touch is the real one.
+#[repr(C, align(16))]
 #[derive(Debug)]
 pub struct DeviceObject {
     pub type_: i16,
@@ -250,12 +270,31 @@ pub struct DeviceObject {
     pub next_device: *mut DeviceObject,
     pub attached_device: *mut DeviceObject,
     pub current_irp: *mut Irp,
+    pub timer: *mut c_void,
     pub flags: u32,
     pub characteristics: u32,
+    pub vpb: *mut c_void,
     pub device_extension: *mut c_void,
     pub device_type: u32,
     pub stack_size: i8,
-    pub _padding: [u8; 7],
+    pub _pad_stack_size: [u8; 3],
+    /// `union { LIST_ENTRY ListEntry; WAIT_CONTEXT_BLOCK Wcb; } Queue`.
+    pub queue: [u8; 0x48],
+    pub alignment_requirement: u32,
+    pub _pad_alignment: u32,
+    /// `KDEVICE_QUEUE DeviceQueue`.
+    pub device_queue: [u8; 0x28],
+    /// `KDPC Dpc`.
+    pub dpc: [u8; 0x40],
+    pub active_thread_count: u32,
+    pub _pad_active_threads: u32,
+    pub security_descriptor: *mut c_void,
+    pub device_lock: KEvent,
+    pub sector_size: u16,
+    pub spare1: u16,
+    pub _pad_sector: u32,
+    pub device_object_extension: *mut c_void,
+    pub reserved: *mut c_void,
 }
 
 impl Default for DeviceObject {
@@ -268,12 +307,28 @@ impl Default for DeviceObject {
             next_device: core::ptr::null_mut(),
             attached_device: core::ptr::null_mut(),
             current_irp: core::ptr::null_mut(),
+            timer: core::ptr::null_mut(),
             flags: 0,
             characteristics: 0,
+            vpb: core::ptr::null_mut(),
             device_extension: core::ptr::null_mut(),
             device_type: 0,
             stack_size: 1,
-            _padding: [0; 7],
+            _pad_stack_size: [0; 3],
+            queue: [0; 0x48],
+            alignment_requirement: 0,
+            _pad_alignment: 0,
+            device_queue: [0; 0x28],
+            dpc: [0; 0x40],
+            active_thread_count: 0,
+            _pad_active_threads: 0,
+            security_descriptor: core::ptr::null_mut(),
+            device_lock: KEvent::default(),
+            sector_size: 0,
+            spare1: 0,
+            _pad_sector: 0,
+            device_object_extension: core::ptr::null_mut(),
+            reserved: core::ptr::null_mut(),
         }
     }
 }
@@ -287,30 +342,64 @@ pub struct IoStatusBlock {
     pub information: usize,
 }
 
-/// Parameters union in Windows NT I/O Stack Location.
+/// `IO_STACK_LOCATION.Parameters.DeviceIoControl` (x64).
+///
+/// Every `ULONG` in the WDK parameter structs is `POINTER_ALIGNMENT`, so each
+/// occupies a full 8-byte slot. The first slot doubles as
+/// `Parameters.Read.Length` / `Parameters.Write.Length` (offset 0x08 of the
+/// stack location), exactly as in the official union.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ParametersDeviceIoControl {
     pub output_buffer_length: u32,
+    pub _pad0: u32,
     pub input_buffer_length: u32,
+    pub _pad1: u32,
     pub io_control_code: u32,
-    pub _padding: u32,
+    pub _pad2: u32,
     pub type3_input_buffer: *mut c_void,
+}
+
+impl ParametersDeviceIoControl {
+    /// `Parameters.DeviceIoControl` for an IOCTL.
+    pub fn ioctl(io_control_code: u32, input_len: u32, output_len: u32) -> Self {
+        Self {
+            output_buffer_length: output_len,
+            input_buffer_length: input_len,
+            io_control_code,
+            ..Self::default()
+        }
+    }
+
+    /// `Parameters.Read` / `Parameters.Write`: `Length` lives in the first slot.
+    pub fn transfer(length: u32) -> Self {
+        Self {
+            output_buffer_length: length,
+            ..Self::default()
+        }
+    }
+
+    /// `Parameters.Read.Length` / `Parameters.Write.Length`.
+    pub fn length(&self) -> u32 {
+        self.output_buffer_length
+    }
 }
 
 impl Default for ParametersDeviceIoControl {
     fn default() -> Self {
         Self {
             output_buffer_length: 0,
+            _pad0: 0,
             input_buffer_length: 0,
+            _pad1: 0,
             io_control_code: 0,
-            _padding: 0,
+            _pad2: 0,
             type3_input_buffer: core::ptr::null_mut(),
         }
     }
 }
 
-/// Windows NT I/O Stack Location (`IO_STACK_LOCATION`).
+/// Windows NT I/O Stack Location (`IO_STACK_LOCATION`), x64 size 0x48.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct IoStackLocation {
@@ -343,8 +432,14 @@ impl Default for IoStackLocation {
     }
 }
 
-/// Windows NT I/O Request Packet (`IRP`).
-#[repr(C)]
+/// Windows NT I/O Request Packet (`IRP`), full x64 WDK layout
+/// (`sizeof == 0xD0`, 16-byte aligned).
+///
+/// `associated_irp` is the `AssociatedIrp` union (`SystemBuffer` for
+/// `METHOD_BUFFERED` / `DO_BUFFERED_IO`). `current_stack_location` is
+/// `Tail.Overlay.CurrentStackLocation` (0xB8), which the WDK inline
+/// `IoGetCurrentIrpStackLocation` reads directly.
+#[repr(C, align(16))]
 #[derive(Debug)]
 pub struct Irp {
     pub type_: i16,
@@ -354,14 +449,31 @@ pub struct Irp {
     pub flags: u32,
     pub _padding1: u32,
     pub associated_irp: *mut c_void,
+    pub thread_list_entry: [*mut c_void; 2],
     pub io_status: IoStatusBlock,
     pub requestor_mode: i8,
     pub pending_returned: u8,
     pub stack_count: i8,
     pub current_location: i8,
-    pub _padding2: u32,
+    pub cancel: u8,
+    pub cancel_irql: u8,
+    pub apc_environment: i8,
+    pub allocation_flags: u8,
+    pub user_iosb: *mut IoStatusBlock,
+    pub user_event: *mut KEvent,
+    /// `Overlay` union (`AsynchronousParameters` / `AllocationSize`).
+    pub overlay: [usize; 2],
+    pub cancel_routine: *mut c_void,
     pub user_buffer: *mut c_void,
+    /// `Tail.Overlay.DriverContext[4]` (aliases `DeviceQueueEntry`).
+    pub driver_context: [*mut c_void; 4],
+    pub thread: *mut c_void,
+    pub auxiliary_buffer: *mut c_void,
+    pub list_entry: [*mut c_void; 2],
     pub current_stack_location: *mut IoStackLocation,
+    pub original_file_object: *mut c_void,
+    /// Remainder of the `Tail` union (sized by `KAPC Apc`, 0x58 bytes).
+    pub _tail_pad: [u8; 8],
 }
 
 impl Default for Irp {
@@ -374,17 +486,64 @@ impl Default for Irp {
             flags: 0,
             _padding1: 0,
             associated_irp: core::ptr::null_mut(),
+            thread_list_entry: [core::ptr::null_mut(); 2],
             io_status: IoStatusBlock::default(),
             requestor_mode: 0,
             pending_returned: 0,
             stack_count: 1,
             current_location: 1,
-            _padding2: 0,
+            cancel: 0,
+            cancel_irql: 0,
+            apc_environment: 0,
+            allocation_flags: 0,
+            user_iosb: core::ptr::null_mut(),
+            user_event: core::ptr::null_mut(),
+            overlay: [0; 2],
+            cancel_routine: core::ptr::null_mut(),
             user_buffer: core::ptr::null_mut(),
+            driver_context: [core::ptr::null_mut(); 4],
+            thread: core::ptr::null_mut(),
+            auxiliary_buffer: core::ptr::null_mut(),
+            list_entry: [core::ptr::null_mut(); 2],
             current_stack_location: core::ptr::null_mut(),
+            original_file_object: core::ptr::null_mut(),
+            _tail_pad: [0; 8],
         }
     }
 }
+
+// Compile-time pins of the x64 WDK layout (values from the official
+// headers, see docs/14). `scripts/wdk-abi.py --enforce` is the authoritative
+// check; these asserts make a drift fail the build on every target.
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    use core::mem::{offset_of, size_of};
+    assert!(size_of::<KEvent>() == 0x18);
+    assert!(offset_of!(KEvent, signal_state) == 0x04);
+    assert!(offset_of!(KEvent, wait_list_flink) == 0x08);
+    assert!(offset_of!(KEvent, wait_list_blink) == 0x10);
+    assert!(size_of::<DeviceObject>() == 0x150);
+    assert!(offset_of!(DeviceObject, timer) == 0x28);
+    assert!(offset_of!(DeviceObject, flags) == 0x30);
+    assert!(offset_of!(DeviceObject, vpb) == 0x38);
+    assert!(offset_of!(DeviceObject, device_extension) == 0x40);
+    assert!(offset_of!(DeviceObject, device_type) == 0x48);
+    assert!(offset_of!(DeviceObject, stack_size) == 0x4c);
+    assert!(offset_of!(DeviceObject, alignment_requirement) == 0x98);
+    assert!(offset_of!(DeviceObject, device_lock) == 0x118);
+    assert!(offset_of!(DeviceObject, device_object_extension) == 0x138);
+    assert!(size_of::<IoStackLocation>() == 0x48);
+    assert!(offset_of!(IoStackLocation, parameters) == 0x08);
+    assert!(offset_of!(IoStackLocation, device_object) == 0x28);
+    assert!(offset_of!(IoStackLocation, context) == 0x40);
+    assert!(size_of::<Irp>() == 0xd0);
+    assert!(offset_of!(Irp, associated_irp) == 0x18);
+    assert!(offset_of!(Irp, io_status) == 0x30);
+    assert!(offset_of!(Irp, cancel) == 0x44);
+    assert!(offset_of!(Irp, user_buffer) == 0x70);
+    assert!(offset_of!(Irp, current_stack_location) == 0xb8);
+    assert!(offset_of!(Irp, original_file_object) == 0xc0);
+};
 
 #[cfg(test)]
 mod tests {

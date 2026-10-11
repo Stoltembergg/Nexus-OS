@@ -10,7 +10,7 @@ spec.loader.exec_module(runner)
 
 class RunnerTests(unittest.TestCase):
     def serial(self):
-        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in sorted(runner.CHECKS | runner.DRIVER_CHECKS)) + '\nNEXUS_DRIVER_WX:pages_verified=20:expected=20\nNEXUS_NT_SEMANTICS:checks=14\nNEXUS_DRIVER_LIFECYCLE:drivers=3:heap_balanced=true:pool_balanced=true:devices_deleted=true' + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\nNEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0\nNEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n'
+        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in sorted(runner.CHECKS | runner.DRIVER_CHECKS)) + '\nNEXUS_DRIVER_WX:pages_verified=20:expected=20\nNEXUS_NT_SEMANTICS:checks=14\nNEXUS_DRIVER_WDK_MIN:entry=0x0:ioctl=0xedcba987:requests=1:flags_ok=true\nNEXUS_DRIVER_LIFECYCLE:drivers=4:heap_balanced=true:pool_balanced=true:devices_deleted=true' + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\nNEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0\nNEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n'
 
     def test_complete_protocol_requires_success_exit(self):
         runner.validate(33, self.serial())
@@ -40,7 +40,10 @@ class RunnerTests(unittest.TestCase):
             ('pages_verified=20:expected=20', 'pages_verified=19:expected=20'),
             ('NEXUS_CHECK:nt-semantics:PASS\n', ''),
             ('NEXUS_NT_SEMANTICS:checks=14', 'NEXUS_NT_SEMANTICS:checks=13'),
-            ('drivers=3:heap_balanced=true', 'drivers=2:heap_balanced=true'),
+            ('drivers=4:heap_balanced=true', 'drivers=3:heap_balanced=true'),
+            ('NEXUS_DRIVER_WDK_MIN:entry=0x0:ioctl=0xedcba987:requests=1:flags_ok=true\n', ''),
+            ('ioctl=0xedcba987', 'ioctl=0x12345678'),
+            ('requests=1:flags_ok', 'requests=0:flags_ok'),
         ]:
             with self.assertRaises(RuntimeError):
                 runner.validate(33, self.serial().replace(old, new))

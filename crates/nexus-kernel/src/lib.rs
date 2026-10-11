@@ -183,14 +183,14 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     let report = driver_host::validate_nt_driver_subsystem();
 
     // Markers are derived from the evidence counters, not printed unconditionally (FP1).
-    // 3 drivers: reloc_driver, nexus_driver, standard_wdm.
+    // 4 drivers: reloc_driver, nexus_driver, standard_wdm, wdk_min.
     assert_eq!(
-        report.lifecycles_verified, 3,
+        report.lifecycles_verified, 4,
         "driver lifecycle evidence missing"
     );
     assert_eq!(
         report.wx_pages_verified, report.wx_pages_expected,
-        "driver PTE W^X evidence must cover exactly every page of the 3 fixtures"
+        "driver PTE W^X evidence must cover exactly every page of the 4 fixtures"
     );
     serial_println!("NEXUS_CHECK:driver-wx:PASS");
     serial_println!(

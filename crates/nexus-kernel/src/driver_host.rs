@@ -23,6 +23,10 @@ const STANDARD_WDM_BYTES: &[u8] =
 /// `DriverEntry` returns STATUS_SUCCESS only if every relocated pointer is correct.
 const RELOC_DRIVER_BYTES: &[u8] =
     include_bytes!("../../../tests/fixtures/nt_driver/reloc/reloc_driver.sys");
+/// Minimal driver written only against the official WDK headers (no Nexus names).
+const WDK_MIN_BYTES: &[u8] = include_bytes!("../../../tests/fixtures/nt_driver/wdk/wdk_min.sys");
+/// `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x900, METHOD_BUFFERED, FILE_ANY_ACCESS)` in wdk_min.c.
+const IOCTL_WDK_MIN_ECHO: u32 = 0x0022_2400;
 /// Preferred `ImageBase` of the fixtures; the host always maps elsewhere.
 const FIXTURE_PREFERRED_BASE: u64 = 0x1_4000_0000;
 
@@ -31,7 +35,7 @@ const FIXTURE_PREFERRED_BASE: u64 = 0x1_4000_0000;
 pub struct DriverValidationReport {
     /// Driver image pages whose PTEs were read back and matched the section's W^X policy.
     pub wx_pages_verified: usize,
-    /// Pages the 3 fixtures must have, derived independently from their PE section tables.
+    /// Pages the 4 fixtures must have, derived independently from their PE section tables.
     pub wx_pages_expected: usize,
     /// Checks passed by `nexus_loader::driver::nt_semantics_self_test` in Ring 0.
     pub nt_semantics_checks: usize,
@@ -194,6 +198,88 @@ fn validate_loader_relocations_and_fail_closed(host: &NtDriverHost) -> usize {
     wx_pages
 }
 
+/// Runs `wdk_min.sys`, a driver that uses nothing but the official WDK headers, in Ring 0.
+/// Everything it does goes through the real x64 layouts: it writes `DeviceObject->Flags`
+/// (0x30) and reads `DeviceExtension` (0x40), takes its spin lock through
+/// `KeAcquireSpinLockRaiseToDpc`, reads `IoGetCurrentIrpStackLocation` (IRP 0xB8) and
+/// `AssociatedIrp.SystemBuffer` (IRP 0x18), and completes through `IofCompleteRequest`.
+fn validate_wdk_min(host: &NtDriverHost, report: &mut DriverValidationReport) {
+    use nexus_types::driver::{DO_BUFFERED_IO, DO_DEVICE_INITIALIZING, IRP_MJ_CLOSE};
+    crate::serial_println!("[*] Loading wdk_min.sys (official WDK headers only)...");
+    let mut driver = host
+        .load_driver(WDK_MIN_BYTES, "\\Driver\\NexusWdkMin", "\\Registry\\Test")
+        .expect("wdk_min.sys must load");
+    report.wx_pages_verified += protect_driver_pages(&driver);
+    let (reg, _reg_backing) = UnicodeString::from_str_vec("\\Registry\\Test");
+    assert_eq!(
+        unsafe { driver.init(&reg) },
+        0,
+        "wdk_min DriverEntry failed"
+    );
+    let dev = driver.driver_object.device_object;
+    assert!(!dev.is_null(), "wdk_min created no device");
+    let (flags, ext) = unsafe { ((*dev).flags, (*dev).device_extension) };
+    assert!(!ext.is_null(), "wdk_min device has no extension");
+    assert_eq!(
+        flags & (DO_BUFFERED_IO | DO_DEVICE_INITIALIZING),
+        DO_BUFFERED_IO,
+        "wdk_min must set DO_BUFFERED_IO and clear DO_DEVICE_INITIALIZING at the WDK offset"
+    );
+    for major in [IRP_MJ_CREATE, IRP_MJ_CLOSE] {
+        let mut stack = IoStackLocation {
+            major_function: major as u8,
+            device_object: dev,
+            ..Default::default()
+        };
+        let mut irp = Irp {
+            current_stack_location: &mut stack,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { driver.dispatch(major, dev, &mut irp) }, 0);
+    }
+    let mut value: u32 = 0x1234_5678;
+    let mut stack = IoStackLocation {
+        major_function: IRP_MJ_DEVICE_CONTROL as u8,
+        device_object: dev,
+        parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDK_MIN_ECHO, 4, 4),
+        ..Default::default()
+    };
+    let mut irp = Irp {
+        associated_irp: &mut value as *mut u32 as *mut c_void,
+        current_stack_location: &mut stack,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev, &mut irp) },
+        0
+    );
+    assert_eq!(irp.io_status.information, 4);
+    assert_eq!(
+        value, !0x1234_5678u32,
+        "wdk_min IOCTL must invert the SystemBuffer"
+    );
+    // WDK_MIN_EXTENSION { KSPIN_LOCK Lock; ULONG Requests; }
+    let (lock, requests) = unsafe {
+        (
+            *(ext as *const usize),
+            *((ext as *const u8).add(8) as *const u32),
+        )
+    };
+    assert_eq!(
+        (lock, requests),
+        (0, 1),
+        "spin lock released and one request counted"
+    );
+    assert_eq!(crate::arch::x86_64::read_cr8_irql(), PASSIVE_LEVEL);
+    unsafe { driver.unload() }.expect("wdk_min unload must delete its device and balance pool");
+    release_driver_pages(&driver);
+    crate::serial_println!(
+        "NEXUS_DRIVER_WDK_MIN:entry=0x0:ioctl={:#010x}:requests={}:flags_ok=true",
+        value,
+        requests
+    );
+}
+
 /// Number of image pages W^X must cover for a fixture, computed from the raw PE file
 /// (headers up to the first section, then every section's page span). Used to require an
 /// exact `wx_pages_verified` instead of a lower bound.
@@ -272,10 +358,15 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
 
     let host = NtDriverHost::new();
     let mut report = DriverValidationReport {
-        wx_pages_expected: [RELOC_DRIVER_BYTES, REAL_DRIVER_BYTES, STANDARD_WDM_BYTES]
-            .iter()
-            .map(|image| expected_wx_pages(image))
-            .sum(),
+        wx_pages_expected: [
+            RELOC_DRIVER_BYTES,
+            REAL_DRIVER_BYTES,
+            STANDARD_WDM_BYTES,
+            WDK_MIN_BYTES,
+        ]
+        .iter()
+        .map(|image| expected_wx_pages(image))
+        .sum(),
         ..Default::default()
     };
 
@@ -300,9 +391,9 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
     let heap_before_nexus = heap_used_bytes();
     {
         // =========================================================================
-        // Part 1: MSVC-Compiled Driver Validation (nexus_driver.sys)
+        // Part 1: nexus_driver.sys (official WDK headers + official ntoskrnl.lib)
         // =========================================================================
-        crate::serial_println!("[*] Loading MSVC-compiled WDM Driver (nexus_driver.sys)...");
+        crate::serial_println!("[*] Loading WDK-built WDM driver (nexus_driver.sys)...");
         let mut driver = host
             .load_driver(
                 REAL_DRIVER_BYTES,
@@ -353,18 +444,12 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
         let mut ver_output: u32 = 0;
         let mut stack_ver = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_NEXUS_GET_VERSION,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_NEXUS_GET_VERSION, 0, 4),
             ..Default::default()
         };
 
         let mut ioctl_irp_ver = Irp {
-            user_buffer: &mut ver_output as *mut u32 as *mut c_void,
+            associated_irp: &mut ver_output as *mut u32 as *mut c_void,
             current_stack_location: &mut stack_ver,
             ..Default::default()
         };
@@ -385,18 +470,12 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
         let mut irql_test_result: u32 = 0;
         let mut stack_irql = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_NEXUS_RAISE_IRQL_TEST,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_NEXUS_RAISE_IRQL_TEST, 0, 4),
             ..Default::default()
         };
 
         let mut ioctl_irp_irql = Irp {
-            user_buffer: &mut irql_test_result as *mut u32 as *mut c_void,
+            associated_irp: &mut irql_test_result as *mut u32 as *mut c_void,
             current_stack_location: &mut stack_irql,
             ..Default::default()
         };
@@ -413,10 +492,17 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
         irql_test_result
     );
 
-        // 6. Dispatch IRP_MJ_READ
+        // 6. Dispatch IRP_MJ_READ (buffered: SystemBuffer + Parameters.Read.Length)
         let mut read_buf = [0u8; 32];
+        let mut read_stack = IoStackLocation {
+            major_function: IRP_MJ_READ as u8,
+            device_object: dev_ptr,
+            parameters: ParametersDeviceIoControl::transfer(32),
+            ..Default::default()
+        };
         let mut read_irp = Irp {
-            user_buffer: read_buf.as_mut_ptr() as *mut c_void,
+            associated_irp: read_buf.as_mut_ptr() as *mut c_void,
+            current_stack_location: &mut read_stack,
             ..Default::default()
         };
 
@@ -478,17 +564,11 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
         let mut pool_result: u32 = 0;
         let mut stack_mem = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_WDM_SAMPLE_MEM_TEST,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDM_SAMPLE_MEM_TEST, 0, 4),
             ..Default::default()
         };
         let mut ioctl_irp_mem = Irp {
-            user_buffer: &mut pool_result as *mut u32 as *mut c_void,
+            associated_irp: &mut pool_result as *mut u32 as *mut c_void,
             current_stack_location: &mut stack_mem,
             ..Default::default()
         };
@@ -508,17 +588,11 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
         let mut spinlock_counter: u32 = 0;
         let mut stack_spin = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_WDM_SAMPLE_SPINLOCK_IRQL,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDM_SAMPLE_SPINLOCK_IRQL, 0, 4),
             ..Default::default()
         };
         let mut ioctl_irp_spin = Irp {
-            user_buffer: &mut spinlock_counter as *mut u32 as *mut c_void,
+            associated_irp: &mut spinlock_counter as *mut u32 as *mut c_void,
             current_stack_location: &mut stack_spin,
             ..Default::default()
         };
@@ -540,17 +614,11 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
         let mut event_res: u32 = 0;
         let mut stack_evt = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 4,
-                input_buffer_length: 0,
-                io_control_code: IOCTL_WDM_SAMPLE_EVENT_TEST,
-                _padding: 0,
-                type3_input_buffer: core::ptr::null_mut(),
-            },
+            parameters: ParametersDeviceIoControl::ioctl(IOCTL_WDM_SAMPLE_EVENT_TEST, 0, 4),
             ..Default::default()
         };
         let mut ioctl_irp_evt = Irp {
-            user_buffer: &mut event_res as *mut u32 as *mut c_void,
+            associated_irp: &mut event_res as *mut u32 as *mut c_void,
             current_stack_location: &mut stack_evt,
             ..Default::default()
         };
@@ -571,14 +639,11 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
         let mut std_read_stack = IoStackLocation {
             major_function: IRP_MJ_READ as u8,
             device_object: std_dev_ptr,
-            parameters: ParametersDeviceIoControl {
-                output_buffer_length: 32,
-                ..Default::default()
-            },
+            parameters: ParametersDeviceIoControl::transfer(32),
             ..Default::default()
         };
         let mut std_read_irp = Irp {
-            user_buffer: std_read_buf.as_mut_ptr() as *mut c_void,
+            associated_irp: std_read_buf.as_mut_ptr() as *mut c_void,
             current_stack_location: &mut std_read_stack,
             ..Default::default()
         };
@@ -603,6 +668,11 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
     );
     }
     expect_heap_balanced(heap_before_std, "standard_wdm.sys");
+    report.lifecycles_verified += 1;
+
+    let heap_before_wdk_min = heap_used_bytes();
+    validate_wdk_min(&host, &mut report);
+    expect_heap_balanced(heap_before_wdk_min, "wdk_min.sys");
     report.lifecycles_verified += 1;
 
     // =========================================================================
