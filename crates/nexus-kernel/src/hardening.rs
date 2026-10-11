@@ -539,6 +539,28 @@ pub fn run() {
     stress();
     serial_println!("NEXUS_HARDENING_PASS:checks=8");
 }
+/// `isa-debug-exit` value written on a kernel panic (QEMU exit status 35).
+pub const EXIT_CODE_PANIC: u32 = 0x11;
+/// `isa-debug-exit` value written on an unrecoverable Ring 0 trap (QEMU exit status 37).
+pub const EXIT_CODE_RING0_TRAP: u32 = 0x12;
+
+/// Terminates QEMU with a failure status so the runner fails immediately instead of
+/// waiting for its timeout (audit finding M8). Any value other than 0x10 is a failure.
+pub fn exit_failure(code: u32) -> ! {
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") 0xf4u16, in("eax") code, options(nomem, nostack));
+        core::arch::asm!("cli; 2: hlt; jmp 2b", options(noreturn));
+    }
+}
+
+/// Reports any panic on the serial port and exits QEMU with [`EXIT_CODE_PANIC`].
+pub fn install_panic_exit_hook() {
+    std::panic::set_hook(std::boxed::Box::new(|info| {
+        serial_println!("NEXUS_PANIC: {}", info);
+        exit_failure(EXIT_CODE_PANIC);
+    }));
+}
+
 /// Called only after the original Phase 3 flow also verified its real outcomes.
 pub fn exit_success() -> ! {
     unsafe {

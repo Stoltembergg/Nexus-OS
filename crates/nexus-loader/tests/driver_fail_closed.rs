@@ -86,6 +86,8 @@ fn reloc_fixture_really_has_dir64_relocations() {
 
 #[test]
 fn relocations_are_applied_and_verified_by_driver_entry() {
+    // DriverEntry calls KeGetCurrentIrql: serialize with other users of the host's global state.
+    let _host_state = nexus_loader::driver::lock_nt_host_state_for_tests();
     let mut driver = load(RELOC_DRIVER).unwrap();
     assert_ne!(
         driver.image_base, PREFERRED_BASE,
@@ -113,6 +115,8 @@ fn relocations_are_applied_and_verified_by_driver_entry() {
 
 #[test]
 fn missing_relocations_are_detected_by_the_driver_itself() {
+    // DriverEntry calls KeGetCurrentIrql: serialize with other users of the host's global state.
+    let _host_state = nexus_loader::driver::lock_nt_host_state_for_tests();
     // Controle negativo do teste acima: sem diretório de relocações (e sem a flag
     // RELOCS_STRIPPED) o loader não tem o que aplicar, e o DriverEntry PRECISA
     // detectar o ponteiro não corrigido. Prova que o teste positivo pode falhar.

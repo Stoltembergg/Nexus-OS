@@ -10,7 +10,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use byteorder::{ByteOrder, LittleEndian};
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use nexus_types::driver::{
     DeviceObject, DriverEntryFn, DriverObject, DriverSectionMapping, Irp, KEvent, Kirql,
     UnicodeString, DISPATCH_LEVEL, IMAGE_SUBSYSTEM_NATIVE, IRP_MJ_MAXIMUM_FUNCTION, PASSIVE_LEVEL,
@@ -32,14 +32,80 @@ pub static HARDWARE_IRQL_GETTER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_
 /// Hardware IRQL setter callback hook (e.g. writing CR8 / TPR on bare metal).
 pub static HARDWARE_IRQL_SETTER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Pool header magic token: "NEXUSPOL" (0x4E455855_53504F4C).
-const POOL_HEADER_MAGIC: u64 = 0x4E455855_53504F4C;
+/// Serializes host tests that touch the NT host's process-global state.
+#[cfg(not(any(target_os = "uefi", target_os = "none")))]
+static NT_HOST_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[repr(C, align(16))]
-struct PoolHeader {
-    magic: u64,
-    size: u32,
-    tag: u32,
+/// Test support (host builds only): takes exclusive ownership of the NT host's
+/// process-global state (software IRQL, hardware IRQL hooks, pool registry) and resets
+/// IRQL to `PASSIVE_LEVEL` with no hardware hooks installed.
+///
+/// `cargo test` runs tests in parallel threads; without this, one test lowering the
+/// global IRQL while another holds a spin lock made `standard_wdm`'s spin-lock IOCTL
+/// observe the wrong IRQL (audit finding B2, `counter 100 != 101`).
+#[doc(hidden)]
+#[cfg(not(any(target_os = "uefi", target_os = "none")))]
+pub fn lock_nt_host_state_for_tests() -> std::sync::MutexGuard<'static, ()> {
+    let guard = NT_HOST_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    HARDWARE_IRQL_GETTER.store(core::ptr::null_mut(), Ordering::SeqCst);
+    HARDWARE_IRQL_SETTER.store(core::ptr::null_mut(), Ordering::SeqCst);
+    CURRENT_IRQL.store(PASSIVE_LEVEL, Ordering::SeqCst);
+    guard
+}
+
+/// Maximum number of simultaneously live pool allocations tracked by the host.
+pub const POOL_TRACKER_CAPACITY: usize = 256;
+
+/// One live pool block: (address, size in bytes, tag). Address 0 marks a free slot.
+type PoolSlot = (usize, usize, u32);
+
+/// Fixed-capacity registry of live pool blocks.
+///
+/// Frees are validated against this registry instead of reading a header in front of the
+/// pointer, so a double free or a foreign pointer is detected without touching freed memory.
+/// The registry never allocates, so it does not perturb kernel heap accounting.
+struct PoolTracker {
+    lock: AtomicBool,
+    slots: core::cell::UnsafeCell<[PoolSlot; POOL_TRACKER_CAPACITY]>,
+}
+
+// SAFETY: every access to `slots` happens while `lock` is held.
+unsafe impl Sync for PoolTracker {}
+
+impl PoolTracker {
+    fn with<R>(&self, f: impl FnOnce(&mut [PoolSlot; POOL_TRACKER_CAPACITY]) -> R) -> R {
+        while self
+            .lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        // SAFETY: the spin lock above grants exclusive access.
+        let result = f(unsafe { &mut *self.slots.get() });
+        self.lock.store(false, Ordering::Release);
+        result
+    }
+}
+
+static POOL_TRACKER: PoolTracker = PoolTracker {
+    lock: AtomicBool::new(false),
+    slots: core::cell::UnsafeCell::new([(0, 0, 0); POOL_TRACKER_CAPACITY]),
+};
+
+/// Count of rejected pool frees (double free, unknown pointer, tag mismatch).
+static POOL_VIOLATIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of pool blocks currently allocated through `ExAllocatePoolWithTag`.
+pub fn live_pool_allocations() -> usize {
+    POOL_TRACKER.with(|slots| slots.iter().filter(|s| s.0 != 0).count())
+}
+
+/// Number of invalid pool frees observed since boot (monotonic).
+pub fn pool_violations() -> usize {
+    POOL_VIOLATIONS.load(Ordering::SeqCst)
 }
 
 /// Errors encountered while loading, binding, and executing an NT kernel driver.
@@ -64,6 +130,12 @@ pub enum NtDriverError {
     ImageOutOfBounds,
     /// A section requests simultaneous write and execute permission (W^X violation).
     WritableExecutableSection,
+    /// `DriverUnload` returned with device objects still attached to the driver.
+    DevicesLeaked,
+    /// `DriverUnload` returned with this many more live pool blocks than before `DriverEntry`.
+    PoolLeaked(usize),
+    /// The driver performed this many invalid pool frees during its lifetime.
+    PoolViolations(usize),
 }
 
 impl From<LoaderError> for NtDriverError {
@@ -514,6 +586,8 @@ pub struct LoadedDriver {
     pub relocations_applied: usize,
     /// UTF-16 backing storage for `driver_object.driver_name` (must outlive the driver object).
     _driver_name_backing: Vec<u16>,
+    /// Live pool blocks and pool violations recorded right before `DriverEntry`.
+    pool_baseline: (usize, usize),
 }
 
 impl LoadedDriver {
@@ -595,6 +669,7 @@ impl LoadedDriver {
     ///
     /// The entry point must point to valid native x86_64 code compiled for Ring 0.
     pub unsafe fn init(&mut self, registry_path: &UnicodeString) -> i32 {
+        self.pool_baseline = (live_pool_allocations(), pool_violations());
         let entry: DriverEntryFn = core::mem::transmute(self.entry_point);
         let status = entry(&mut self.driver_object, registry_path);
         if status != STATUS_SUCCESS {
@@ -636,14 +711,33 @@ impl LoadedDriver {
     /// # Safety
     ///
     /// Must be called at PASSIVE_LEVEL with no outstanding I/O requests.
+    ///
+    /// The host does not clean up after the driver: after `DriverUnload` returns, every
+    /// device object must have been deleted and every pool block allocated since
+    /// `DriverEntry` must have been freed, otherwise an error is returned. Pool accounting
+    /// is global, so this assumes one driver lifecycle at a time (true for the kernel
+    /// validation flow and enforced in host tests by serializing them).
     pub unsafe fn unload(&mut self) -> Result<(), NtDriverError> {
-        if let Some(unload_fn) = self.driver_object.driver_unload {
-            unload_fn(&mut self.driver_object);
-            self.driver_object.device_object = core::ptr::null_mut();
-            Ok(())
-        } else {
-            Err(NtDriverError::NoUnloadRoutine)
+        let unload_fn = self
+            .driver_object
+            .driver_unload
+            .ok_or(NtDriverError::NoUnloadRoutine)?;
+        unload_fn(&mut self.driver_object);
+        if !self.driver_object.device_object.is_null() {
+            return Err(NtDriverError::DevicesLeaked);
         }
+        let (live_before, violations_before) = self.pool_baseline;
+        let live = live_pool_allocations();
+        if live > live_before {
+            return Err(NtDriverError::PoolLeaked(live - live_before));
+        }
+        let violations = pool_violations();
+        if violations > violations_before {
+            return Err(NtDriverError::PoolViolations(
+                violations - violations_before,
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -823,6 +917,7 @@ impl NtDriverHost {
             sections: section_mappings,
             relocations_applied,
             _driver_name_backing: driver_name_backing,
+            pool_baseline: (0, 0),
         };
 
         // 6. Enforce W^X platform page protection (Code -> RX, Data -> RW/RO, Headers -> RO)
@@ -1013,7 +1108,8 @@ pub unsafe extern "win64" fn stub_io_complete_request(irp: *mut Irp, _priority_b
 ///
 /// # Safety
 ///
-/// Allocates non-paged aligned pool memory with safety tracking header.
+/// Allocates zeroed, 16-byte aligned memory and records it in the pool registry.
+/// Returns null when the size is invalid, memory is exhausted or the registry is full.
 pub unsafe extern "win64" fn stub_ex_allocate_pool_with_tag(
     _pool_type: u32,
     number_of_bytes: usize,
@@ -1022,8 +1118,7 @@ pub unsafe extern "win64" fn stub_ex_allocate_pool_with_tag(
     if number_of_bytes == 0 || number_of_bytes > 0x1000_0000 {
         return core::ptr::null_mut();
     }
-    let total_size = core::mem::size_of::<PoolHeader>() + number_of_bytes;
-    let layout = match alloc::alloc::Layout::from_size_align(total_size, 16) {
+    let layout = match alloc::alloc::Layout::from_size_align(number_of_bytes, 16) {
         Ok(l) => l,
         Err(_) => return core::ptr::null_mut(),
     };
@@ -1031,34 +1126,47 @@ pub unsafe extern "win64" fn stub_ex_allocate_pool_with_tag(
     if ptr.is_null() {
         return core::ptr::null_mut();
     }
-    let header = ptr as *mut PoolHeader;
-    (*header).magic = POOL_HEADER_MAGIC;
-    (*header).size = number_of_bytes as u32;
-    (*header).tag = tag;
-    ptr.add(core::mem::size_of::<PoolHeader>()) as *mut c_void
+    let recorded = POOL_TRACKER.with(|slots| {
+        slots.iter_mut().find(|s| s.0 == 0).map(|slot| {
+            *slot = (ptr as usize, number_of_bytes, tag);
+        })
+    });
+    if recorded.is_none() {
+        alloc::alloc::dealloc(ptr, layout);
+        return core::ptr::null_mut();
+    }
+    ptr as *mut c_void
 }
 
 /// WDM ExFreePoolWithTag export stub.
 ///
 /// # Safety
 ///
-/// Verifies pool header magic token and tag before deallocation.
+/// Frees only blocks present in the pool registry. Unknown pointers (including double
+/// frees) and tag mismatches are rejected without dereferencing `p` and counted in
+/// [`pool_violations`]; the block is then left allocated (so it also shows up as a leak).
 pub unsafe extern "win64" fn stub_ex_free_pool_with_tag(p: *mut c_void, tag: u32) {
     if p.is_null() {
         return;
     }
-    let ptr = (p as *mut u8).sub(core::mem::size_of::<PoolHeader>());
-    let header = ptr as *mut PoolHeader;
-    if (*header).magic != POOL_HEADER_MAGIC {
-        return; // Guard against corrupted or invalid pool pointer
-    }
-    if tag != 0 && (*header).tag != tag {
-        return; // Guard against mismatched pool tag
-    }
-    let total_size = core::mem::size_of::<PoolHeader>() + (*header).size as usize;
-    (*header).magic = 0; // Invalidate header to detect double-free
-    if let Ok(layout) = alloc::alloc::Layout::from_size_align(total_size, 16) {
-        alloc::alloc::dealloc(ptr, layout);
+    let removed = POOL_TRACKER.with(|slots| {
+        let slot = slots.iter_mut().find(|s| s.0 == p as usize)?;
+        if tag != 0 && slot.2 != tag {
+            return None;
+        }
+        let size = slot.1;
+        *slot = (0, 0, 0);
+        Some(size)
+    });
+    match removed {
+        Some(size) => {
+            if let Ok(layout) = alloc::alloc::Layout::from_size_align(size, 16) {
+                alloc::alloc::dealloc(p as *mut u8, layout);
+            }
+        }
+        None => {
+            POOL_VIOLATIONS.fetch_add(1, Ordering::SeqCst);
+        }
     }
 }
 
@@ -1262,6 +1370,7 @@ mod tests {
 
     #[test]
     fn test_driver_loader_validates_native_subsystem() {
+        let _host_state = lock_nt_host_state_for_tests();
         let host = NtDriverHost::new();
 
         // 1. Verify real native driver loads successfully
@@ -1285,10 +1394,11 @@ mod tests {
 
     #[test]
     fn test_real_nt_driver_execution_ring0_lifecycle() {
+        // Serialized and reset to PASSIVE_LEVEL (B2). On the host the IRQL stubs use the
+        // software fallback; the CR8 path is covered by test_irql_stubs_route_through_hardware_hooks
+        // and, for real, in the QEMU guest.
+        let _host_state = lock_nt_host_state_for_tests();
         let host = NtDriverHost::new();
-
-        // Reset IRQL state
-        CURRENT_IRQL.store(PASSIVE_LEVEL, Ordering::SeqCst);
 
         // 1. Load real MSVC-compiled WDM driver
         let mut driver = host
@@ -1443,18 +1553,23 @@ mod tests {
             "Read payload mismatch"
         );
 
-        // 9. Test safe driver unload
+        // 9. Test safe driver unload. unload() no longer clears device_object itself, so
+        // this only passes if the driver's own DriverUnload deleted its device (FP3/M3),
+        // and unload() fails if pool blocks leaked.
+        let pool_before = live_pool_allocations();
         unsafe {
             driver.unload().expect("DriverUnload must succeed");
         }
         assert!(
             driver.driver_object.device_object.is_null(),
-            "DeviceObject must be cleared after unload"
+            "DriverUnload must have deleted its DeviceObject"
         );
+        assert!(live_pool_allocations() <= pool_before);
     }
 
     #[test]
     fn test_standard_wdm_driver_execution_and_pools() {
+        let _host_state = lock_nt_host_state_for_tests();
         let host = NtDriverHost::new();
 
         // 1. Load authentic standard WDM driver
@@ -1554,7 +1669,9 @@ mod tests {
         assert_eq!(counter_val, 101, "SpinLock counter increment verified");
         assert_eq!(CURRENT_IRQL.load(Ordering::SeqCst), PASSIVE_LEVEL);
 
-        // 6. Test Event Synchronization IOCTL
+        // 6. Event IOCTL. NOTE (FP5): the driver signals the event and only then waits, so
+        // this exercises the KeSetEvent/KeWaitForSingleObject call path on a signaled
+        // event. It does NOT prove blocking or wake-up semantics (no waiters exist yet).
         let mut event_val: u32 = 0;
         let mut ioctl_irp_evt = Irp {
             user_buffer: &mut event_val as *mut u32 as *mut c_void,
@@ -1604,7 +1721,8 @@ mod tests {
             "Read payload mismatch"
         );
 
-        // 8. Test Safe Unload
+        // 8. Test Safe Unload: fails with DevicesLeaked/PoolLeaked if the driver did not
+        // release what it created (the host no longer hides it).
         unsafe {
             driver
                 .unload()
@@ -1615,6 +1733,7 @@ mod tests {
 
     #[test]
     fn test_wx_protection_and_section_isolation() {
+        let _host_state = lock_nt_host_state_for_tests();
         let host = NtDriverHost::new();
         let driver = host
             .load_driver(
@@ -1647,6 +1766,49 @@ mod tests {
         assert!(rx_count > 0, "Must have RX pages for code");
         assert!(rw_count > 0, "Must have RW pages for data");
         assert!(ro_count > 0, "Must have RO pages for headers/rdata");
+
+        // FP2: the callback above only checks the arguments it is given. The real proof is
+        // the OS page protection of the mapped image, read back below (Linux: /proc/self/maps,
+        // Windows: VirtualQuery). The guest's PTE-level check lives in nexus-kernel driver_host.
+        #[cfg(target_os = "linux")]
+        {
+            let maps = std::fs::read_to_string("/proc/self/maps").expect("read /proc/self/maps");
+            let perms_at = |va: u64| -> String {
+                for line in maps.lines() {
+                    let mut it = line.split_whitespace();
+                    let range = it.next().unwrap();
+                    let perms = it.next().unwrap();
+                    let (lo, hi) = range.split_once('-').unwrap();
+                    let lo = u64::from_str_radix(lo, 16).unwrap();
+                    let hi = u64::from_str_radix(hi, 16).unwrap();
+                    if (lo..hi).contains(&va) {
+                        return perms[..3].to_string();
+                    }
+                }
+                panic!("address {va:#x} not mapped");
+            };
+            assert_eq!(
+                perms_at(driver.image_base),
+                "r--",
+                "headers must be read-only"
+            );
+            let mut checked = 0;
+            for sec in &driver.sections {
+                let expected = match (sec.is_writable, sec.is_executable) {
+                    (false, true) => "r-x",
+                    (true, false) => "rw-",
+                    (false, false) => "r--",
+                    (true, true) => unreachable!("W+X sections are rejected at load"),
+                };
+                let start = driver.image_base + sec.rva as u64;
+                let end = start + (sec.size as u64).max(1);
+                for va in (start & !4095..end).step_by(4096) {
+                    assert_eq!(perms_at(va), expected, "section {:?}", sec.name);
+                    checked += 1;
+                }
+            }
+            assert!(checked >= 4, "must have verified every section page");
+        }
 
         // Verify with Windows OS memory query that .text is indeed PAGE_EXECUTE_READ (0x20)
         #[cfg(windows)]
@@ -1700,19 +1862,146 @@ mod tests {
 
     #[test]
     fn test_pool_tag_verification_and_double_free() {
+        let _host_state = lock_nt_host_state_for_tests();
+        let live0 = live_pool_allocations();
+        let violations0 = pool_violations();
         unsafe {
-            // 1. Allocate valid pool
             let ptr = stub_ex_allocate_pool_with_tag(0, 128, 0x41424344);
             assert!(!ptr.is_null(), "Allocation failed");
+            assert_eq!(ptr as usize % 16, 0, "pool blocks are 16-byte aligned");
+            assert_eq!(live_pool_allocations(), live0 + 1);
+            let bytes = core::slice::from_raw_parts(ptr as *const u8, 128);
+            assert!(bytes.iter().all(|&b| b == 0), "pool must be zeroed");
 
-            // 2. Mismatched tag free must be rejected without crash
+            // Mismatched tag: rejected, counted, block stays allocated.
             stub_ex_free_pool_with_tag(ptr, 0x99999999);
+            assert_eq!(pool_violations(), violations0 + 1);
+            assert_eq!(live_pool_allocations(), live0 + 1);
 
-            // 3. Free with matching tag must succeed
+            // Matching tag: freed.
             stub_ex_free_pool_with_tag(ptr, 0x41424344);
+            assert_eq!(live_pool_allocations(), live0);
+            assert_eq!(pool_violations(), violations0 + 1);
 
-            // 4. Double-free must be rejected safely
+            // Double free: rejected via the registry, without reading freed memory.
             stub_ex_free_pool_with_tag(ptr, 0x41424344);
+            assert_eq!(pool_violations(), violations0 + 2);
+            assert_eq!(live_pool_allocations(), live0);
+
+            // Pointer never returned by the pool.
+            let mut local = [0u8; 32];
+            stub_ex_free_pool(local.as_mut_ptr() as *mut c_void);
+            assert_eq!(pool_violations(), violations0 + 3);
+
+            // Invalid sizes fail instead of allocating.
+            assert!(stub_ex_allocate_pool_with_tag(0, 0, 1).is_null());
+            assert!(stub_ex_allocate_pool_with_tag(0, 0x1000_0001, 1).is_null());
+            assert_eq!(live_pool_allocations(), live0);
         }
+    }
+
+    unsafe extern "win64" fn unload_that_deletes_nothing(_driver: *mut DriverObject) {}
+
+    #[test]
+    fn test_unload_reports_leaked_devices_and_pool() {
+        // Negative controls for unload(): previously it nulled device_object itself, so
+        // these leaks were invisible (FP3/M3).
+        let _host_state = lock_nt_host_state_for_tests();
+        let host = NtDriverHost::new();
+        let (reg, _backing) = UnicodeString::from_str_vec("\\Registry\\Leak");
+
+        // 1. DriverUnload that forgets IoDeleteDevice -> DevicesLeaked.
+        let mut driver = host
+            .load_driver(REAL_DRIVER_BYTES, "\\Driver\\Leak", "\\Registry\\Leak")
+            .unwrap();
+        assert_eq!(unsafe { driver.init(&reg) }, STATUS_SUCCESS);
+        let real_unload = driver.driver_object.driver_unload;
+        driver.driver_object.driver_unload = Some(unload_that_deletes_nothing);
+        assert_eq!(
+            unsafe { driver.unload() },
+            Err(NtDriverError::DevicesLeaked)
+        );
+        // Clean up with the driver's real routine.
+        driver.driver_object.driver_unload = real_unload;
+        unsafe { driver.unload() }.expect("real DriverUnload cleans up");
+
+        // 2. Pool block allocated during the driver's lifetime and never freed -> PoolLeaked.
+        let mut driver = host
+            .load_driver(REAL_DRIVER_BYTES, "\\Driver\\Leak", "\\Registry\\Leak")
+            .unwrap();
+        assert_eq!(unsafe { driver.init(&reg) }, STATUS_SUCCESS);
+        let leaked = unsafe { stub_ex_allocate_pool_with_tag(0, 64, 0x4B41454C) };
+        assert!(!leaked.is_null());
+        assert_eq!(
+            unsafe { driver.unload() },
+            Err(NtDriverError::PoolLeaked(1))
+        );
+        unsafe { stub_ex_free_pool_with_tag(leaked, 0x4B41454C) };
+
+        // 3. Invalid free during the driver's lifetime -> PoolViolations.
+        let mut driver = host
+            .load_driver(REAL_DRIVER_BYTES, "\\Driver\\Leak", "\\Registry\\Leak")
+            .unwrap();
+        assert_eq!(unsafe { driver.init(&reg) }, STATUS_SUCCESS);
+        let mut not_pool = [0u8; 16];
+        unsafe { stub_ex_free_pool(not_pool.as_mut_ptr() as *mut c_void) };
+        assert_eq!(
+            unsafe { driver.unload() },
+            Err(NtDriverError::PoolViolations(1))
+        );
+    }
+
+    static FAKE_CR8: AtomicU8 = AtomicU8::new(0);
+    static FAKE_CR8_MAX: AtomicU8 = AtomicU8::new(0);
+    fn fake_cr8_get() -> u8 {
+        FAKE_CR8.load(Ordering::SeqCst)
+    }
+    unsafe fn fake_cr8_set(irql: u8) {
+        FAKE_CR8.store(irql, Ordering::SeqCst);
+        FAKE_CR8_MAX.fetch_max(irql, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_irql_stubs_route_through_hardware_hooks() {
+        // FP6: the other host tests only see the software CURRENT_IRQL. This proves that,
+        // once the kernel installs its CR8 hooks, the driver's KeRaiseIrql/KeLowerIrql and
+        // KeAcquire/ReleaseSpinLock reach the hook (in the guest the hook writes CR8).
+        // It does not prove interrupt masking: there are no interrupts yet (Phase 4).
+        let _host_state = lock_nt_host_state_for_tests();
+        FAKE_CR8.store(PASSIVE_LEVEL, Ordering::SeqCst);
+        FAKE_CR8_MAX.store(PASSIVE_LEVEL, Ordering::SeqCst);
+        HARDWARE_IRQL_GETTER.store(fake_cr8_get as *mut (), Ordering::SeqCst);
+        HARDWARE_IRQL_SETTER.store(fake_cr8_set as *mut (), Ordering::SeqCst);
+
+        let host = NtDriverHost::new();
+        let mut driver = host
+            .load_driver(STANDARD_WDM_BYTES, "\\Driver\\Cr8", "\\Registry\\Cr8")
+            .unwrap();
+        let (reg, _backing) = UnicodeString::from_str_vec("\\Registry\\Cr8");
+        assert_eq!(unsafe { driver.init(&reg) }, STATUS_SUCCESS);
+        let dev_ptr = driver.driver_object.device_object;
+        let mut counter_val: u32 = 0;
+        let mut stack = IoStackLocation {
+            major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev_ptr,
+            parameters: ParametersDeviceIoControl {
+                output_buffer_length: 4,
+                io_control_code: IOCTL_WDM_SAMPLE_SPINLOCK_IRQL,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut irp = Irp {
+            user_buffer: &mut counter_val as *mut u32 as *mut c_void,
+            current_stack_location: &mut stack,
+            ..Default::default()
+        };
+        let status = unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev_ptr, &mut irp) };
+        assert_eq!(status, STATUS_SUCCESS);
+        // 101 only if KeGetCurrentIrql (through the getter hook) saw DISPATCH_LEVEL.
+        assert_eq!(counter_val, 101);
+        assert_eq!(FAKE_CR8_MAX.load(Ordering::SeqCst), DISPATCH_LEVEL);
+        assert_eq!(FAKE_CR8.load(Ordering::SeqCst), PASSIVE_LEVEL);
+        unsafe { driver.unload() }.unwrap();
     }
 }

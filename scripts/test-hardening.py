@@ -13,13 +13,19 @@ from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECKS = {'msrs', 'permissions', 'context', 'faults', 'exit-and-boundary', 'rollback-oom', 'loader-bytes', 'stress'}
+# Emitted by the NT driver host after reading PTEs back / balancing heap, pool and devices.
+DRIVER_CHECKS = {'driver-wx', 'driver-lifecycle'}
+# isa-debug-exit failure codes written by the guest (status = (code << 1) | 1).
+FAILURE_EXITS = {35: 'guest kernel panic (NEXUS_PANIC)', 37: 'unrecoverable Ring 0 trap (NEXUS_RING0_TRAP)'}
 
 
 def validate(returncode, serial):
+    if returncode in FAILURE_EXITS:
+        raise RuntimeError(f'Guest reported failure: {FAILURE_EXITS[returncode]} (exit {returncode})')
     if returncode != 33:
         raise RuntimeError(f'Guest did not signal isa-debug-exit success (expected 33, got {returncode})')
     checks = [line.strip() for line in serial.splitlines() if line.startswith('NEXUS_CHECK:')]
-    expected = {f'NEXUS_CHECK:{name}:PASS' for name in CHECKS}
+    expected = {f'NEXUS_CHECK:{name}:PASS' for name in CHECKS | DRIVER_CHECKS}
     if set(checks) != expected or len(checks) != len(expected):
         raise RuntimeError(f'Missing/duplicate/unexpected guest checks: {checks}')
     if serial.count('NEXUS_HARDENING_PASS:checks=8') != 1:
@@ -34,6 +40,10 @@ def validate(returncode, serial):
         raise RuntimeError('Relocation-bearing NT driver was not rebased and verified in guest Ring 0')
     if serial.count('NEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected') != 1:
         raise RuntimeError('NT driver loader did not reject corrupted import/relocation tables in guest')
+    if not re.search(r'^NEXUS_DRIVER_WX:pages_verified=([1-9][0-9]+)\r?$', serial, re.M):
+        raise RuntimeError('Driver W^X was not verified by reading PTEs back in the guest')
+    if serial.count('NEXUS_DRIVER_LIFECYCLE:drivers=3:heap_balanced=true:pool_balanced=true:devices_deleted=true') != 1:
+        raise RuntimeError('Driver lifecycles did not balance heap/pool/devices in the guest')
     if 'NEXUS_STRESS:cycles=64:processes=128:yields=1024:' not in serial:
         raise RuntimeError('Missing measured stress results')
 
