@@ -1,5 +1,14 @@
 # Anti-Cheat Systems: Technical Analysis & Research Strategy
 
+## Status and evidence correction (2026-10-11)
+
+**Historical research document; not a verified internal specification of Vanguard.** References to exact ELAM behavior, server-side TPM quotes, PCR validation rules, PatchGuard inspection, callback lists, compatibility outcomes for individual third-party games, and vendor signature requirements may include hypotheses from public material. The proprietary Vanguard implementation and acceptance policy are not fully documented. The [updated Vanguard study](10-vanguard-feasibility-study.md) must also distinguish public facts from hypotheses; do not interpret a quoted procedure as demonstrated fact.
+
+The project-level acceptance gate remains **legitimate League of Legends and VALORANT on a physical Nexus installation with vendor-approved anti-cheat behavior**. Existing Phase 3.6 WDM driver execution is an experimental building block, **not** Vanguard compatibility, and success with one vendor's anti-cheat would not automatically establish others' acceptance. There must be no spoofing, fake attestation or evasion.
+
+Research into Riot support/approval should run in parallel with engineering; it must not be deferred until all GPU/UI work is complete. Relevant priorities and ongoing risks are tracked in the [roadmap](04-roadmap-and-phases.md).
+
+
 This document provides a comprehensive technical breakdown of modern kernel-level anti-cheat solutions (specifically **Riot Vanguard** used in *Valorant* and *League of Legends*, and **Easy Anti-Cheat / BattlEye**), analyzing their kernel interactions, cryptographic attestation mechanisms, and the realistic engineering hurdles for third-party operating systems.
 
 ---

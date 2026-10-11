@@ -1,5 +1,16 @@
 # Kernel Feasibility Study: Hybrid NT + Linux Architecture
 
+## 0. Current feasibility status (2026-10-11)
+
+This is an **early hypothesis and comparative feasibility study**, not an independent production-readiness conclusion. The [current roadmap](04-roadmap-and-phases.md) and [system architecture](03-system-architecture.md) supersede broad statements below such as “100% feasible,” “native GPU drivers” or guaranteed performance.
+
+- The selected architecture remains **one custom Nexus kernel with NT/Linux user-execution personalities**. No Linux kernel in parallel and no VM to run games/apps.
+- Phase 3 demonstrates a bounded freestanding PE/ELF QEMU test profile, not general Windows or Linux compatibility. Phase 3.6 demonstrates a single targeted WDM `.sys` guest Ring 0 fixture, not modern NT-driver parity.
+- Direct integration of Linux DRM/KMS and Mesa graphics is **not solved** on a non-Linux kernel; the cost and architecture are open research topics (see [graphics review](06-drm-kms-feasibility-revision.md)).
+- Exact Vanguard remote attestation implementation (including any PCR 7 allowlist) is **not established by public documentation**. Legitimate Riot acceptance cannot be inferred from a functioning WDM loader.
+- Sustainable physical installation requires block I/O, recovery, and **signed offline A/B updates** before desktop-focused dogfooding; see [Nexus Update](12-nexus-update-architecture.md).
+
+
 This study evaluates the technical, hardware, and security feasibility of constructing an operating system capable of running Windows (PE32+) and Linux (ELF64) binaries directly on bare-metal x86_64 UEFI hardware without virtual machines.
 
 ---
