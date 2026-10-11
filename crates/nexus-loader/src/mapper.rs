@@ -45,7 +45,8 @@ impl LoadedImage {
 
         // 1. Headers segment (mapped at image_base)
         let headers_size = (pe.size_of_headers as usize).min(raw_bytes.len());
-        let headers_aligned = ((headers_size as u64 + PAGE_SIZE_4KB - 1) & !(PAGE_SIZE_4KB - 1)) as usize;
+        let headers_aligned =
+            ((headers_size as u64 + PAGE_SIZE_4KB - 1) & !(PAGE_SIZE_4KB - 1)) as usize;
         let mut header_data = vec![0u8; headers_aligned];
         header_data[..headers_size].copy_from_slice(&raw_bytes[..headers_size]);
 
@@ -60,7 +61,8 @@ impl LoadedImage {
         // 2. Map each section
         for sec in &pe.sections {
             let sec_va = VirtualAddress::new(pe.image_base + sec.virtual_address as u64);
-            let mem_size = ((sec.virtual_size as u64 + PAGE_SIZE_4KB - 1) & !(PAGE_SIZE_4KB - 1)) as usize;
+            let mem_size =
+                ((sec.virtual_size as u64 + PAGE_SIZE_4KB - 1) & !(PAGE_SIZE_4KB - 1)) as usize;
             let mut sec_data = vec![0u8; mem_size];
 
             let raw_offset = sec.pointer_to_raw_data as usize;
@@ -107,7 +109,8 @@ impl LoadedImage {
             let file_size = ph.p_filesz as usize;
 
             if file_size > 0 && file_offset + file_size <= raw_bytes.len() {
-                seg_data[..file_size].copy_from_slice(&raw_bytes[file_offset..file_offset + file_size]);
+                seg_data[..file_size]
+                    .copy_from_slice(&raw_bytes[file_offset..file_offset + file_size]);
             }
 
             if ph.p_vaddr < min_va {

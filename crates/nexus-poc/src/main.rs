@@ -157,8 +157,14 @@ fn main() {
 
     println!("\n============================================================");
     println!("  Phase 0 PoC Verification Summary:                         ");
-    println!("  - Total NT System Service Calls Handled: {}", router.nt_call_count);
-    println!("  - Total Linux Pico Syscalls Handled:     {}", router.linux_call_count);
+    println!(
+        "  - Total NT System Service Calls Handled: {}",
+        router.nt_call_count
+    );
+    println!(
+        "  - Total Linux Pico Syscalls Handled:     {}",
+        router.linux_call_count
+    );
     println!("  - Hybrid Binary Execution Status: PASS                    ");
     println!("============================================================");
 }

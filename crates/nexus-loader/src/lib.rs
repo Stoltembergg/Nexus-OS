@@ -22,13 +22,15 @@ pub enum BinaryFormat {
 }
 
 pub fn detect_format(bytes: &[u8]) -> BinaryFormat {
-    if bytes.len() >= 4 && bytes[0..4] == elf::ELF_MAGIC {
-        if bytes.len() > 5 && bytes[4] == elf::ELF_CLASS_64 {
-            return BinaryFormat::Elf64;
-        }
+    if bytes.len() >= 4
+        && bytes[0..4] == elf::ELF_MAGIC
+        && bytes.len() > 5
+        && bytes[4] == elf::ELF_CLASS_64
+    {
+        return BinaryFormat::Elf64;
     }
 
-    if bytes.len() >= 2 && bytes[0..2] == [b'M', b'Z'] {
+    if bytes.len() >= 2 && bytes[0..2] == *b"MZ" {
         return BinaryFormat::Pe32Plus;
     }
 

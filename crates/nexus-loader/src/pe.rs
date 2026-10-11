@@ -99,8 +99,7 @@ impl PeImage {
 
         // 3. Verify Optional Header (PE32+ 64-bit)
         let opt_header_offset = file_header_offset + 20;
-        let opt_magic =
-            LittleEndian::read_u16(&bytes[opt_header_offset..opt_header_offset + 2]);
+        let opt_magic = LittleEndian::read_u16(&bytes[opt_header_offset..opt_header_offset + 2]);
         if opt_magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC {
             return Err(LoaderError::InvalidPeMagic(opt_magic));
         }

@@ -4,6 +4,8 @@ use bitflags::bitflags;
 
 pub const PAGE_SIZE_4KB: u64 = 4096;
 pub const PAGE_MASK_4KB: u64 = !(PAGE_SIZE_4KB - 1);
+pub const PAGE_SIZE_2MB: u64 = 2 * 1024 * 1024;
+pub const PAGE_MASK_2MB: u64 = !(PAGE_SIZE_2MB - 1);
 
 /// A canonical 64-bit virtual memory address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

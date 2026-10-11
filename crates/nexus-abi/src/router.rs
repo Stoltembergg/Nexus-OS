@@ -5,15 +5,18 @@ use crate::linux::dispatch_linux_syscall;
 use crate::nt::dispatch_nt_syscall;
 use nexus_types::process::ProcessPersonality;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct SyscallRouter {
     pub nt_call_count: u64,
     pub linux_call_count: u64,
 }
 
 impl SyscallRouter {
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            nt_call_count: 0,
+            linux_call_count: 0,
+        }
     }
 
     /// Dispatches a system call based on the calling process personality.

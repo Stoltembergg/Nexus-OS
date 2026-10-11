@@ -13,7 +13,9 @@ pub enum LoaderError {
     #[error("Invalid PE signature: expected 'PE\\0\\0', got {0:#010X}")]
     InvalidPeSignature(u32),
 
-    #[error("Unsupported machine architecture: expected x86_64 ({expected:#06X}), got {actual:#06X}")]
+    #[error(
+        "Unsupported machine architecture: expected x86_64 ({expected:#06X}), got {actual:#06X}"
+    )]
     UnsupportedMachine { expected: u16, actual: u16 },
 
     #[error("Invalid PE magic: expected 0x020B (PE32+ 64-bit), got {0:#06X}")]

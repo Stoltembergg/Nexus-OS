@@ -6,6 +6,7 @@ members = [
     "crates/nexus-abi",
     "crates/nexus-poc",
     "crates/nexus-boot",
+    "crates/nexus-kernel",
 ]
 
 [workspace.package]
@@ -20,6 +21,8 @@ repository = "https://github.com/hybrid-os/nexus-os"
 nexus-types = { path = "crates/nexus-types", version = "0.1.0-alpha.0" }
 nexus-loader = { path = "crates/nexus-loader", version = "0.1.0-alpha.0" }
 nexus-abi = { path = "crates/nexus-abi", version = "0.1.0-alpha.0" }
+nexus-boot = { path = "crates/nexus-boot", version = "0.1.0-alpha.0" }
+nexus-kernel = { path = "crates/nexus-kernel", version = "0.1.0-alpha.0" }
 
 # Common dependencies
 bitflags = "2.8"
@@ -27,3 +30,6 @@ thiserror = "2.0"
 byteorder = "1.5"
 log = "0.4"
 env_logger = "0.11"
+spin = "0.9"
+x86_64 = "0.14"
+volatile = "0.4"

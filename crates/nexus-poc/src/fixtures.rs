@@ -27,7 +27,10 @@ pub fn create_minimal_pe64() -> Vec<u8> {
     LittleEndian::write_u16(&mut buf[opt_offset..opt_offset + 2], 0x020B); // PE32+
     LittleEndian::write_u32(&mut buf[opt_offset + 16..opt_offset + 20], 0x1000); // AddressOfEntryPoint (RVA 0x1000)
     LittleEndian::write_u32(&mut buf[opt_offset + 20..opt_offset + 24], 0x1000); // BaseOfCode
-    LittleEndian::write_u64(&mut buf[opt_offset + 24..opt_offset + 32], 0x0000_0001_4000_0000); // ImageBase
+    LittleEndian::write_u64(
+        &mut buf[opt_offset + 24..opt_offset + 32],
+        0x0000_0001_4000_0000,
+    ); // ImageBase
     LittleEndian::write_u32(&mut buf[opt_offset + 32..opt_offset + 36], 0x1000); // SectionAlignment
     LittleEndian::write_u32(&mut buf[opt_offset + 36..opt_offset + 40], 0x200); // FileAlignment
     LittleEndian::write_u32(&mut buf[opt_offset + 56..opt_offset + 60], 0x3000); // SizeOfImage
@@ -105,8 +108,8 @@ pub fn create_minimal_elf64() -> Vec<u8> {
     // 48 C7 C0 3C 00 00 00 48 31 FF 0F 05
     let payload = [
         0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00, // mov rax, 60
-        0x48, 0x31, 0xFF,                         // xor rdi, rdi
-        0x0F, 0x05,                               // syscall
+        0x48, 0x31, 0xFF, // xor rdi, rdi
+        0x0F, 0x05, // syscall
     ];
     buf[0x1000..0x1000 + payload.len()].copy_from_slice(&payload);
 

@@ -5,5 +5,15 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "nexus_boot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bootx64"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 nexus-types = { workspace = true }
+nexus-kernel = { workspace = true }

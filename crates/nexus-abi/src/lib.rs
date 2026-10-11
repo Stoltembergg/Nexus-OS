@@ -30,7 +30,7 @@ mod tests {
         let mut win_ctx = RegisterContext::new();
         win_ctx.rax = nt::NT_ALLOCATE_VIRTUAL_MEMORY as u64;
         win_ctx.rcx = 0xFFFFFFFF; // Current process pseudo-handle
-        win_ctx.r9 = 0x1000;      // 4KB commit
+        win_ctx.r9 = 0x1000; // 4KB commit
 
         router.dispatch(&win_pers, &mut win_ctx);
         assert_eq!(win_ctx.rax, 0); // STATUS_SUCCESS

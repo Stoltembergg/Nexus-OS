@@ -18,11 +18,19 @@ pub fn dispatch_nt_syscall(ctx: &mut RegisterContext) -> NtStatus {
         NT_ALLOCATE_VIRTUAL_MEMORY => {
             // Args: ProcessHandle (RCX), BaseAddress (RDX), ZeroBits (R8), CommitSize (R9)
             // Simulated memory allocation
-            log::info!("[NT-SSDT] NtAllocateVirtualMemory(handle={:#X}, size={:#X})", ctx.rcx, ctx.r9);
+            log::info!(
+                "[NT-SSDT] NtAllocateVirtualMemory(handle={:#X}, size={:#X})",
+                ctx.rcx,
+                ctx.r9
+            );
             NtStatus::STATUS_SUCCESS
         }
         NT_FREE_VIRTUAL_MEMORY => {
-            log::info!("[NT-SSDT] NtFreeVirtualMemory(handle={:#X}, addr={:#X})", ctx.rcx, ctx.rdx);
+            log::info!(
+                "[NT-SSDT] NtFreeVirtualMemory(handle={:#X}, addr={:#X})",
+                ctx.rcx,
+                ctx.rdx
+            );
             NtStatus::STATUS_SUCCESS
         }
         NT_WRITE_FILE => {
@@ -36,7 +44,11 @@ pub fn dispatch_nt_syscall(ctx: &mut RegisterContext) -> NtStatus {
             NtStatus::STATUS_SUCCESS
         }
         NT_TERMINATE_PROCESS => {
-            log::info!("[NT-SSDT] NtTerminateProcess(handle={:#X}, exit_code={})", ctx.rcx, ctx.rdx);
+            log::info!(
+                "[NT-SSDT] NtTerminateProcess(handle={:#X}, exit_code={})",
+                ctx.rcx,
+                ctx.rdx
+            );
             NtStatus::STATUS_SUCCESS
         }
         NT_QUERY_SYSTEM_INFORMATION => {

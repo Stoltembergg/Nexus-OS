@@ -140,6 +140,8 @@ impl ElfImage {
     }
 
     pub fn loadable_segments(&self) -> impl Iterator<Item = &ElfProgramHeader> {
-        self.program_headers.iter().filter(|ph| ph.p_type == PT_LOAD)
+        self.program_headers
+            .iter()
+            .filter(|ph| ph.p_type == PT_LOAD)
     }
 }
