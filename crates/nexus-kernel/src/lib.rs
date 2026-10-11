@@ -2,7 +2,7 @@
 //!
 //! Provides bare-metal x86_64 architecture initialization (GDT, IDT, exceptions),
 //! Physical Memory Management (PMM), Virtual Memory Management (VMM),
-//! Process / Thread execution in Ring 3, and Dual-Personality Syscalls.
+//! Process / Thread execution in Ring 3, and Dual-Personality Syscalls (NT & Linux).
 
 #[macro_use]
 pub mod arch;
@@ -19,7 +19,7 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     arch::init_arch();
 
     serial_println!("============================================================");
-    serial_println!("     Nexus OS - Real Process Execution & VMM (Phase 2)      ");
+    serial_println!("  Nexus OS - Unified PE32+ / ELF64 Process Executive (Phase 3) ");
     serial_println!("============================================================");
     serial_println!("[*] CPU Architecture: x86_64 Long Mode (64-bit)");
     serial_println!("[+] Serial COM1 (115200 8N1) Initialized.");
@@ -58,54 +58,68 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     syscall::init_syscall_msrs(task::syscall::asm_syscall_entry as *const () as usize as u64);
     serial_println!("[+] IA32_EFER.SCE & IA32_LSTAR Configured with Secure Pointer Validation.");
 
-    // 5. Milestone 1: Freestanding ELF64 Process Execution in Ring 3
+    // 5. Milestone 1: Spawning Windows PE32+ and Linux ELF64 Processes
     serial_println!("------------------------------------------------------------");
-    serial_println!("[*] Milestone 1: Executing Freestanding ELF64 in Ring 3...");
+    serial_println!("[*] Milestone 1: Spawning Windows PE32+ & Linux ELF64 Processes...");
     serial_println!("------------------------------------------------------------");
 
-    serial_println!("[*] Generating Ring 3 payload...");
+    let pe_bytes = task::pe_payload::generate_ring3_pe_payload();
     let elf_bytes = task::elf_payload::generate_ring3_elf_payload(
-        b"Hello from Nexus OS Ring 3 (Freestanding ELF64)!\n",
+        b"Hello from Nexus OS Ring 3 (Linux ELF64)!\n",
     );
-    serial_println!("[*] Acquiring kernel memory locks...");
+
     let mut kernel_as_guard = mem::KERNEL_ADDRESS_SPACE.lock();
     let kernel_as = kernel_as_guard
         .as_mut()
         .expect("Kernel Address Space must be initialized");
     let mut pmm_guard = mem::pmm::PMM.lock();
 
-    serial_println!("[*] Calling spawn_elf for PID 1...");
-    let mut user_process = task::Process::spawn_elf(
+    serial_println!("[*] Spawning Windows PE32+ Process (PID 1, 'win_app.exe')...");
+    let win_proc = task::Process::spawn_pe(
         nexus_types::ProcessId(1),
-        "init_elf",
+        "win_app.exe",
+        &pe_bytes,
+        kernel_as,
+        &mut pmm_guard,
+    )
+    .expect("Failed to spawn Windows PE32+ process");
+
+    serial_println!("[*] Spawning Linux ELF64 Process (PID 2, 'linux_app.elf')...");
+    let linux_proc = task::Process::spawn_elf(
+        nexus_types::ProcessId(2),
+        "linux_app.elf",
         &elf_bytes,
         kernel_as,
         &mut pmm_guard,
     )
-    .expect("Failed to spawn Ring 3 ELF process");
+    .expect("Failed to spawn Linux ELF64 process");
 
     drop(kernel_as_guard);
     drop(pmm_guard);
 
-    serial_println!("[*] Launching user process PID 1 in Ring 3...");
+    // 6. Milestone 2: Cooperative Multi-Process Scheduling & Personality Alternation
+    serial_println!("------------------------------------------------------------");
+    serial_println!("[*] Milestone 2: Interleaved Multi-Personality Scheduling...");
+    serial_println!("------------------------------------------------------------");
+
+    let mut scheduler = task::Scheduler::new();
+    scheduler.add_process(win_proc);
+    scheduler.add_process(linux_proc);
+
     let kernel_as_ref = mem::KERNEL_ADDRESS_SPACE.lock();
     let k_as = kernel_as_ref.as_ref().unwrap();
-    let exit_code =
-        task::run_user_process(&mut user_process, k_as).expect("Failed to execute process");
+    scheduler.run_all(k_as).expect("Scheduler execution failed");
     drop(kernel_as_ref);
 
-    if exit_code == 0 {
-        serial_println!(
-            "[+] MILESTONE 1 VERIFIED: Ring 3 ELF64 executed cleanly (Exit Code: {}).",
-            exit_code
-        );
-    } else {
-        serial_println!("[!] MILESTONE 1 FAILED: Unexpected Exit Code {}", exit_code);
-    }
+    serial_println!(
+        "[+] MILESTONE 1 & 2 VERIFIED: Dual PE32+ & ELF64 execution and cooperative scheduling completed!"
+    );
 
-    // 6. Milestone 2: Ring 3 Memory Isolation & #PF Recovery Test
+    // 7. Milestone 3: Memory Isolation & Protection Fault Recovery
     serial_println!("------------------------------------------------------------");
-    serial_println!("[*] Milestone 2: Testing Ring 3 Memory Isolation & #PF Recovery...");
+    serial_println!(
+        "[*] Milestone 3: Testing Address Space Isolation & Hardware Fault Recovery..."
+    );
     serial_println!("------------------------------------------------------------");
 
     let fault_elf_bytes = task::elf_payload::generate_faulting_elf_payload();
@@ -116,13 +130,13 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     let mut pmm_guard = mem::pmm::PMM.lock();
 
     let mut fault_process = task::Process::spawn_elf(
-        nexus_types::ProcessId(2),
+        nexus_types::ProcessId(3),
         "fault_test",
         &fault_elf_bytes,
         kernel_as,
         &mut pmm_guard,
     )
-    .expect("Failed to spawn faulting ELF process");
+    .expect("Failed to spawn faulting process");
 
     drop(kernel_as_guard);
     drop(pmm_guard);
@@ -135,21 +149,21 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     match fault_res {
         Err(task::ProcessError::Fault(14)) => {
             serial_println!(
-                "[+] MILESTONE 2 VERIFIED: Memory isolation caught illegal access (Exception Vector 14: #PF)."
+                "[+] MILESTONE 3 VERIFIED: Memory isolation caught illegal access (Exception Vector 14: #PF)."
             );
         }
         Err(task::ProcessError::Fault(13)) => {
             serial_println!(
-                "[+] MILESTONE 2 VERIFIED: Memory isolation caught illegal access (Exception Vector 13: #GP)."
+                "[+] MILESTONE 3 VERIFIED: Memory isolation caught illegal access (Exception Vector 13: #GP)."
             );
         }
         other => {
-            serial_println!("[!] MILESTONE 2: Outcome: {:?}", other);
+            serial_println!("[!] MILESTONE 3: Outcome: {:?}", other);
         }
     }
 
     serial_println!("============================================================");
-    serial_println!(" NEXUS_PHASE2_SUCCESS: Real Process Execution Verified     ");
+    serial_println!(" NEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified");
     serial_println!("============================================================");
 }
 

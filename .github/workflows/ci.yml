@@ -63,6 +63,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-system-x86 ovmf
 
-      - name: Run Phase 1 Bare-Metal UEFI Boot Test (Ubuntu)
+      - name: Run Phase 3 Bare-Metal UEFI Boot Test (Ubuntu)
         if: runner.os == 'Linux'
         run: bash scripts/test-boot.sh

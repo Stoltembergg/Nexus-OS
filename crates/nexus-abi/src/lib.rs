@@ -25,6 +25,8 @@ mod tests {
             image_base: VirtualAddress::new(0x140000000),
             entry_point: VirtualAddress::new(0x140001000),
             subsystem: 3,
+            teb_address: VirtualAddress::new(0),
+            peb_address: VirtualAddress::new(0),
         };
 
         let mut win_ctx = RegisterContext::new();

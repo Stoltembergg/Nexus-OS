@@ -1,17 +1,17 @@
-# Nexus OS - Phase 2 Automated Bare-Metal UEFI Boot & Process Execution Test (PowerShell)
-# Runs QEMU with OVMF firmware and verifies bare-metal boot, Ring 3 ELF64 execution, and memory isolation.
+# Nexus OS - Phase 3 Automated Bare-Metal UEFI Boot & Unified Process Execution Test (PowerShell)
+# Runs QEMU with OVMF firmware and verifies bare-metal boot, interleaved Ring 3 Windows PE32+ & Linux ELF64 execution, and memory isolation.
 
 param(
     [string]$QemuPath = "C:\Program Files\qemu\qemu-system-x86_64.exe",
     [string]$OvmfPath = "C:\Program Files\qemu\share\edk2-x86_64-code.fd",
-    [int]$TimeoutSeconds = 15
+    [int]$TimeoutSeconds = 20
 )
 
 $ErrorActionPreference = "Stop"
 $WorkspaceRoot = (Get-Item $PSScriptRoot).Parent.FullName
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host "    Nexus OS - Phase 2 Real Process Execution & VMM Test    " -ForegroundColor Cyan
+Write-Host "  Nexus OS - Phase 3 Unified PE32+ / ELF64 Execution Test   " -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # 1. Build UEFI Bootloader and Kernel
@@ -79,7 +79,7 @@ while ($stopwatch.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
     Start-Sleep -Milliseconds 500
     if (Test-Path $LogFile) {
         $content = Get-Content $LogFile -Raw -ErrorAction SilentlyContinue
-        if ($content -and $content -match "NEXUS_PHASE2_SUCCESS") {
+        if ($content -and $content -match "NEXUS_PHASE3_SUCCESS") {
             $successFound = $true
             break
         }
@@ -101,14 +101,18 @@ Write-Host "`n--- Serial Log Output ---" -ForegroundColor DarkGray
 Write-Host $logContent -ForegroundColor Gray
 Write-Host "-------------------------`n" -ForegroundColor DarkGray
 
-if ($logContent -match "NEXUS_PHASE2_SUCCESS" -and
-    $logContent -match "MILESTONE 1 VERIFIED" -and
-    $logContent -match "MILESTONE 2 VERIFIED" -and
-    $logContent -match "GOP Framebuffer Detected" -and
-    $logContent -match "PMM & VMM Active") {
-    Write-Host "[+] REAL PROCESS EXECUTION & VMM TEST PASSED: All Phase 2 milestones verified." -ForegroundColor Green
+if ($logContent -match "NEXUS_PHASE3_SUCCESS" -and
+    $logContent -match "Ring 3 WinPE" -and
+    $logContent -match "Ring 3 Linux" -and
+    $logContent -match "NtYieldExecution invoked by Windows PE32\+ task" -and
+    $logContent -match "SYS_SCHED_YIELD invoked by Linux ELF64 task" -and
+    $logContent -match "NtTerminateProcess invoked" -and
+    $logContent -match "Linux sys_exit invoked" -and
+    $logContent -match "MILESTONE 1 & 2 VERIFIED" -and
+    $logContent -match "MILESTONE 3 VERIFIED") {
+    Write-Host "[+] UNIFIED PE32+ / ELF64 EXECUTION TEST PASSED: All Phase 3 milestones verified." -ForegroundColor Green
     exit 0
 } else {
-    Write-Error "Test Failed: Expected Phase 2 boot milestones missing from log."
+    Write-Error "Test Failed: Expected Phase 3 boot milestones missing from log."
     exit 1
 }

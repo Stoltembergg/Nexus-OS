@@ -9,6 +9,7 @@ pub const SYS_OPEN: u64 = 2;
 pub const SYS_CLOSE: u64 = 3;
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_BRK: u64 = 12;
+pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_EXIT: u64 = 60;
 pub const SYS_ARCH_PRCTL: u64 = 158;
 pub const SYS_EXIT_GROUP: u64 = 231;
@@ -67,6 +68,10 @@ pub fn dispatch_linux_syscall(ctx: &mut RegisterContext) -> i64 {
             );
             0x0000_7FFF_0000_0000 // Return simulated mmap allocation base
         }
+        SYS_SCHED_YIELD => {
+            log::info!("[Linux-Pico] sys_sched_yield()");
+            0
+        }
         SYS_ARCH_PRCTL => {
             // code: rdi, addr: rsi (ARCH_SET_FS = 0x1002)
             log::info!(
@@ -78,7 +83,7 @@ pub fn dispatch_linux_syscall(ctx: &mut RegisterContext) -> i64 {
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
             log::info!("[Linux-Pico] sys_exit(status={})", ctx.rdi);
-            0
+            ctx.rdi as i64
         }
         _ => {
             log::warn!("[Linux-Pico] Unhandled Linux syscall nr: {}", syscall_nr);

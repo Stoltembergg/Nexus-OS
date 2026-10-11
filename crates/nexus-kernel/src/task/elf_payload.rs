@@ -1,4 +1,4 @@
-//! Freestanding ELF64 User-Mode Payloads for Phase 2 Verification.
+//! Freestanding ELF64 User-Mode Payloads for Nexus OS Process Execution.
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -6,7 +6,8 @@ pub const ELF_USER_BASE_VADDR: u64 = 0x0000_0000_4000_0000; // 1 GB user base
 pub const ELF_USER_ENTRY_VADDR: u64 = 0x0000_0000_4000_1000;
 
 /// Generates a valid freestanding ELF64 executable in memory that invokes
-/// Linux `SYS_WRITE` (1) to print a greeting message and `SYS_EXIT` (60) with code 0.
+/// Linux `SYS_WRITE` (1) to print a greeting message, `SYS_SCHED_YIELD` (24) to yield
+/// CPU cooperatively to the Windows PE32+ task, and `SYS_EXIT` (60) with code 0 upon resumption.
 pub fn generate_ring3_elf_payload(message: &[u8]) -> [u8; 8192] {
     let mut image = [0u8; 8192];
 
@@ -65,19 +66,27 @@ pub fn generate_ring3_elf_payload(message: &[u8]) -> [u8; 8192] {
     code[i..i + 7].copy_from_slice(&[0x48, 0xC7, 0xC2, msg_len as u8, 0x00, 0x00, 0x00]);
     i += 7;
 
-    // 5. syscall
+    // 5. syscall (SYS_WRITE)
     code[i..i + 2].copy_from_slice(&[0x0F, 0x05]);
     i += 2;
 
-    // 6. mov rax, 60 (SYS_EXIT)
+    // 6. mov rax, 24 (SYS_SCHED_YIELD)
+    code[i..i + 7].copy_from_slice(&[0x48, 0xC7, 0xC0, 0x18, 0x00, 0x00, 0x00]);
+    i += 7;
+
+    // 7. syscall (SYS_SCHED_YIELD)
+    code[i..i + 2].copy_from_slice(&[0x0F, 0x05]);
+    i += 2;
+
+    // 8. mov rax, 60 (SYS_EXIT)
     code[i..i + 7].copy_from_slice(&[0x48, 0xC7, 0xC0, 0x3C, 0x00, 0x00, 0x00]);
     i += 7;
 
-    // 7. mov rdi, 0 (status 0)
+    // 9. mov rdi, 0 (status 0)
     code[i..i + 7].copy_from_slice(&[0x48, 0xC7, 0xC7, 0x00, 0x00, 0x00, 0x00]);
     i += 7;
 
-    // 8. syscall
+    // 10. syscall (SYS_EXIT)
     code[i..i + 2].copy_from_slice(&[0x0F, 0x05]);
     i += 2;
 

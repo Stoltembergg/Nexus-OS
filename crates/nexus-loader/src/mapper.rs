@@ -85,6 +85,8 @@ impl LoadedImage {
             image_base: VirtualAddress::new(pe.image_base),
             entry_point: pe.entry_point_va(),
             subsystem: pe.subsystem,
+            teb_address: VirtualAddress::new(0),
+            peb_address: VirtualAddress::new(0),
         };
 
         Ok(Self {

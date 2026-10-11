@@ -1,4 +1,8 @@
-//! Hardware SYSCALL / SYSRET Dispatcher and Safe User Pointer Validation.
+//! Hardware Syscall Dispatcher with Dual Personality (NT SSDT / Linux Pico).
+//!
+//! Handles transitions initiated by the `syscall` CPU instruction in Ring 3.
+//! Implements strict user pointer validation, boundary checks, and routing based on
+//! the active thread's `ProcessPersonality`.
 
 use crate::mem::vmm::AddressSpace;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -7,61 +11,57 @@ use nexus_types::VirtualAddress;
 
 pub static LAST_SYSCALL_EXIT_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
 
-/// Scratch storage for switching between User RSP and Kernel RSP.
-#[no_mangle]
-pub static mut USER_RSP_SCRATCH: u64 = 0;
-#[no_mangle]
-pub static mut KERNEL_RSP_SCRATCH: u64 = 0;
-
-/// Register context preserved across a hardware `SYSCALL` instruction.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SyscallFrame {
-    pub rax: u64, // Syscall number on entry; return value on exit
-    pub r10: u64, // arg 4
-    pub r9: u64,  // arg 6
-    pub r8: u64,  // arg 5
-    pub rdi: u64, // arg 1
-    pub rsi: u64, // arg 2
-    pub rdx: u64, // arg 3
+    pub rax: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
     pub r15: u64,
     pub r14: u64,
     pub r13: u64,
     pub r12: u64,
     pub rbx: u64,
     pub rbp: u64,
-    pub rcx: u64, // Saved user RIP (loaded by CPU)
-    pub r11: u64, // Saved user RFLAGS (loaded by CPU)
+    pub rcx: u64, // Saved user RIP (from RCX)
+    pub r11: u64, // Saved user RFLAGS (from R11)
     pub rsp: u64, // Saved user RSP
 }
 
-/// Validates that a user-supplied pointer and buffer size reside completely within
-/// the canonical user-space memory boundary (0x0000_0000_0000_0000..=0x0000_7FFF_FFFF_FFFF)
-/// and are mapped in the current address space without integer overflow.
+#[no_mangle]
+pub static mut KERNEL_RSP_SCRATCH: u64 = 0;
+
+#[no_mangle]
+pub static mut USER_RSP_SCRATCH: u64 = 0;
+
+pub const USER_CEILING: u64 = 0x0000_8000_0000_0000;
+
+/// Validates that a user-provided buffer is safely within user memory bounds.
 pub fn validate_user_buffer(
-    ptr: u64,
+    user_ptr: u64,
     len: usize,
-    _write: bool,
+    _require_writable: bool,
     address_space: &AddressSpace,
 ) -> Result<(), Errno> {
     if len == 0 {
         return Ok(());
     }
 
-    // 1. Prevent 64-bit integer overflow
-    let end = ptr.checked_add(len as u64).ok_or(Errno::EFAULT)?;
+    let end_ptr = user_ptr.checked_add(len as u64).ok_or(Errno::EFAULT)?;
 
-    // 2. Enforce canonical user-space ceiling (0x0000_8000_0000_0000)
-    const USER_CEILING: u64 = 0x0000_8000_0000_0000;
-    if ptr >= USER_CEILING || end > USER_CEILING {
+    if end_ptr > USER_CEILING || user_ptr >= USER_CEILING || user_ptr == 0 {
         return Err(Errno::EFAULT);
     }
 
-    // 3. Verify page presence in address space
-    let start_page = ptr & !0xFFF;
-    let end_page = (end + 0xFFF) & !0xFFF;
-    let mut curr = start_page;
+    // Verify all pages spanned by buffer are mapped and present in user address space
+    let start_page = user_ptr & !0xFFF;
+    let end_page = (end_ptr + 0xFFF) & !0xFFF;
 
+    let mut curr = start_page;
     while curr < end_page {
         let vaddr = VirtualAddress::new(curr);
         if address_space.translate(vaddr).is_none() {
@@ -73,7 +73,7 @@ pub fn validate_user_buffer(
     Ok(())
 }
 
-/// Safely copies up to `dest.len()` bytes from user space into kernel space after validation.
+/// Safely copies bytes from Ring 3 memory into a kernel buffer after validation.
 pub fn safe_copy_from_user(
     dest: &mut [u8],
     user_src: u64,
@@ -99,6 +99,94 @@ pub fn safe_copy_from_user(
 
 #[no_mangle]
 pub extern "C" fn raw_syscall_dispatcher(frame: &mut SyscallFrame) {
+    let personality = crate::task::get_active_personality();
+
+    if personality.is_windows() {
+        dispatch_nt_syscall(frame);
+    } else {
+        dispatch_linux_syscall(frame);
+    }
+}
+
+fn dispatch_nt_syscall(frame: &mut SyscallFrame) {
+    let service_id = frame.rax as u32;
+
+    match service_id {
+        // NtWriteFile (0x0008)
+        0x0008 => {
+            let active_as = crate::task::get_active_address_space();
+            let mut buf_ptr = frame.rdx;
+            let mut count = frame.r8 as usize;
+
+            // Check if buffer pointer and length were passed on stack (Win64 NT convention)
+            let stack_buf_slot = frame.rsp.wrapping_add(0x30);
+            if validate_user_buffer(stack_buf_slot, 8, false, &active_as).is_ok() {
+                let stack_val = unsafe { *(stack_buf_slot as *const u64) };
+                if (0x4000_0000..USER_CEILING).contains(&stack_val) {
+                    buf_ptr = stack_val;
+                    let stack_len_slot = frame.rsp.wrapping_add(0x38);
+                    if validate_user_buffer(stack_len_slot, 8, false, &active_as).is_ok() {
+                        let l = unsafe { *(stack_len_slot as *const u64) } as usize;
+                        if l > 0 && l < 1024 {
+                            count = l;
+                        }
+                    }
+                }
+            }
+
+            let mut local_buf = [0u8; 256];
+            let to_read = count.min(local_buf.len());
+
+            if let Err(e) = validate_user_buffer(buf_ptr, to_read, false, &active_as) {
+                serial_println!(
+                    "[Kernel Syscall] NtWriteFile rejected invalid pointer {:#018X} ({:?})",
+                    buf_ptr,
+                    e
+                );
+                frame.rax = 0xC000_0005; // STATUS_ACCESS_VIOLATION
+                return;
+            }
+
+            if let Ok(copied) = safe_copy_from_user(&mut local_buf, buf_ptr, to_read, &active_as) {
+                if let Ok(s) = core::str::from_utf8(&local_buf[..copied]) {
+                    serial_print!("[Ring 3 WinPE]: {}", s);
+                }
+                frame.rax = 0; // STATUS_SUCCESS
+                return;
+            }
+
+            frame.rax = 0;
+        }
+
+        // NtYieldExecution (0x0050)
+        0x0050 => {
+            serial_println!("[Kernel Syscall] NtYieldExecution invoked by Windows PE32+ task.");
+            crate::task::save_active_thread_registers(frame);
+            crate::task::trigger_user_yield();
+        }
+
+        // NtTerminateProcess (0x002C)
+        0x002C => {
+            let exit_code = frame.rdx as i32;
+            serial_println!(
+                "[Kernel Syscall] NtTerminateProcess invoked (status={})",
+                exit_code
+            );
+            LAST_SYSCALL_EXIT_CODE.store(exit_code as u64, Ordering::SeqCst);
+            crate::task::trigger_user_abort(exit_code);
+        }
+
+        _ => {
+            serial_println!(
+                "[Kernel Syscall] Unhandled NT service ID: {:#06X}",
+                service_id
+            );
+            frame.rax = 0xC000_0002; // STATUS_NOT_IMPLEMENTED
+        }
+    }
+}
+
+fn dispatch_linux_syscall(frame: &mut SyscallFrame) {
     let syscall_nr = frame.rax;
 
     match syscall_nr {
@@ -127,7 +215,7 @@ pub extern "C" fn raw_syscall_dispatcher(frame: &mut SyscallFrame) {
                     safe_copy_from_user(&mut local_buf, user_buf, to_read, &active_as)
                 {
                     if let Ok(s) = core::str::from_utf8(&local_buf[..copied]) {
-                        serial_print!("[Ring 3 App]: {}", s);
+                        serial_print!("[Ring 3 Linux]: {}", s);
                     }
                     frame.rax = copied as u64;
                     return;
@@ -136,11 +224,18 @@ pub extern "C" fn raw_syscall_dispatcher(frame: &mut SyscallFrame) {
             frame.rax = count as u64;
         }
 
+        // Linux SYS_SCHED_YIELD (24)
+        24 => {
+            serial_println!("[Kernel Syscall] SYS_SCHED_YIELD invoked by Linux ELF64 task.");
+            crate::task::save_active_thread_registers(frame);
+            crate::task::trigger_user_yield();
+        }
+
         // Linux SYS_EXIT (60) or SYS_EXIT_GROUP (231): status = rdi
         60 | 231 => {
             let exit_code = frame.rdi as i32;
             serial_println!(
-                "[Kernel Syscall] Process exit requested (status={})",
+                "[Kernel Syscall] Linux sys_exit invoked (status={})",
                 exit_code
             );
             LAST_SYSCALL_EXIT_CODE.store(exit_code as u64, Ordering::SeqCst);
@@ -148,7 +243,7 @@ pub extern "C" fn raw_syscall_dispatcher(frame: &mut SyscallFrame) {
         }
 
         _ => {
-            serial_println!("[Kernel Syscall] Unknown syscall nr: {}", syscall_nr);
+            serial_println!("[Kernel Syscall] Unknown Linux syscall nr: {}", syscall_nr);
             frame.rax = Errno::ENOSYS.as_ret_val() as u64;
         }
     }
@@ -204,11 +299,10 @@ core::arch::global_asm!(
         pop r12
         pop rbx
         pop rbp
-        pop rcx // Restore user RIP
-        pop r11 // Restore user RFLAGS
-        pop rsp // Restore user RSP
+        pop rcx // Restore user RIP into RCX
+        pop r11 // Restore user RFLAGS into R11
+        pop rsp // Restore user RSP directly
 
-        // 6. Return to Ring 3
         sysretq
     "#
 );
@@ -224,13 +318,14 @@ pub extern "C" fn asm_syscall_entry() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mem::vmm::AddressSpace;
     use nexus_types::PhysicalAddress;
 
     #[test]
     fn test_user_buffer_bounds_check() {
         let dummy_as = AddressSpace::from_pml4(PhysicalAddress::new(0x1000));
 
-        // Canonical user addresses: 0x400000 -> Should pass ceiling check
+        // Canonical user addresses: 0x400000
         assert!(validate_user_buffer(0x0040_0000, 32, false, &dummy_as).is_ok());
 
         // Kernel higher addresses: 0xFFFF_8000_0000_0000 -> Must return EFAULT
@@ -248,6 +343,12 @@ mod tests {
         // Integer overflow -> EFAULT
         assert_eq!(
             validate_user_buffer(u64::MAX - 10, 20, false, &dummy_as),
+            Err(Errno::EFAULT)
+        );
+
+        // Null pointer -> EFAULT
+        assert_eq!(
+            validate_user_buffer(0, 16, false, &dummy_as),
             Err(Errno::EFAULT)
         );
     }

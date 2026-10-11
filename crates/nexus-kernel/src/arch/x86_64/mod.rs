@@ -26,6 +26,52 @@ pub fn set_kernel_stack(rsp0: u64) {
     }
 }
 
+/// Sets the user FS base address in IA32_FS_BASE (0xC0000100).
+///
+/// # Safety
+///
+/// The caller must ensure that `addr` is a canonical virtual address and that
+/// writing to IA32_FS_BASE is supported by the CPU.
+pub unsafe fn set_user_fs_base(addr: u64) {
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    {
+        let low = addr as u32;
+        let high = (addr >> 32) as u32;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0100u32,
+            in("eax") low,
+            in("edx") high,
+            options(nostack, preserves_flags)
+        );
+    }
+    #[cfg(any(not(target_arch = "x86_64"), test))]
+    let _ = addr;
+}
+
+/// Sets the user GS base address in IA32_GS_BASE (0xC0000101).
+///
+/// # Safety
+///
+/// The caller must ensure that `addr` is a canonical virtual address and that
+/// writing to IA32_GS_BASE is supported by the CPU.
+pub unsafe fn set_user_gs_base(addr: u64) {
+    #[cfg(all(target_arch = "x86_64", not(test)))]
+    {
+        let low = addr as u32;
+        let high = (addr >> 32) as u32;
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0101u32,
+            in("eax") low,
+            in("edx") high,
+            options(nostack, preserves_flags)
+        );
+    }
+    #[cfg(any(not(target_arch = "x86_64"), test))]
+    let _ = addr;
+}
+
 /// Initializes core x86_64 CPU structures: GDT, TSS, IDT, SSE, and COM1 serial.
 pub fn init_arch() {
     // 1. Initialize serial logging immediately

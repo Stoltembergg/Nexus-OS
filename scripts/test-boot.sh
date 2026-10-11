@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Nexus OS - Phase 2 Automated Bare-Metal UEFI Boot & Process Execution Test (Bash)
+# Nexus OS - Phase 3 Automated Bare-Metal UEFI Boot & Unified Process Execution Test (Bash)
 
 set -euo pipefail
 
@@ -11,7 +11,7 @@ OVMF_PATH="${OVMF_PATH:-/usr/share/ovmf/OVMF.fd}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-15}"
 
 echo "============================================================"
-echo "    Nexus OS - Phase 2 Real Process Execution & VMM Test    "
+echo "  Nexus OS - Phase 3 Unified PE32+ / ELF64 Execution Test   "
 echo "============================================================"
 
 # 1. Build UEFI Bootloader and Kernel
@@ -52,13 +52,13 @@ timeout "${TIMEOUT_SEC}s" "${QEMU_BIN}" \
 echo "[4/4] Validating Serial Boot Logs..."
 cat "${LOG_FILE}"
 
-if grep -q "NEXUS_PHASE2_SUCCESS" "${LOG_FILE}" && \
-   grep -q "MILESTONE 1 VERIFIED" "${LOG_FILE}" && \
-   grep -q "MILESTONE 2 VERIFIED" "${LOG_FILE}" && \
+if grep -q "NEXUS_PHASE3_SUCCESS" "${LOG_FILE}" && \
+   grep -q "MILESTONE 1 & 2 VERIFIED" "${LOG_FILE}" && \
+   grep -q "MILESTONE 3 VERIFIED" "${LOG_FILE}" && \
    grep -q "PMM & VMM Active" "${LOG_FILE}"; then
-    echo -e "\033[0;32m[+] REAL PROCESS EXECUTION & VMM TEST PASSED: All Phase 2 milestones verified.\033[0m"
+    echo -e "\033[0;32m[+] UNIFIED PE32+ / ELF64 EXECUTION TEST PASSED: All Phase 3 milestones verified.\033[0m"
     exit 0
 else
-    echo -e "\033[0;31m[!] Test Failed: Expected Phase 2 boot milestones missing from log.\033[0m" >&2
+    echo -e "\033[0;31m[!] Test Failed: Expected Phase 3 boot milestones missing from log.\033[0m" >&2
     exit 1
 fi

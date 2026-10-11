@@ -9,6 +9,7 @@ pub const NT_FREE_VIRTUAL_MEMORY: u32 = 0x001E;
 pub const NT_WRITE_FILE: u32 = 0x0008;
 pub const NT_QUERY_SYSTEM_INFORMATION: u32 = 0x0036;
 pub const NT_TERMINATE_PROCESS: u32 = 0x002C;
+pub const NT_YIELD_EXECUTION: u32 = 0x0050;
 
 /// Dispatches an NT system service call from a Windows thread context.
 pub fn dispatch_nt_syscall(ctx: &mut RegisterContext) -> NtStatus {
@@ -49,6 +50,10 @@ pub fn dispatch_nt_syscall(ctx: &mut RegisterContext) -> NtStatus {
                 ctx.rcx,
                 ctx.rdx
             );
+            NtStatus::STATUS_SUCCESS
+        }
+        NT_YIELD_EXECUTION => {
+            log::info!("[NT-SSDT] NtYieldExecution()");
             NtStatus::STATUS_SUCCESS
         }
         NT_QUERY_SYSTEM_INFORMATION => {
