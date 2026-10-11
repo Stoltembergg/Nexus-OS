@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nexus-types",
+    "crates/nexus-loader",
+    "crates/nexus-abi",
+    "crates/nexus-poc",
+    "crates/nexus-boot",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+authors = ["Nexus OS Developers"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/hybrid-os/nexus-os"
+
+[workspace.dependencies]
+# Internal workspace crates
+nexus-types = { path = "crates/nexus-types", version = "0.1.0-alpha.0" }
+nexus-loader = { path = "crates/nexus-loader", version = "0.1.0-alpha.0" }
+nexus-abi = { path = "crates/nexus-abi", version = "0.1.0-alpha.0" }
+
+# Common dependencies
+bitflags = "2.8"
+thiserror = "2.0"
+byteorder = "1.5"
+log = "0.4"
+env_logger = "0.11"

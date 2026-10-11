@@ -1,0 +1,40 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# C / C++ / CMake
+CMakeCache.txt
+CMakeFiles/
+*.dir/
+bin/
+lib/
+*.pdb
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# OS generated files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+
+# IDE / Editor configs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.vs/
+
+# OS Build Artifacts
+build/
+dist/
+*.iso
+*.img
+*.efi
