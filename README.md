@@ -1,11 +1,11 @@
 # Nexus OS: Hybrid NT + Linux Operating System
 
-[![CI Status](https://github.com/hybrid-os/nexus-os/actions/workflows/ci.yml/badge.svg)](https://github.com/hybrid-os/nexus-os/actions)
+[![CI Status](https://github.com/Stoltembergg/Nexus-OS/actions/workflows/ci.yml/badge.svg)](https://github.com/Stoltembergg/Nexus-OS/actions)
 [![License](https://img.shields.io/badge/License-Apache_2.0_OR_MIT-blue.svg)](LICENSE)
 [![Target](https://img.shields.io/badge/Target-x86__64_UEFI-orange.svg)](#architecture)
-[![Phase](https://img.shields.io/badge/Phase-3.5_Hardening_in_progress-orange.svg)](docs/09-phase3.5-kernel-hardening.md)
+[![Phase](https://img.shields.io/badge/Phase-3.7_Planned_%7C_3.5_Audit_Open-orange.svg)](docs/04-roadmap-and-phases.md)
 
-> Current status: Phase 3.5 hardening is in progress. QEMU validates a bounded freestanding PE32+/ELF64 execution profile; general Windows/Linux application compatibility, preemption and SMP remain unvalidated. See [the hardening report](docs/09-phase3.5-kernel-hardening.md) for evidence and limitations.
+> **Current status (2026-10-11):** Freestanding PE32+/ELF64 execution in QEMU and an MSVC-built WDM `.sys` driver PoC running in guest Ring 0 have been reported. This is **not** general Windows/Linux or third-party driver compatibility. [Phase 3.5 hardening](docs/09-phase3.5-kernel-hardening.md) remains open; [Phase 3.7 driver hardening](docs/04-roadmap-and-phases.md) is planned. Physical hardware installation, Vulkan acceleration, Nexus Shell and OTA are not yet implemented.
 
 **Nexus OS** is an open-source, research-driven hybrid operating system designed to execute Windows (PE/PE32+) and Linux (ELF64) binaries natively on x86_64 bare-metal hardware without relying on virtual machines or emulation layers.
 
@@ -18,7 +18,7 @@ Modern systems are fractured into two dominant user-facing paradigms:
 2. **Linux / POSIX Architecture**: The industry standard for open driver stacks (AMDGPU, Mesa, Intel, DRM/KMS), high-performance memory management, server computing, and developer toolchains.
 
 Existing solutions either:
-- Run full virtual machines (WSL 2, KVM, Hyper-V) with severe hardware virtualization overhead, latency, and anti-cheat incompatibility;
+- Run full virtual machines (WSL 2, KVM, Hyper-V) with incompatible product assumptions for Nexus' no-VM requirement;
 - Rely purely on user-space translation (Wine/Proton), which cannot run kernel drivers (`.sys`), anti-cheats, or native NT kernel services;
 - Attempt to patch ancient monolithic kernels (Longene/LUK), suffering insurmountable architectural rot.
 
@@ -71,35 +71,23 @@ Existing solutions either:
 1. **Bare Metal Execution**: Boots directly on UEFI x86_64 machines.
 2. **Dual-Personality Dispatch**: Fast system call routing distinguishing NT syscalls from Linux syscalls with zero hypervisor overhead.
 3. **Unified Memory & Address Space**: PE images (default 0x140000000) and ELF binaries (default 0x400000 or ASLR base) mapped seamlessly using standard 4-level x86_64 page tables.
-4. **Anti-Cheat Research Framework**: Rigorous reverse engineering and analysis of kernel-level anti-cheat drivers (Vanguard, EAC, BattlEye) to map out ring-0 dependencies, PatchGuard integrity checks, and TPM 2.0 attestation constraints.
+4. **Anti-Cheat research:** standard NT drivers can be validated independently; Vanguard compatibility and vendor acceptance remain unproven and may need cooperation with Riot. No bypass, spoofing or hidden hypervisor strategy.
 
 ---
 
-## 3. Repository Structure
+## 3. Repository structure (selected components)
 
-```
-├── .github/
-│   └── workflows/
-│       └── ci.yml               # Automated CI pipeline (lint, test, build)
-├── docs/                        # Deep technical specifications & research
-│   ├── 01-reference-projects-analysis.md
-│   ├── 02-kernel-feasibility-study.md
-│   ├── 03-system-architecture.md
-│   ├── 04-roadmap-and-phases.md
-│   └── 05-anticheat-technical-analysis.md
-├── crates/                      # Core Rust modular codebase
-│   ├── nexus-types/             # Core OS types (Status, Errno, Process, Memory)
-│   ├── nexus-loader/            # Native PE32+ and ELF64 parser & mapper
-│   ├── nexus-abi/               # Dual ABI system call dispatcher (NT + Linux)
-│   ├── nexus-poc/               # Phase 0 verified Proof-of-Concept runner
-│   └── nexus-boot/              # UEFI bootloader stub (x86_64)
-├── fixtures/                    # Test PE and ELF binary payloads
-├── scripts/                     # Cross-platform build & test helpers
-│   ├── build.ps1
-│   ├── build.sh
-│   └── test.ps1
-├── Cargo.toml                   # Workspace manifest
-└── CONTRIBUTING.md              # Engineering guidelines & conventions
+```text
+.github/workflows/ci.yml       # host checks, QEMU/OVMF integration
+crates/nexus-boot/             # UEFI entry
+crates/nexus-kernel/           # x86_64 kernel, VMM, Ring 3, driver host
+crates/nexus-loader/           # PE/ELF and NT driver image processing
+crates/nexus-abi/              # personality-aware syscall interfaces
+crates/nexus-types/            # ABI structs and core types
+crates/nexus-poc/              # host-side exploratory PoC
+docs/                          # architecture, feasibility, historical evidence and roadmap
+scripts/                       # build, test, hardening and fixture helpers
+tests/fixtures/nt_driver/      # test WDM driver code and fixture
 ```
 
 ---
@@ -112,11 +100,11 @@ Existing solutions either:
 - **Git**
 
 ### Running the Proof of Concept
-The Phase 0 PoC demonstrates parsing, validation, virtual memory mapping, and dual ABI routing inspection (unimplemented services return errors) for both a native Windows PE32+ binary and an ELF64 Linux binary:
+The Phase 0 host PoC inspects PE/ELF parsing and routing; it does not boot the kernel or prove full Windows/Linux compatibility. QEMU integration and security tests are separate:
 
 ```bash
 # Clone the repository
-git clone https://github.com/hybrid-os/nexus-os.git
+git clone https://github.com/Stoltembergg/Nexus-OS.git
 cd nexus-os
 
 # Run all unit and integration tests
@@ -124,19 +112,31 @@ cargo test --workspace
 
 # Run the Phase 0 interactive loader demonstration
 cargo run -p nexus-poc
+
+# On a configured QEMU/OVMF development machine
+python scripts/test-hardening.py
 ```
 
 ---
 
-## 5. Development Phases
+## 5. Development phases, shell and updates
 
-- [x] **Phase 0: Specifications, Architecture & Minimal Dual Loader PoC** (host parsing/routing only)
-- [x] **Phase 1: Bare-Metal UEFI Bootloader & Microkernel Initialization** (Paging, GDT, IDT, Serial)
-- [x] **Phase 2: Hybrid Process Scheduler & Memory Subsystem** (VAD / mm_struct unified core)
-- [x] **Phase 3: Unified Freestanding PE32+/ELF64 Execution & Cooperative Scheduling** (see validation limits)
-- [ ] **Phase 3.5: Kernel Hardening & Architecture Validation** ([in progress](docs/09-phase3.5-kernel-hardening.md))
-- [ ] **Phase 4: NT Executive Subsystem & Win32 Userland** (Relocations, IAT, DirectX/Vulkan bridge)
-- [ ] **Phase 5: Native GPU Acceleration (DRM/KMS) & Anti-Cheat Research Lab**
+See the [authoritative roadmap](docs/04-roadmap-and-phases.md) for dependency gates, phase acceptance criteria and evidentiary limits.
+
+- [x] **Phase 0** — PE32+/ELF64 loader and routing prototype (host tests)
+- [x] **Phase 1** — UEFI/GOP boot demonstration (QEMU/OVMF)
+- [x] **Phase 2** — Minimal freestanding ELF64 Ring 3 and syscall demonstration (QEMU)
+- [x] **Phase 3** — Freestanding dual PE32+/ELF64 cooperative execution (QEMU)
+- [ ] **Phase 3.5** — kernel hardening and architecture validation (**open**)
+- [x] **Phase 3.6** — targeted MSVC-compiled WDM driver Ring 0 PoC (not general driver support)
+- [ ] **Phase 3.7** — W^X, real interrupt-aware IRQL, broader third-party driver tests
+- [ ] **Phase 4+** — executive, storage, runtimes, graphics, hardware and real applications (planned)
+
+**Graphical interface decision:** **Nexus Shell** uses the **Niri compositor + iNiR Shell**, ported/adapted to Nexus APIs (Wayland, Qt/QML/Quickshell integration); **not running yet**. See the [architecture](docs/03-system-architecture.md) and [graphics feasibility review](docs/06-drm-kms-feasibility-revision.md).
+
+**Update strategy:** **Nexus Update** uses signed A/B system images, independent boot fallback, offline USB updates before sustained physical installation, and eventually GitHub Releases OTA with Nightly/Beta/Stable channels. See the [detailed OTA plan](docs/12-nexus-update-architecture.md). **No updater is implemented yet.**
+
+**Project success criterion:** legitimate online **League of Legends and VALORANT** gameplay on Nexus OS with Riot Vanguard accepted, on real hardware and with no Windows installation, VM or evasion. This is **not yet demonstrated** and is subject to Riot acceptance beyond binary compatibility.
 
 ---
 
