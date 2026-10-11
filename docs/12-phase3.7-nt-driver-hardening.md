@@ -1,164 +1,85 @@
 # Nexus OS — Fase 3.7: NT Driver Runtime Hardening
 
 **Documento:** `docs/12-phase3.7-nt-driver-hardening.md`  
-**Status:** Concluído e Verificado em Hardware Real / QEMU / OVMF  
-**Data:** Outubro de 2026  
-**Autores:** Nexus OS Core Architecture Group  
+**Status:** **Aberta.** Escopo revisado formalmente em 2026-10-11 (seção 2). Parte dos critérios já tem evidência em **QEMU/OVMF**; faltam a validação com o WDK oficial (PR-5) e o alinhamento das structs NT ao WDK real (PR-6).  
+**Evidência:** somente **guest QEMU/OVMF emulado (TCG)** e testes de host no CI. **Nada foi verificado em hardware físico.**  
+**Data:** Outubro de 2026
+
+> **Revisão de 2026-10-11.** A versão anterior deste documento dizia "Concluído e Verificado em Hardware Real", "IRQLs de Hardware Reais… mascarando interrupções no nível de silício", "driver WDM autêntico… sem adaptações do Nexus" e "23 rotinas validadas". A auditoria de encerramento (`docs/13-auditoria-fases-3.5-3.7.md`) mostrou que essas afirmações **não tinham evidência**: nunca houve teste em hardware físico; o kernel roda com interrupções desabilitadas e sem APIC, então o CR8 não tem o que mascarar; as structs NT das fixtures são escritas à mão e divergem do `wdm.h` real; e eventos e esperas eram stubs. Este documento foi reescrito para refletir só o que está provado. A versão anterior continua no histórico do Git.
 
 ---
 
-## 1. Sumário Executivo
+## 1. O que está provado hoje (QEMU/OVMF + testes de host, CI verde)
 
-A **Fase 3.7 (NT Driver Runtime Hardening)** consolidou a segurança, o isolamento e o determinismo do subsistema de drivers Windows NT (`nexus-loader` e `nexus-kernel`), eliminando simulações e implementando garantias arquiteturais rígidas de nível de hardware:
+Cada item abaixo é exigido pelo runner `scripts/test-hardening.py` ou por testes de host que falham se a correção for revertida. As mutações que provam isso estão registradas no doc 13, §10.
 
-1. **Eliminação de Páginas RWX Persistentes (Strict W^X Enforcement):** O kernel e o loader não permitem mais nenhuma página com permissões de leitura, escrita e execução simultâneas. Seções executáveis (`.text`) são estritamente `PAGE_EXECUTE_READ` (RX), seções de dados mutáveis (`.data`, `INIT`) são `PAGE_READWRITE | PAGE_NO_EXECUTE` (RW), e cabeçalhos PE/dados constantes (`.rdata`, `.pdata`) são `PAGE_READONLY | PAGE_NO_EXECUTE` (RO).
-2. **IRQLs de Hardware Reais via CR8 (Local APIC TPR):** Abandonou-se qualquer modelo baseado em variáveis atômicas de software. No modo longo x86_64, as elevações de IRQL (`KeRaiseIrql`, `KeLowerIrql`) atuam diretamente sobre o registrador `CR8` (Task Priority Register do Local APIC), mascarando interrupções no nível de silício.
-3. **Invariante do Escalonador de Threads:** Implementou-se a regra arquitetural fundamental do Windows NT: **em `DISPATCH_LEVEL` (IRQL 2) ou superior, o escalonador é terminantemente proibido de realizar preempção ou troca de contexto de threads**.
-4. **Validação de Driver WDM Autêntico e Externo (`standard_wdm.sys`):** Compilado via MSVC 2022 sem quaisquer convenções ou adaptações proprietárias do Nexus OS, utilizando cabeçalhos WDM padrão, pools de memória non-paged, spinlocks e eventos de sincronização.
-5. **Infraestrutura WDM Expandida no `ntoskrnl`:** Implementação e validação de 23 rotinas essenciais do executivo NT, incluindo `ExAllocatePoolWithTag`, `ExFreePoolWithTag`, `KeInitializeSpinLock`, `KeAcquireSpinLock`, `KeReleaseSpinLock`, `KeInitializeEvent`, `KeSetEvent`, `KeResetEvent`, `KeWaitForSingleObject`, `RtlCopyMemory`, `RtlZeroMemory` e `RtlCompareMemory`.
-6. **Auditoria Adversarial e Prova de Proteção de Hardware:** A ativação do bit `CR0.WP` (Supervisor Write Protect) foi comprovada de forma inequívoca em Ring 0: qualquer tentativa de modificação em páginas marcadas como Read-Only gera imediatamente a exceção arquitetural `#PF` (Vector 14, Error Code 0x3).
-
----
-
-## 2. Eliminação de RWX e Aplicação Estrita de W^X
-
-Na Fase 3.6, o carregamento inicial de drivers utilizava buffers temporários RWX para acomodar a aplicação de relocations DIR64 e resolução de imports. Na Fase 3.7, esse modelo foi completamente desativado.
-
-### 2.1 Ciclo de Proteção Transacional
-1. **Alocação e Escrita (Fase de Carregamento):** O buffer da imagem do driver é alocado inicialmente com permissões `RW` (sem permissão de execução).
-2. **Relocations e Imports:** As tabelas de importação (IAT) e as correções de endereço base são aplicadas na memória gravável.
-3. **Enforcement Transacional de W^X:** Imediatamente antes de invocar a rotina `DriverEntry`, a função `LoadedDriver::enforce_wx_protection` itera sobre a tabela de seções do PE32+ e ajusta as permissões de cada página de 4 KiB:
-   * **Seção de Código (`.text`):** Configurada como `PRESENT`, `USER=0`, `WRITABLE=0`, `NO_EXECUTE=0` (RX puro).
-   * **Seção de Dados (`.data`, `INIT`):** Configurada como `PRESENT`, `USER=0`, `WRITABLE=1`, `NO_EXECUTE=1` (RW puro com bit NX ativo).
-   * **Cabeçalhos PE e Constantes (`.rdata`, `.pdata`):** Configurados como `PRESENT`, `USER=0`, `WRITABLE=0`, `NO_EXECUTE=1` (RO puro).
-4. **Garantia Invariante:** Em nenhum momento durante ou após a execução do driver existe qualquer página que seja simultaneamente `WRITABLE` e executável (`NO_EXECUTE=0`).
-
----
-
-## 3. Gerenciamento Real de IRQLs via CR8 e Invariante de Escalonamento
-
-### 3.1 Registrador de Hardware CR8 (APIC TPR)
-No modelo AMD64/Intel 64, o registrador `CR8` mapeia diretamente os 4 bits de prioridade do Task Priority Register (TPR) do Local APIC.
-
-* `CR8 = 0`: `PASSIVE_LEVEL` / `APC_LEVEL` — Todas as interrupções habilitadas.
-* `CR8 = 2`: `DISPATCH_LEVEL` — Interrupções de menor prioridade suprimidas; preempção proibida.
-* `CR8 >= 12`: `DEVICE_IRQL` (DIRQL) — Interrupções de barramento de hardware mascaradas.
-* `CR8 = 15`: `HIGH_LEVEL` — Todas as fontes mascaradas.
-
-No Nexus OS, foram criados ganchos atômicos que ligam as stubs de `ntoskrnl` diretamente às instruções de máquina:
-```rust
-mov cr8, reg
-mov reg, cr8
-```
-
-### 3.2 Bloqueio de Preempção no Escalonador
-O escalonador cooperativo do Nexus OS (`crates/nexus-kernel/src/task/mod.rs`) agora verifica explicitamente o IRQL de hardware:
-```rust
-if crate::arch::x86_64::read_cr8_irql() >= nexus_types::driver::DISPATCH_LEVEL {
-    return Err(ProcessError::UnsupportedExecution);
-}
-```
-Se uma rotina de driver ou DPC elevar o IRQL para `DISPATCH_LEVEL`, qualquer tentativa de ceder o processador ou chavear processos é bloqueada por violação de invariante de integridade.
-
----
-
-## 4. O Driver WDM Autêntico (`standard_wdm.sys`)
-
-Para eliminar o risco de acoplamento entre o kernel Nexus e drivers sintetizados especificamente para testes, foi criado um driver WDM 100% puro:
-
-* **Arquivo-fonte:** `tests/fixtures/nt_driver/standard_wdm.c`
-* **Compilação:** Microsoft Visual C++ 2022 (`cl.exe /kernel /O2 /GS-` + `link.exe /SUBSYSTEM:NATIVE /DRIVER`)
-* **Tamanho binário:** 5.120 bytes (alinhado a seções de 4.096 bytes)
-* **Funcionalidades validadas:**
-  1. `DriverEntry`: Criação dinâmica de `DEVICE_OBJECT` com extensão de dispositivo alocada via Non-Paged Pool.
-  2. `ExAllocatePoolWithTag`: Alocação com tag `0x4C4F4F50` ('POOL'), verificação de integridade e desalocação com verificação de tag.
-  3. `KeAcquireSpinLock` e `KeReleaseSpinLock`: Elevação segura de IRQL para `DISPATCH_LEVEL` (`CR8=2`), incremento protegido de variáveis de sincronização e restauração segura para `PASSIVE_LEVEL`.
-  4. `KeInitializeEvent`, `KeSetEvent` e `KeWaitForSingleObject`: Sincronização por eventos NT.
-  5. `IRP_MJ_READ`: Cópia segura de buffer com validação estrita de tamanho na pilha de I/O (`CurrentStackLocation->Parameters.DeviceIoControl.OutputBufferLength`).
-  6. `DriverUnload`: Liberação ordenada de todos os pools, cancelamento de vínculos e destruição do objeto de dispositivo.
-
----
-
-## 5. Tabela Completa de Exportações WDM Implementadas (`ntoskrnl`)
-
-| Símbolo Exportado | Status na Fase 3.7 | Descrição e Validação |
+| Item | Evidência | PR |
 | :--- | :--- | :--- |
-| `DbgPrint` | Validado | Redirecionamento serial COM1 / Framebuffer |
-| `IoCreateDevice` | Validado | Alocação de `DEVICE_OBJECT` e extensão |
-| `IoDeleteDevice` | Validado | Destruição e desacoplamento do device |
-| `IoCreateSymbolicLink` | Validado | Criação de enlace em `\DosDevices` |
-| `IoDeleteSymbolicLink` | Validado | Remoção segura de enlace |
-| `IoCompleteRequest` | Validado | Conclusão síncrona e preenchimento de `IoStatus` |
-| `KeGetCurrentIrql` | Validado | Leitura direta do registrador de hardware CR8 |
-| `KeRaiseIrql` | Validado | Elevação via `CR8` e armazenamento de `OldIrql` |
-| `KeLowerIrql` | Validado | Restauração atômica do registrador `CR8` |
-| `RtlInitUnicodeString` | Validado | Inicialização de `UNICODE_STRING` UTF-16LE |
-| `ExAllocatePoolWithTag` | Validado | Alocação alinhada (16 bytes) com tag de 32 bits |
-| `ExFreePoolWithTag` | Validado | Verificação de integridade e desalocação segura |
-| `ExFreePool` | Validado | Desalocação padrão NT |
-| `RtlCopyMemory` | Validado | Cópia segura de memória de modo kernel |
-| `RtlZeroMemory` | Validado | Zeramento rápido de buffers de supervisor |
-| `RtlCompareMemory` | Validado | Comparação determinística de buffers |
-| `KeInitializeSpinLock` | Validado | Inicialização de trava atômica `KSPIN_LOCK` |
-| `KeAcquireSpinLock` | Validado | Elevação a `DISPATCH_LEVEL` e aquisição atômica |
-| `KeReleaseSpinLock` | Validado | Liberação de trava e restauração de IRQL |
-| `KeInitializeEvent` | Validado | Inicialização de evento de notificação/sincronização |
-| `KeSetEvent` | Validado | Sinalização de evento com suporte a waiters |
-| `KeResetEvent` | Validado | Redefinição do estado de sinalização |
-| `KeWaitForSingleObject` | Validado | Espera determinística em Ring 0 |
+| **W^X nas imagens de driver.** `.text` RX; cabeçalhos, `.rdata` e `.pdata` RO+NX; `.data`/`INIT` RW+NX; nenhuma página W+X e nenhuma página USER. | O kernel relê o PTE efetivo de **cada** página das 3 fixtures e exige a contagem exata derivada das tabelas de seção: `NEXUS_DRIVER_WX:pages_verified=17:expected=17` (`NEXUS_CHECK:driver-wx`). No host Linux, `/proc/self/maps`. | #5, #6 |
+| **Loader fail-closed.** Erros de relocação e de import, seções fora da imagem, seção W+X, `SectionAlignment < 4096` e imagens com `RELOCS_STRIPPED` que precisariam de rebase são recusados. | `crates/nexus-loader/tests/driver_fail_closed.rs`; guest `NEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected`. | #4 |
+| **Relocações DIR64.** | Fixture `reloc_driver.sys` (3 entradas DIR64, recompilada e conferida byte a byte por `scripts/build-reloc-driver.py --check`); guest `NEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0`. | #4 |
+| **Ciclo de vida do driver sem vazamento.** `unload()` falha com `DevicesLeaked`, `PoolLeaked` ou `PoolViolations`; o heap do kernel volta exatamente ao valor anterior em cada um dos 3 ciclos. | `NEXUS_CHECK:driver-lifecycle`; testes de controle negativo no host. | #5 |
+| **Semântica NT mínima** (14 verificações em Ring 0): direção do IRQL e limite `HIGH_LEVEL` (bugchecks 0x09/0x0A); `KeAcquireSpinLock` acima de DISPATCH; auto-reset de `SynchronizationEvent`; `NotificationEvent` continua sinalizado; espera infinita não satisfazível gera bugcheck em vez de `STATUS_TIMEOUT`; tag de pool errada e double free (0xC2); extensão de device zerada; remoção de device em qualquer posição; `IoDeleteDevice` inválido (exclusão dupla ou ponteiro estranho) gera bugcheck sem liberar nada; o esgotamento do registro de pool é contado e registrado. | `NEXUS_CHECK:nt-semantics` + `NEXUS_NT_SEMANTICS:checks=14`, com o heap do kernel balanceado; um bugcheck no guest sai com status 39. | #6 |
+| **Roteamento IRQL → CR8.** `KeRaiseIrql`/`KeLowerIrql`/spin locks escrevem e leem o CR8 (TPR) de verdade; o escalonador cooperativo recusa o despacho com CR8 ≥ DISPATCH_LEVEL em `Scheduler::run_all`. | Linha do guest: "CR8 (TPR) read/write round-trip and KeRaise/LowerIrql -> CR8 routing verified (no interrupt masking…)"; teste de host com hooks falsos. | #5 |
+| **CR0.WP habilitado** no init do kernel. | `arch/x86_64/mod.rs` (bit 16 do CR0). A falta em escrita numa página RX de driver (`#PF error=0x3`) só foi observada pela sonda descartável da auditoria (doc 13, §6.3); **ainda não há teste versionado** disso. | — |
 
----
+## 2. Revisão formal do escopo
 
-## 6. Evidências de Execução em Hardware / QEMU
+O roadmap original exigia, para a 3.7, "real IRQ/APIC IRQL semantics". **Decisão (2026-10-11):** a integração real de IRQL com interrupções foi **transferida para a Fase 4**. Na 3.7, o IRQL é definido como:
 
-Registro do console serial extraído do teste automatizado sob QEMU e firmware OVMF (`build/hardening-128-qemu64-debug/serial.log`):
+> **IRQL na 3.7 = valor de software validado (direção, limites e bugchecks) e roteado para o CR8/TPR, sem nenhuma fonte de interrupção mascarável.** O kernel roda com RFLAGS.IF = 0, sem LAPIC/IOAPIC inicializados, sem PIC remapeado e sem vetores de IRQ ≥ 32. Portanto **não existe mascaramento de interrupções por hardware** e **não existe gerenciamento completo de IRQL**. Isso **não é equivalente ao Windows**.
 
-```text
-============================================================
- NEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified
-============================================================
-------------------------------------------------------------
-[*] Milestone 4: Windows NT Driver Compatibility Validation (Ring 0)...
-------------------------------------------------------------
-[*] Initializing NT Driver Host Subsystem...
-[+] Hardware CR8 / TPR IRQL hooks installed into NT Driver Host
-[*] Loading MSVC-compiled WDM Driver (nexus_driver.sys)...
-[+] Driver Image Mapped: Base 0x0000000005D4A000, EntryPoint 0x0000000005D4B000, Size 24576 bytes
-[+] Driver sections protected with strict W^X (RX code, RW data, RO headers)
-[+] DriverEntry executed successfully in Ring 0 (STATUS_SUCCESS)
-[+] DeviceObject dynamically created and registered at 0x5d49828
-[+] IRP_MJ_CREATE dispatched and completed successfully
-[+] IOCTL_NEXUS_GET_VERSION verified: Driver Version 0x00030600
-[+] IOCTL_NEXUS_RAISE_IRQL_TEST verified: IRQL hardware elevation/restoration (0x1337C0DE)
-[+] IRP_MJ_READ verified: Driver payload 'NEXUS_OS_WDM_READ_SUCCESS'
-[+] DriverUnload executed cleanly: DeviceObject freed
-[*] Loading Authentic Standard WDM Driver (standard_wdm.sys)...
-[+] Standard WDM sections protected with strict W^X (RX code, RW data, RO headers)
-[+] Standard WDM DriverEntry initialized successfully: DeviceObject at 0x5d49a58
-[+] Non-Paged Pool allocation and memory verification verified (0x504F4F4C)
-[+] SpinLock synchronization and hardware CR8 IRQL elevation verified (counter = 101)
-[+] KEvent signaling and synchronization verified (0xCAFEFEED)
-[+] Standard WDM IRP_MJ_READ verified: 'STANDARD_WDM_DEVICE_PAYLOAD'
-[+] Standard WDM DriverUnload executed cleanly: DeviceObject destroyed and pools freed
-[+] Hardware CR8 Task Priority Register (TPR) verified at Ring 0
-============================================================
- NEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0
-============================================================
- NEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0
-============================================================
+### Critérios para encerrar a 3.7 (ainda pendentes)
+
+1. **PR-5 — validação com o WDK oficial:** um job `windows-latest` recompila os drivers de teste a partir do fonte com os cabeçalhos oficiais do WDK e gera uma tabela de `sizeof`/`offsetof` das structs NT principais (`DRIVER_OBJECT`, `DEVICE_OBJECT`, `IRP`, `IO_STACK_LOCATION`, `KEVENT`…). Hoje isso está **bloqueado**: o token usado não tem permissão para alterar workflows.
+2. **PR-6 — alinhamento das structs:** `nexus-types` e as fixtures passam a usar os layouts do WDK real (doc 13, achado C4), com asserções estáticas de offset, e um driver compilado com os cabeçalhos reais carrega e executa no guest (achado A4, `IofCompleteRequest` e afins).
+3. CI verde nos 5 jobs depois do PR-5 e do PR-6.
+
+Até lá, a 3.7 **não está encerrada**. O marcador serial `NEXUS_PHASE3_7_SUCCESS`, impresso pelo kernel, tem nome histórico: ele só indica que os checks acima passaram nesta execução, **não** que a fase foi encerrada.
+
+### Itens transferidos explicitamente para a Fase 4
+
+| Item | Por que não cabe na 3.7 |
+| :--- | :--- |
+| **IRQL real com APIC e mascaramento de interrupções:** LAPIC (SVR, timer), IOAPIC, PIC mascarado ou remapeado, vetores ≥ 32, IF=1, um teste em que uma interrupção fica pendente com TPR ≥ classe e é entregue ao baixar o TPR, e a checagem de CR8 também em `run_user_process` (doc 13, B1). | Exige o subsistema de interrupções e de timers da Fase 4 (doc 13, C5). |
+| **Spin lock do `PoolTracker` elevando para `DISPATCH_LEVEL` ou desabilitando interrupções.** Hoje é um `AtomicBool` simples, correto só enquanto nenhum ISR ou DPC aloca pool. | Quando ISRs/DPCs puderem alocar, uma interrupção no meio de `ExAllocatePoolWithTag` causaria deadlock. |
+| **Esperas reais com threads e timers:** `KeWaitForSingleObject` bloqueando, lista de waiters, `KeSetEvent` acordando threads e timeouts com passagem de tempo real. | Hoje não há threads de kernel nem timer: espera infinita não satisfazível gera o bugcheck `0x4E580001` e um timeout finito retorna `STATUS_TIMEOUT` imediatamente. |
+| **Reuso de endereço de device e contagem de referências.** O registro de devices vivos (PR #6) identifica o device pelo endereço. Se um device é excluído e um novo `IoCreateDevice` reutiliza o mesmo endereço, um ponteiro antigo passa a apontar para o novo device e é aceito (problema ABA). O NT resolve isso com contagem de referências no gerenciador de objetos (`ObReferenceObject`/`ObDereferenceObject`, exclusão adiada até a última referência). | Exige o gerenciador de objetos e handles da Fase 4. |
+
+## 3. Limitações conhecidas (estado atual)
+
+- **Structs NT escritas à mão**, que divergem do `wdm.h` real (doc 13, C4). As fixtures `nexus_driver.c` e `standard_wdm.c` são compiladas com MSVC, mas usam essas definições próprias do Nexus. **Não** são drivers "WDM autênticos com cabeçalhos padrão". Um driver compilado com os cabeçalhos reais ainda não carrega (A4).
+- Os `.sys` MSVC versionados não são recompilados no CI. Só a fixture de relocações (clang + lld-link) é conferida byte a byte.
+- `DbgPrint` não imprime; `IoCreateSymbolicLink`/`IoDeleteSymbolicLink` são no-ops; `IoCompleteRequest` não tem rotinas de conclusão; não há I/O manager, `IoCallDriver` nem `DriverExtension` (doc 13, §5).
+- Os códigos `0x09`, `0x0A` e `0xC2` são códigos do Windows. Já os subcódigos de `0xC2` e os códigos `0x4E580001` (espera infinita não satisfazível) e `0x4E580002` (`IoDeleteDevice` inválido) são **específicos do Nexus**.
+- Todo pool é non-paged. Não há paginação de modo kernel.
+- Um único CPU, escalonador cooperativo, sem SMP: nenhum teste de concorrência real.
+
+## 4. Exportações `ntoskrnl` implementadas (superfície de teste, não compatibilidade)
+
+"Testado" significa que existe um teste de host ou de guest que exercita a rotina com as structs do Nexus. **Não** significa compatibilidade com o comportamento do Windows.
+
+| Rotina | Estado |
+| :--- | :--- |
+| `IoCreateDevice` / `IoDeleteDevice` | Testado: extensão zerada, remoção em qualquer posição, bugcheck em exclusão inválida. Sem nome, sem modo exclusivo, sem contagem de referências. |
+| `KeGetCurrentIrql` / `KeRaiseIrql` / `KeLowerIrql` | Testado: direção e limites com bugcheck; roteamento para o CR8. **Sem** mascaramento de interrupções. |
+| `KeInitializeSpinLock` / `KeAcquireSpinLock` / `KeReleaseSpinLock` | Testado em um único CPU, com IF=0. |
+| `KeInitializeEvent` / `KeSetEvent` / `KeResetEvent` / `KeWaitForSingleObject` | Testado: auto-reset, notification, espera infinita gera bugcheck, timeout finito imediato. **Não bloqueia** (sem threads ou timers). |
+| `ExAllocatePoolWithTag` / `ExFreePoolWithTag` / `ExFreePool` | Testado: registro de blocos vivos, bugcheck 0xC2 em tag errada ou double free, esgotamento contado. |
+| `IoCompleteRequest`, `RtlInitUnicodeString`, `RtlCopyMemory`, `RtlZeroMemory`, `RtlCompareMemory` | Exercitados pelas fixtures; semântica mínima. |
+| `DbgPrint`, `IoCreateSymbolicLink`, `IoDeleteSymbolicLink` | No-ops. |
+
+## 5. Como reproduzir
+
+```bash
+cargo test --locked --workspace
+python3 scripts/test-hardening-runner.py
+cargo build --locked -p nexus-boot --target x86_64-unknown-uefi
+python3 scripts/test-hardening.py --ram 256 --cpu max --timeout 120   # exige QEMU + OVMF
 ```
 
-Resultado verificado de saída:
-```text
-QEMU/OVMF assertions and exit status verified: RAM=128 MiB CPU=qemu64 release=False (isa-debug-exit: 33)
-```
+A evidência versionada são os artefatos `hardening-*` de cada execução do GitHub Actions. O registro das correções e das mutações está em `docs/13-auditoria-fases-3.5-3.7.md`, §10.
 
----
+## 6. Sem declarações de compatibilidade
 
-## 7. Limitações Conhecidas e Escopo Não Suportado
-
-> [!IMPORTANT]
-> **Isenção de Responsabilidade Técnica (Disclaimers Mandatórios):**
-> 1. **Não declaração de compatibilidade geral:** O sucesso na execução dos drivers `nexus_driver.sys` e `standard_wdm.sys` comprova a viabilidade dos mecanismos fundamentais da ABI NT (PE loader, relocations, IAT, IRPs, IRQL via CR8, Pools, SpinLocks e W^X). Isso **NÃO** significa nem declara compatibilidade geral com o ecossistema de drivers comerciais Windows.
-> 2. **Não declaração de compatibilidade com o Vanguard:** Drivers complexos como o `vgk.sys` exigem subsistemas adicionais massivos (Minifilters via `fltmgr.sys`, Callbacks de Objeto via `ObRegisterCallbacks`, gerenciamento avançado de MDLs, estruturas opacas `EPROCESS`/`KTHREAD`, e atestação remota de hardware via TPM 2.0 / PCR 7). A execução de drivers simplificados não atenua esses requisitos externos.
-> 3. **Páginas Paged Pool:** Atualmente todos os pools são alocados em memória não paginável física. Paginação sob demanda de modo kernel (Paged Pool swap out) não está implementada nesta fase.
+Nada aqui declara compatibilidade com Windows, com drivers comerciais, com Linux ou com o Vanguard. Drivers como o `vgk.sys` exigem subsistemas que o Nexus não tem (minifilters, callbacks de objeto, MDLs, `EPROCESS`/`KTHREAD`, atestação TPM), além da aceitação do fornecedor.

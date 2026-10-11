@@ -22,11 +22,11 @@ This is the **current planning source of truth**. Detailed implementation report
 | **1 — UEFI boot** | QEMU/OVMF startup and basic PMM/IDT/GDT | Experimental; not tested as broadly installable physical hardware |
 | **2 — Ring 3 ELF execution** | Guest syscall, exit and supervisor memory-fault tests | Minimal freestanding ELF support; not a complete Linux ABI |
 | **3 — Dual PE32+/ELF64** | Interleaved guest processes and cooperative yields | Test binaries only; preemption, SMP, runtimes and real-world apps missing |
-| **3.5 — Kernel hardening** | [Audit and confirmed defects](09-phase3.5-kernel-hardening.md) | **Open gate** until repairs, adversarial tests and independent verification are recorded |
-| **3.6 — NT WDM driver PoC** | [MSVC-built .sys](11-phase3.6-nt-driver-validation.md) executed in QEMU Ring 0; I/O and unload | **PoC achieved**, not arbitrary .sys support; persistent RWX mapping and simulated IRQL behavior require remediation |
-| **3.7 — NT runtime hardening** | Not yet demonstrated | **Next gated work:** enforce W^X, real IRQ/APIC IRQL semantics, external driver fixtures, concurrency and teardown checks |
+| **3.5 — Kernel hardening** | [Closure criteria and evidence](09-phase3.5-kernel-hardening.md); [audit](13-auditoria-fases-3.5-3.7.md) | **Closed (2026-10-11)** in QEMU/OVMF + CI: audited defects fixed with regression tests, CI green on 5 jobs after PRs #3–#6. No physical-hardware evidence; toolchain pinned to 1.98.0 (issue #2) |
+| **3.6 — NT WDM driver PoC** | [MSVC-built .sys](11-phase3.6-nt-driver-validation.md) executed in QEMU Ring 0; I/O and unload | **PoC achieved** with Nexus-defined NT structs, not arbitrary .sys support. RWX mapping and silent leaks were fixed in 3.7 work (PRs #4–#6) |
+| **3.7 — NT runtime hardening** | [Revised scope](12-phase3.7-nt-driver-hardening.md): PTE-verified W^X (exact page count), fail-closed loader + DIR64 fixture, leak-checked lifecycles, 14 Ring 0 NT-semantics checks with bugchecks (PRs #4–#6) | **Open.** Remaining: official-WDK rebuild + `sizeof`/`offsetof` table (PR-5, blocked on CI workflow permission) and struct alignment to the real `wdm.h` (PR-6). IRQL = software-validated value routed to CR8 **without interrupt masking**; interrupt-aware IRQL moved to Phase 4 |
 
-Do not mark 3.5 or 3.7 complete just because 3.6 reported success. See the [Vanguard study](10-vanguard-feasibility-study.md) for claims requiring explicit evidence.
+3.5 was closed on explicit criteria, not because 3.6 reported success. Do not mark 3.7 complete until PR-5 and PR-6 land with green CI. See the [Vanguard study](10-vanguard-feasibility-study.md) for claims requiring explicit evidence.
 
 ## Critical path: kernel to first physical installation
 
@@ -34,15 +34,16 @@ Do not mark 3.5 or 3.7 complete just because 3.6 reported success. See the [Vang
 
 1. Fix documented user pointer access permissions, kernel/user isolation, page ownership, memory cleanup, context saving, trapping and test-harness false positives.
 2. Transition driver mapping to **W^X** (temporary staging followed by executable read-only code and writable non-executable data); reject incompatible sections instead of defaulting to RWX.
-3. Model NT IRQL with true interrupt masking/prioritization, per-CPU state, DPCs and synchronization, not an atomic integer alone.
-4. Test a WDM driver independently built from public WDK samples in the actual guest, including unload/reload, failures and malformed requests.
+3. ~~Model NT IRQL with true interrupt masking~~ **Moved to Phase 4 (Gate E).** 3.7 enforces IRQL direction/limits with bugchecks and routes IRQL to CR8, without interrupt sources.
+4. Rebuild the test drivers with the official WDK headers in CI, generate a `sizeof`/`offsetof` table for key NT structs, and align `nexus-types` and fixtures to it (PR-5, PR-6); then run a WDK-built driver in the guest, including unload/reload, failures and malformed requests.
 5. Differentiate guest evidence, host tests, hardware tests, and unverified statements; maintain strict negative tests.
 
-**Exit:** reproducible QEMU guest tests plus a written limitations and security audit. No assertion of compatibility with Vanguard.
+**Exit:** reproducible QEMU guest tests plus a written limitations and security audit ([doc 13](13-auditoria-fases-3.5-3.7.md)). No assertion of compatibility with Vanguard. Status: 3.5 closed; 3.7 open pending items 4 above.
 
 ### Gate E — Core executive & device foundations (Phase 4)
 
 - Preemptive single-core scheduling before SMP; per-thread context, FPU/SIMD, locks, interrupt routing, timers, cancellation, object lifetimes and handles.
+- **Transferred from 3.7:** real IRQL with LAPIC/IOAPIC, PIC masking, IRQ vectors and IF=1, with a test that a pending interrupt is held while TPR ≥ its class and delivered when TPR is lowered (plus the CR8 check in `run_user_process`); the NT pool-registry spin lock must raise to `DISPATCH_LEVEL` or disable interrupts once ISRs/DPCs can allocate; blocking `KeWaitForSingleObject` with waiter lists, wake-ups and real timeouts; device-object reference counting so a reused device address cannot be mistaken for a stale pointer (`ObReferenceObject`-style deferred deletion).
 - Hardware discovery (ACPI/PCIe), block-device interfaces, DMA/IOMMU and IRQ APIs. VFS, initial FAT32/GPT support, durable flush and mount semantics.
 - Production-style process lifecycle, IPC and basic user services needed by the update agent and display stack.
 - **Exit:** crash-resistant multi-process test suite and persistent read/write on a QEMU block device with power-loss fault injection.
@@ -119,7 +120,9 @@ Do not mark 3.5 or 3.7 complete just because 3.6 reported success. See the [Vang
 - [System architecture](03-system-architecture.md)
 - [Kernel feasibility](02-kernel-feasibility-study.md)
 - [GPU dependency analysis](06-drm-kms-feasibility-revision.md)
-- [Fase 3.5 hardening audit](09-phase3.5-kernel-hardening.md)
+- [Fase 3.5 hardening (closed)](09-phase3.5-kernel-hardening.md)
+- [Fase 3.7 NT driver hardening (open, revised scope)](12-phase3.7-nt-driver-hardening.md)
+- [Fases 3.5/3.7 closure audit](13-auditoria-fases-3.5-3.7.md)
 - [Vanguard feasibility](10-vanguard-feasibility-study.md)
 - [Phase 3.6 driver demonstration](11-phase3.6-nt-driver-validation.md)
 - [Nexus Update detailed design](12-nexus-update-architecture.md)
