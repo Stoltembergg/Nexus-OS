@@ -1,150 +1,125 @@
-# Nexus OS Roadmap & Implementation Phases
+# Nexus OS — Roadmap and Implementation Gates
 
-The development of Nexus OS is structured into incremental, verifiable phases. Each phase establishes a functional, reproducible milestone on real hardware/QEMU before advancing.
+**Updated:** 2026-10-11  
+**Scope:** experimental hybrid NT/Linux kernel, Nexus Shell, hardware enablement, and secure OTA updates.  
+**Status rule:** a passing host test is not evidence of guest Ring 0 execution; a QEMU result is not proof of real-hardware compatibility; a laboratory driver is not general NT driver support.
 
----
+This is the **current planning source of truth**. Detailed implementation reports (Phases 0–3.6) remain historical evidence, including known limits, and are not retroactively reclassified as production ready.
 
-> Phase 3.5 is now the active gate before Phase 4. Earlier "Done" milestones refer to their original limited demonstrations; [the hardening report](09-phase3.5-kernel-hardening.md) supersedes broad validation claims and records remaining blockers.
+## Product contract
 
-## Phase Overview
+- **One independent Nexus kernel**, with NT PE32+ and Linux ELF64 personalities sharing a core executive. No second Linux kernel, Windows guest, or VM-based application execution in the product.
+- **Nexus Shell = Niri compositor + iNiR Shell**, adapted through explicit Nexus graphics/input/IPC APIs. Qt/QML/Quickshell and Wayland ports are research and implementation tasks, not functional dependencies today.
+- **Nexus Update** will distribute signed A/B system images, initially offline and eventually from GitHub Releases. The updater is mandatory **before** sustained SSD installation; see [OTA architecture](12-nexus-update-architecture.md).
+- **League of Legends and VALORANT with legitimate Riot Vanguard support** is the mandatory **project-success criterion**, not a feature promised by current engineering demos. Vendor acceptance is an independent external gate. Never bypass, falsify, or camouflage anti-cheat integrity checks.
+- Hardware drivers cannot be assumed to load unchanged from Linux. Evaluate ports, stable driver classes, and vendor-device ownership explicitly. GPU acceleration is an unresolved research track; see [DRM/KMS review](06-drm-kms-feasibility-revision.md).
 
-```
-+--------------------------------------------------------------------------+
-| Phase 0: Specifications, Architecture & Minimal Dual Loader PoC (Done)   |
-+--------------------------------------------------------------------------+
-                                    |
-                                    v
-+--------------------------------------------------------------------------+
-| Phase 1: Bare-Metal UEFI Bootloader & Microkernel Initialization (Done)  |
-+--------------------------------------------------------------------------+
-                                    |
-                                    v
-+--------------------------------------------------------------------------+
-| Phase 2: Real Process Execution, VMM Isolation & Ring 3 Syscalls (Done)  |
-+--------------------------------------------------------------------------+
-                                    |
-                                    v
-+--------------------------------------------------------------------------+
-| Phase 3: Unified PE32+ / ELF64 Execution & Cooperative Scheduling (Done) |
-+--------------------------------------------------------------------------+
-                                    |
-                                    v
-+--------------------------------------------------------------------------+
-| Phase 3.5: Kernel Hardening & Architecture Validation (In progress)    |
-+--------------------------------------------------------------------------+
-                                    |
-                                    v
-+--------------------------------------------------------------------------+
-| Phase 4: Multi-Threaded Executive, In-Memory VFS & Dynamic Runtimes      |
-+--------------------------------------------------------------------------+
-                                    |
-                                    v
-+--------------------------------------------------------------------------+
-| Phase 5: NT Subsystem, Object Handles & Win32 Userland Integration       |
-+--------------------------------------------------------------------------+
-                                    |
-                                    v
-+--------------------------------------------------------------------------+
-| Phase 6: Hardware Acceleration (Vulkan/DRM) & Anti-Cheat Research Lab   |
-+--------------------------------------------------------------------------+
-```
+## Demonstrated progress versus maturity
 
----
+| Milestone | Recorded evidence | Actual maturity / open gates |
+| --- | --- | --- |
+| **0 — Research + PE/ELF parser PoC** | Host parsing, loader and syscall routing tests | Prototype; no general application ABI compatibility |
+| **1 — UEFI boot** | QEMU/OVMF startup and basic PMM/IDT/GDT | Experimental; not tested as broadly installable physical hardware |
+| **2 — Ring 3 ELF execution** | Guest syscall, exit and supervisor memory-fault tests | Minimal freestanding ELF support; not a complete Linux ABI |
+| **3 — Dual PE32+/ELF64** | Interleaved guest processes and cooperative yields | Test binaries only; preemption, SMP, runtimes and real-world apps missing |
+| **3.5 — Kernel hardening** | [Audit and confirmed defects](09-phase3.5-kernel-hardening.md) | **Open gate** until repairs, adversarial tests and independent verification are recorded |
+| **3.6 — NT WDM driver PoC** | [MSVC-built .sys](11-phase3.6-nt-driver-validation.md) executed in QEMU Ring 0; I/O and unload | **PoC achieved**, not arbitrary .sys support; persistent RWX mapping and simulated IRQL behavior require remediation |
+| **3.7 — NT runtime hardening** | Not yet demonstrated | **Next gated work:** enforce W^X, real IRQ/APIC IRQL semantics, external driver fixtures, concurrency and teardown checks |
 
-## Detailed Phase Breakdown
+Do not mark 3.5 or 3.7 complete just because 3.6 reported success. See the [Vanguard study](10-vanguard-feasibility-study.md) for claims requiring explicit evidence.
 
-### Phase 0: Specifications, Architecture & Minimal Dual Loader PoC (Completed)
-- **Objective**: Establish the repository foundation, deep technical specifications, and a fully functional, verifiable Proof of Concept (PoC) capable of parsing, validating, memory-mapping, and simulating syscall execution for both Windows PE32+ and Linux ELF64 binaries.
-- **Deliverables**:
-  - Modular Rust workspace (`nexus-types`, `nexus-loader`, `nexus-abi`, `nexus-poc`, `nexus-boot`).
-  - PE32+ parser (DOS header, PE header, Optional header, Section headers, Relocations).
-  - ELF64 parser (ELF header, Program headers, Section headers, Entry point validation).
-  - Dual syscall dispatcher with simulated NT SSDT and Linux POSIX call routing.
-  - Test suites with synthetic and real PE/ELF binary fixtures.
-  - Multi-platform CI pipeline (GitHub Actions).
+## Critical path: kernel to first physical installation
 
-### Phase 1: Bare-Metal UEFI Bootloader & Microkernel Initialization (Completed)
-- **Objective**: Boot directly on real x86_64 UEFI hardware or QEMU/OVMF without a host operating system.
-- **Architectural Revision**: Completed full feasibility study of DRM/KMS in an independent microkernel (`docs/06-drm-kms-feasibility-revision.md`). Adopted a 3-stage graphical architecture: Stage 1 = UEFI GOP linear framebuffer console; Stage 2 = VirtIO-GPU paravirtualized accelerator; Stage 3 = user-space Vulkan driver split (eliminating monolithic Linux DRM in-kernel bloat).
-- **Deliverables & Verified Milestones**:
-  - Freestanding UEFI 2.x bootloader (`crates/nexus-boot` -> `target/x86_64-unknown-uefi/debug/bootx64.efi`).
-  - UEFI GOP (Graphics Output Protocol) linear framebuffer acquisition and early console driver (`crates/nexus-kernel/src/framebuffer.rs`).
-  - Memory map acquisition via `GetMemoryMap` and handoff via `ExitBootServices` (`BootHandoverInfo`).
-  - Microkernel core (`crates/nexus-kernel`):
-    - 16550 UART driver for COM1 (0x3F8) at 115200 8N1 with `serial_println!` macro.
-    - 64-bit GDT with Ring 0 & Ring 3 code/data selectors, 16-byte TSS descriptor, and Double Fault IST1 stack.
-    - 256-vector IDT armed for CPU architectural exceptions (#DE, #DB, #BP, #UD, #DF, #GP, #PF).
-    - Physical Memory Manager (PMM) 4KB bitmap allocator tracking up to 4GB of physical RAM.
-    - 4-level x86_64 paging definitions (PML4, PDPT, PD, PT) and PTE bitflag encoding.
-    - Hardware MSR setup (`IA32_EFER.SCE`, `IA32_STAR`, `IA32_LSTAR`, `IA32_SFMASK`) with `SyscallRouter` integration.
-  - **Automated Verification**:
-    - Automated tests in QEMU 11.1.0 with EDK2 OVMF firmware (`scripts/test-boot.ps1` and `scripts/test-boot.sh`).
-    - Verified serial output: `GDT and TSS Configured`, `IDT Initialized`, `GOP Framebuffer Detected: 1280x800`, `PMM Initialized: 20075 usable frames (78 MB free RAM)`, `NEXUS_BOOT_SUCCESS`.
-    - 100% unit tests pass across all workspace crates (`cargo test --workspace`).
-    - 100% clean formatting and linting (`cargo fmt --check`, `cargo clippy -D warnings`).
+### Gate K — Stabilization (3.5 + 3.7, blocking)
 
-### Phase 2: Real Process Execution, VMM Isolation & Ring 3 Syscalls (Completed)
-- **Objective**: Implement a functional Virtual Memory Manager (VMM), dual address space isolation, hardware Ring 3 transitions, safe syscall dispatcher with user-pointer boundary checks, freestanding ELF64 execution, and hardware exception recovery.
-- **Deliverables & Verified Milestones**:
-  - **Audit & Architecture**:
-    - Audited Phase 1 bootloader/kernel boundary, memory map handoff, and paging isolation (`docs/07-phase2-process-execution.md`).
-    - Fixed low-memory identity mapping collision: relocated user binary execution space to `0x4000_0000` (1GB) and user stack to `0x0000_7FFF_FFFF_0000`.
-  - **Functional VMM & Memory Isolation**:
-    - Dedicated Kernel AddressSpace (PML4) constructed at physical frame `0x0010_0000`.
-    - Low physical RAM and GOP framebuffer identity-mapped with supervisor-only flags (`USER = 0`).
-    - CPU CR3 switched cleanly from UEFI page tables (`0x07801000`) to Kernel PML4 (`0x00100000`).
-    - `AddressSpace::new_user`: creates isolated address space per process, sharing upper-half kernel mappings and mapping lower half with hardware-enforced protection.
-  - **Ring 0 / Ring 3 Transitions & Task Context**:
-    - TSS initialized with 16KB dedicated kernel stack (`TSS.rsp0`) and double-fault stack (`TSS.ist1`). Task Register loaded via `ltr 0x28`.
-    - Hardware Ring 3 transition implemented via `iretq` in standalone assembly routine `nexus_enter_user`.
-    - Safe exception and syscall unrolling via `trigger_user_abort_asm`.
-  - **Hardware SYSCALL / SYSRET Dispatcher & User Pointer Security**:
-    - Hardware `SYSCALL` entry stub (`asm_syscall_entry`) wired to `IA32_LSTAR`.
-    - Secure pointer validation (`validate_user_buffer`): checks for 64-bit integer overflow, enforces canonical user ceiling (`< 0x0000_8000_0000_0000`), and verifies page presence in the active address space before dereferencing.
-    - Implemented Linux `SYS_WRITE` (1) and `SYS_EXIT` (60) dispatchers.
+1. Fix documented user pointer access permissions, kernel/user isolation, page ownership, memory cleanup, context saving, trapping and test-harness false positives.
+2. Transition driver mapping to **W^X** (temporary staging followed by executable read-only code and writable non-executable data); reject incompatible sections instead of defaulting to RWX.
+3. Model NT IRQL with true interrupt masking/prioritization, per-CPU state, DPCs and synchronization, not an atomic integer alone.
+4. Test a WDM driver independently built from public WDK samples in the actual guest, including unload/reload, failures and malformed requests.
+5. Differentiate guest evidence, host tests, hardware tests, and unverified statements; maintain strict negative tests.
 
-### Phase 3: Unified PE32+ / ELF64 Execution & Cooperative Scheduling (Completed)
-- **Objective**: Execute real Windows PE32+ and Linux ELF64 binaries in Ring 3 on the same kernel executive with personality-aware syscall dispatching, TEB/PEB setup, base relocations, and interleaved scheduling.
-- **Deliverables & Verified Milestones**:
-  - **PE32+ Loader & Base Relocations**:
-    - Full section mapping with granular page flags (R/W/X).
-    - Base Relocations engine (`PeRelocationBlock`, `IMAGE_REL_BASED_DIR64`).
-    - Import table and Data Directories parsing up to 16 entries.
-  - **Windows NT Personality**:
-    - Aligned 4KB TEB (`0x0000_7FFF_FFF1_0000`) and PEB (`0x0000_7FFF_FFF0_0000`).
-    - MSR `IA32_GS_BASE` (`0xC000_0101`) setup after segment reloading for seamless `gs:[0x30]` and `gs:[0x60]` userland access.
-    - Syscall dispatching: `NtWriteFile` (0x0008), `NtYieldExecution` (0x0050), and `NtTerminateProcess` (0x002C).
-  - **Linux Personality & Independent PML4 per Process**:
-    - Maintained `SYS_WRITE` (1) and `SYS_EXIT` (60); added `SYS_SCHED_YIELD` (24) and `SYS_EXIT_GROUP` (231).
-    - Dedicated PML4 address space allocated per process.
-  - **Interleaved Cooperative Scheduler (`Scheduler`)**:
-    - Round-robin multi-tasking across distinct binary personalities.
-    - Context switches update `CR3`, TSS `RSP0`, and `IA32_GS_BASE`/`IA32_FS_BASE` MSRs.
-    - Preserves user RIP and RSP across cooperative yields.
-  - **Automated Bare-Metal QEMU Validation**:
-    - Serial logs confirmed interleaved execution of `win_app.exe` (PID 1) and `linux_app.elf` (PID 2).
-    - Verified hardware protection (#PF Vector 14) and safe error recovery (`NEXUS_PHASE3_SUCCESS`).
+**Exit:** reproducible QEMU guest tests plus a written limitations and security audit. No assertion of compatibility with Vanguard.
 
-### Phase 4: Multi-Threaded Executive, In-Memory VFS & Dynamic Runtimes
-- **Objective**: Advance the executive with preemptive timer-driven scheduling (APIC/HPET), in-memory VFS (initramfs), dynamic libraries (ELF shared objects, PE DLL imports), and userland libc/runtimes.
-- **Deliverables**:
-  - Local APIC timer interrupts and preemptive thread context switching.
-  - In-memory Root VFS providing `/dev`, `/proc`, `/sys`, `/bin`, and FAT32 disk reading.
-  - Dynamic linking support: Musl libc dynamic loader (`ld-musl-x86_64.so.1`) and initial Windows DLL loading (`ntdll.dll`).
-  - Extended POSIX syscall set (`mmap`, `munmap`, `brk`, `fork`/`clone`, `execve`).
+### Gate E — Core executive & device foundations (Phase 4)
 
-### Phase 5: NT Subsystem, Object Handles & Win32 Userland Integration
-- **Objective**: Execute real Windows console and windowed PE applications natively using kernel object tables and system service dispatching.
-- **Deliverables**:
-  - Handle table (`HANDLE`) implementation with reference-counted kernel objects (Process, Thread, Event, Section, File).
-  - NT System Service Dispatcher (`NtAllocateVirtualMemory`, `NtCreateSection`, `NtMapViewOfSection`, `NtCreateThreadEx`).
-  - Win32 subsystem initialization (CSRSS / Win32k userland abstraction).
-  - Native Windows executable support for standard C runtime applications.
+- Preemptive single-core scheduling before SMP; per-thread context, FPU/SIMD, locks, interrupt routing, timers, cancellation, object lifetimes and handles.
+- Hardware discovery (ACPI/PCIe), block-device interfaces, DMA/IOMMU and IRQ APIs. VFS, initial FAT32/GPT support, durable flush and mount semantics.
+- Production-style process lifecycle, IPC and basic user services needed by the update agent and display stack.
+- **Exit:** crash-resistant multi-process test suite and persistent read/write on a QEMU block device with power-loss fault injection.
 
-### Phase 6: Hardware Acceleration (Vulkan/DRM) & Anti-Cheat Research Lab
-- **Objective**: Direct GPU hardware acceleration for modern games and systematic reverse engineering of anti-cheat drivers.
-- **Deliverables**:
-  - Direct Rendering Manager (DRM) / KMS user-space split or VirtIO-GPU / DMA-BUF subsystem.
-  - Native Vulkan 1.3 driver support.
-  - DirectX 11/12 translation via DXVK / VKD3D running directly on native Vulkan.
-  - Isolated Anti-Cheat Research Sandbox: Ring-0 driver monitoring environment to inspect calls made by `vgk.sys` and `EasyAntiCheat.sys`.
+### Gate R — Linux and Windows runtimes (Phase 5)
+
+- Expand Linux syscalls, ELF dynamic linking, signals, threads, futex, filesystem and musl bootstrap incrementally.
+- Expand NT object/I/O/process APIs, file handles, NTDLL, DLL linking and Win32 userland incrementally.
+- Integrate WDM/KMDF capabilities without assuming a simple driver fixture generalizes to third-party drivers.
+- **Exit:** independent externally built console programs on both personalities, with documented ABI coverage.
+
+### Gate G — Graphics/display/input research and implementation (Phase 6)
+
+- Stage G0: existing UEFI GOP framebuffer and software rendering; establish display surface and input APIs.
+- Stage G1: virtio-gpu in QEMU and a minimal 2D compositor demonstration; display/input drivers and buffer sharing.
+- Stage G2: **separate** real GPU feasibility efforts for AMD/Intel/NVIDIA; design kernel DRM-equivalent capabilities, MMIO, DMA, synchronization, firmware, display modes and security boundaries.
+- Stage G3: validated Vulkan/Mesa adapter and performance tests only after a real kernel-device implementation exists; **do not** assume Linux DRM/KMS or userspace Mesa works unchanged.
+- **Exit:** real device(s) selected and tested; no blanket GPU compatibility claim.
+
+### Gate S — Nexus Shell (Phase 7)
+
+- Maintain Niri and iNiR upstream lineage and license compliance; audit Smithay, DRM/GBM, libinput, Wayland, Qt, QML and Quickshell portability.
+- Implement adapter backends for Nexus display, input, IPC and app lifecycle. Stage compositor functionality before porting the full shell.
+- Windows window integration is a distinct Win32/USER32/GDI compatibility task; Niri alone does not run Windows GUI applications.
+- **Exit:** functional desktop on a supported hardware profile; launcher, windows, input, and updater status interface.
+
+### Gate I — First practical bare-metal installation (Phase 8; may be brought forward)
+
+- Select a **dedicated test SSD** and a narrow supported hardware profile. Implement storage/USB/console, recovery boot, installer and durable boot metadata.
+- Do not offer an in-place install over a user's main OS at this maturity.
+- **Exit:** install once, boot from SSD, restore/recover, and perform **signed offline A/B update with rollback** without loss of the data partition. That is the minimum requirement for sustained physical testing.
+
+### Gate W — Network and OTA delivery (Phase 9; may proceed independently)
+
+- DNS, TCP/TLS, clock validation, restartable downloads, quota/backoff and authenticated signed channel metadata.
+- Download artifacts from GitHub Releases, then verify using Nexus-owned trust roots; CI-generated hashes alone are not sufficient.
+- Integrate update notifications in iNiR; install agent remains privileged and separate from the desktop.
+- **Exit:** signed nightly/beta/stable update from remote release, interrupted network/disk tests and boot rollback.
+
+### Gate V — Games and Vanguard legitimacy (permanent parallel track; mandatory for 1.0)
+
+- Driver ABI conformance and WDM/KMDF breadth, TPM2/Secure Boot attestation **as publicly documented**, NT security and modern graphics performance.
+- Riot Client, game rendering, network services and anti-cheat compatibility must be demonstrated separately.
+- Seek explicit vendor support/approval. Unpublished details of Vanguard remote attestation remain hypotheses, not established facts.
+- **Nexus OS 1.0 acceptance:** legitimate League of Legends **and** VALORANT online gameplay, complete matches without anti-cheat rejection, on supported real hardware, and no VM, bypass or Windows installation. Current feasibility is **unproven and may depend on Riot**.
+
+## Independent Nexus Update workstream (U0–U7)
+
+| Stage | Dependency | Exit test |
+| --- | --- | --- |
+| **U0 — Contracts / threat model** | Now | A/B layout, metadata, signature policy, downgrade prevention, signed release format, rollback invariants reviewed |
+| **U1 — Boot-control prototype** | U0, EFI boot manager | QEMU chooses signed candidate with bounded attempts and autonomous fallback to last-good |
+| **U2 — Storage/installer integration** | Gate E block/VFS | GPT + system A/B + persistent data + recovery disk, power-cut safe |
+| **U3 — Offline signed update** | U1/U2 | v0.1 to v0.2 via USB and rollback on failure, no reinstall |
+| **U4 — GitHub Releases transport** | Network/TLS/clock | Verified signed metadata and payload, retry/resume/error handling |
+| **U5 — Shell UI** | Gate S | iNiR shows channel, progress, status, reboot/rollback without raw disk access |
+| **U6 — Release security hardening** | U0–U5 | Key rotation/revocation, TUF-style metadata or equivalent reviewed design, independent adversarial audit |
+| **U7 — Delta/component updates** | Stable A/B base | Small signed incremental updates with measured safety and bandwidth wins |
+
+**Order constraint:** U0 begins now. U1 can proceed in QEMU. **U2 and U3 are required before the first sustained SSD installation**, even if U4 and U5 are not ready. Details and acceptance tests: [Nexus Update architecture](12-nexus-update-architecture.md).
+
+## Evidence, release and security policy
+
+- Use QEMU/OVMF for repeatable engineering; never call QEMU a real physical hardware acceptance test.
+- Unit tests, lint and serial markers do not by themselves prove safety. Retain raw logs, QEMU exit status, negative checks, image hashes and test fixture provenance.
+- CI artifacts are not implicitly trusted software updates. Signing authority must be independent of ordinary CI jobs; keys never committed to the repository or built into images.
+- No boot-control/partition destructive changes without recovery media, data backups, and a proof of power-loss correctness.
+- Nightly, Beta and Stable are distinct signed release channels with explicit opt-in and anti-rollback policy.
+- Any GPL/LGPL components from ReactOS, Niri/iNiR, Wine, Linux or other sources require per-component license provenance and compatibility review.
+- All userspace/driver feature claims require runtime evidence on supported configurations.
+
+## Decisions and references
+
+- [System architecture](03-system-architecture.md)
+- [Kernel feasibility](02-kernel-feasibility-study.md)
+- [GPU dependency analysis](06-drm-kms-feasibility-revision.md)
+- [Fase 3.5 hardening audit](09-phase3.5-kernel-hardening.md)
+- [Vanguard feasibility](10-vanguard-feasibility-study.md)
+- [Phase 3.6 driver demonstration](11-phase3.6-nt-driver-validation.md)
+- [Nexus Update detailed design](12-nexus-update-architecture.md)
