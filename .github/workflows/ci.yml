@@ -8,17 +8,19 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PYTHONUTF8: '1'
 
 jobs:
   check-and-test:
     name: Host checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: x86_64-unknown-uefi
           components: clippy, rustfmt
@@ -40,7 +42,11 @@ jobs:
         with:
           python-version: '3.13'
       - name: Runner negative tests
-        run: python scripts/test-hardening-runner.py
+        run: |
+          python scripts/test-hardening-runner.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/test-wdk-abi.py
+        shell: pwsh
 
   kernel-hardening:
     name: QEMU/OVMF (${{ matrix.ram }} MiB, ${{ matrix.cpu }}, ${{ matrix.profile }})
@@ -55,7 +61,7 @@ jobs:
           - {ram: 512, cpu: max, profile: release}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: x86_64-unknown-uefi
           components: clippy
@@ -85,4 +91,80 @@ jobs:
             build/hardening-*/serial.log
             build/hardening-*/qemu.log
             build/hardening-*/result.json
+            build/fixtures/manifest.json
+
+  wdk-abi:
+    name: wdk-abi
+    runs-on: windows-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: x86_64-unknown-uefi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install pinned official WDK, SDK and fixture compiler
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force build/wdk-ci, build/wdk-packages | Out-Null
+          $packages = @{
+            wdk = @('microsoft.windows.wdk.x64', '10.0.26100.6584')
+            sdk = @('microsoft.windows.sdk.cpp', '10.0.26100.7705')
+          }
+          foreach ($name in $packages.Keys) {
+            $id, $version = $packages[$name]
+            $zip = "build/wdk-packages/$name.zip"
+            Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$id/$version/$id.$version.nupkg" -OutFile $zip
+            Get-FileHash $zip -Algorithm SHA256 | Format-List | Out-File build/wdk-ci/packages.txt -Append
+            Expand-Archive $zip -DestinationPath "build/wdk-packages/$name"
+          }
+          $installer = Join-Path $env:RUNNER_TEMP 'LLVM-19.1.7-win64.exe'
+          Invoke-WebRequest 'https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-win64.exe' -OutFile $installer
+          Get-FileHash $installer -Algorithm SHA256 | Format-List | Out-File build/wdk-ci/packages.txt -Append
+          $llvm = Join-Path $env:RUNNER_TEMP 'nexus-llvm-19'
+          $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$llvm") -Wait -PassThru -WindowStyle Hidden
+          if ($install.ExitCode -ne 0) { throw 'LLVM installation failed' }
+          "$llvm/bin" | Out-File $env:GITHUB_PATH -Append
+          choco install qemu --yes --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'QEMU installation failed' }
+      - name: Record actual toolchain and run validator regressions
+        run: |
+          & cl /Bv 2>&1 | Out-File build/wdk-ci/toolchains.txt
+          & link /? 2>&1 | Select-Object -First 4 | Out-File build/wdk-ci/toolchains.txt -Append
+          clang-cl --version | Tee-Object -FilePath build/wdk-ci/clang.txt
+          if ($LASTEXITCODE -ne 0) { throw 'clang-cl unavailable' }
+          if ((Get-Content build/wdk-ci/clang.txt -Raw) -notmatch 'clang version 19\.1\.7') { throw 'Wrong fixture producer' }
+          lld-link --version | Out-File build/wdk-ci/toolchains.txt -Append
+          rustc -vV | Out-File build/wdk-ci/toolchains.txt -Append
+          python scripts/test-wdk-abi.py
+          if ($LASTEXITCODE -ne 0) { throw 'ABI validator regression' }
+      - name: Enforce NT layouts, imports, execution, negative controls and compiler-specific reproducibility
+        run: ./scripts/test-wdk-ci.ps1 -WdkRoot build/wdk-packages/wdk -SdkRoot build/wdk-packages/sdk
+      - name: Publish ABI tables in job summary
+        if: always()
+        run: |
+          Get-ChildItem build/wdk-ci -Recurse -Filter abi-table.md | ForEach-Object {
+            "## $($_.Directory.Name)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            Get-Content $_.FullName | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          }
+      - name: Preserve WDK and guest evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wdk-abi-evidence
+          if-no-files-found: error
+          path: |
+            build/wdk-ci/
+            build/hardening-256-max-debug/serial.log
+            build/hardening-256-max-debug/qemu.log
+            build/hardening-256-max-debug/result.json
             build/fixtures/manifest.json

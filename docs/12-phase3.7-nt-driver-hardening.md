@@ -1,8 +1,8 @@
 # Nexus OS — Fase 3.7: NT Driver Runtime Hardening
 
 **Documento:** `docs/12-phase3.7-nt-driver-hardening.md`  
-**Status:** **Aberta.** Escopo revisado formalmente em 2026-10-11 (seção 2). Parte dos critérios já tem evidência em **QEMU/OVMF**; faltam a validação com o WDK oficial (PR-5) e o alinhamento das structs NT ao WDK real (PR-6).  
-**Evidência:** somente **guest QEMU/OVMF emulado (TCG)** e testes de host no CI. **Nada foi verificado em hardware físico.**  
+**Status:** **Concluída em 2026-10-11, dentro do escopo revisado** (seção 2). Os gates PR-5/PR-6 e os seis jobs do CI passaram no [run 38163656509](https://github.com/Stoltembergg/Nexus-OS/actions/runs/38163656509), no código testado `40f985e` (PR #10).
+**Evidência:** guest QEMU/OVMF (TCG), runner Windows hospedado e testes de host no CI. **Nada foi verificado em hardware físico.** Isso não demonstra compatibilidade geral com Windows ou drivers de terceiros.
 **Data:** Outubro de 2026
 
 > **Revisão de 2026-10-11.** A versão anterior deste documento dizia "Concluído e Verificado em Hardware Real", "IRQLs de Hardware Reais… mascarando interrupções no nível de silício", "driver WDM autêntico… sem adaptações do Nexus" e "23 rotinas validadas". A auditoria de encerramento (`docs/13-auditoria-fases-3.5-3.7.md`) mostrou que essas afirmações **não tinham evidência**: nunca houve teste em hardware físico; o kernel roda com interrupções desabilitadas e sem APIC, então o CR8 não tem o que mascarar; as structs NT das fixtures são escritas à mão e divergem do `wdm.h` real; e eventos e esperas eram stubs. Este documento foi reescrito para refletir só o que está provado. A versão anterior continua no histórico do Git.
@@ -22,6 +22,7 @@ Cada item abaixo é exigido pelo runner `scripts/test-hardening.py` ou por teste
 | **Semântica NT mínima** (14 verificações em Ring 0): direção do IRQL e limite `HIGH_LEVEL` (bugchecks 0x09/0x0A); `KeAcquireSpinLock` acima de DISPATCH; auto-reset de `SynchronizationEvent`; `NotificationEvent` continua sinalizado; espera infinita não satisfazível gera bugcheck em vez de `STATUS_TIMEOUT`; tag de pool errada e double free (0xC2); extensão de device zerada; remoção de device em qualquer posição; `IoDeleteDevice` inválido (exclusão dupla ou ponteiro estranho) gera bugcheck sem liberar nada; o esgotamento do registro de pool é contado e registrado. | `NEXUS_CHECK:nt-semantics` + `NEXUS_NT_SEMANTICS:checks=14`, com o heap do kernel balanceado; um bugcheck no guest sai com status 39. | #6 |
 | **Roteamento IRQL → CR8.** `KeRaiseIrql`/`KeLowerIrql`/spin locks escrevem e leem o CR8 (TPR) de verdade; o escalonador cooperativo recusa o despacho com CR8 ≥ DISPATCH_LEVEL em `Scheduler::run_all`. | Linha do guest: "CR8 (TPR) read/write round-trip and KeRaise/LowerIrql -> CR8 routing verified (no interrupt masking…)"; teste de host com hooks falsos. | #5 |
 | **CR0.WP habilitado** no init do kernel. | `arch/x86_64/mod.rs` (bit 16 do CR0). A falta em escrita numa página RX de driver (`#PF error=0x3`) só foi observada pela sonda descartável da auditoria (doc 13, §6.3); **ainda não há teste versionado** disso. | — |
+| **ABI oficial WDK e drivers de teste.** 62/62 layouts NT; três drivers WDK compilados/linkados com MSVC, sem imports não resolvidos ou código estático da import lib, e carregados/executados pelo Nexus no host. Fixtures clang-cl conferidas separadamente. | `wdk-abi-evidence` do [run 38163656509](https://github.com/Stoltembergg/Nexus-OS/actions/runs/38163656509): relatórios MSVC/clang-cl, hashes, controles negativos e execução guest. Os drivers MSVC também passaram no guest QEMU: 22/22 páginas W^X, 14 checks NT, ciclo de vida balanceado. | #10 |
 
 ## 2. Revisão formal do escopo
 
@@ -29,13 +30,13 @@ O roadmap original exigia, para a 3.7, "real IRQ/APIC IRQL semantics". **Decisã
 
 > **IRQL na 3.7 = valor de software validado (direção, limites e bugchecks) e roteado para o CR8/TPR, sem nenhuma fonte de interrupção mascarável.** O kernel roda com RFLAGS.IF = 0, sem LAPIC/IOAPIC inicializados, sem PIC remapeado e sem vetores de IRQ ≥ 32. Portanto **não existe mascaramento de interrupções por hardware** e **não existe gerenciamento completo de IRQL**. Isso **não é equivalente ao Windows**.
 
-### Critérios para encerrar a 3.7 (ainda pendentes)
+### Critérios de encerramento da 3.7 (atendidos)
 
-1. **PR-5 — validação com o WDK oficial:** um job `windows-latest` recompila os drivers de teste a partir do fonte com os cabeçalhos oficiais do WDK e gera uma tabela de `sizeof`/`offsetof` das structs NT principais (`DRIVER_OBJECT`, `DEVICE_OBJECT`, `IRP`, `IO_STACK_LOCATION`, `KEVENT`…). Hoje isso está **bloqueado**: o token usado não tem permissão para alterar workflows.
-2. **PR-6 — alinhamento das structs:** `nexus-types` e as fixtures passam a usar os layouts do WDK real (doc 13, achado C4), com asserções estáticas de offset, e um driver compilado com os cabeçalhos reais carrega e executa no guest (achado A4, `IofCompleteRequest` e afins).
-3. CI verde nos 5 jobs depois do PR-5 e do PR-6.
+1. **PR-5 — validação com o WDK oficial:** atendido pelo job `wdk-abi` em `windows-latest`; o MSVC compilou e linkou três drivers de teste com WDK/SDK NuGet oficiais e gerou a tabela de `sizeof`/`offsetof` das structs NT principais. Resultado: **62/62 entradas** em concordância com o WDK.
+2. **PR-6 — alinhamento das structs:** atendido; `nexus-types` e fixtures têm asserts de layout e concordam com os 62 valores oficiais. Os três drivers foram carregados/executados no host Nexus; os drivers MSVC foram também embutidos na imagem de teste e executados no guest QEMU/OVMF. Fixtures versionadas foram verificadas por rebuild `clang-cl` 19.1.7, sem comparar bytes MSVC a clang-cl.
+3. **CI completo:** atendido no run 38163656509 para o SHA `40f985e`: dois jobs host (Ubuntu/Windows), três configurações QEMU/OVMF e o job `wdk-abi` — **seis jobs verdes**. O job passou os controles negativos de layout/import pelo erro esperado e preservou o artefato `wdk-abi-evidence`.
 
-Até lá, a 3.7 **não está encerrada**. O marcador serial `NEXUS_PHASE3_7_SUCCESS`, impresso pelo kernel, tem nome histórico: ele só indica que os checks acima passaram nesta execução, **não** que a fase foi encerrada.
+Com esses critérios atendidos, a 3.7 está **encerrada somente dentro do escopo revisado**. O marcador serial `NEXUS_PHASE3_7_SUCCESS` sozinho não fecha a fase; o fechamento decorre dos critérios acima e da evidência CI/QEMU vinculada.
 
 ### Itens transferidos explicitamente para a Fase 4
 
@@ -49,8 +50,8 @@ Até lá, a 3.7 **não está encerrada**. O marcador serial `NEXUS_PHASE3_7_SUCC
 
 ## 3. Limitações conhecidas (estado atual)
 
-- **Structs NT alinhadas ao WDK x64 desde o PR #8** (62 de 62 entradas da tabela de `docs/14`, verificado localmente com `clang-cl` e o WDK oficial; asserções `const` de offset em `nexus-types`). As fixtures `nexus_driver.c`, `standard_wdm.c` e `wdk_min.c` usam só `<ntddk.h>`. Isso cobre os campos usados pelos drivers de teste e **não** é uma alegação de compatibilidade com drivers de terceiros.
-- Os `.sys` versionados (gerados com `clang-cl`) ainda **não são recompilados no CI**: `wdk-abi.py --enforce --check-fixtures` só roda localmente até existir o job `wdk-abi` (`windows-latest`, MSVC) no PR só de workflow, que depende da permissão Workflows. A 3.7 só fecha com esse job verde.
+- **Structs NT alinhadas ao WDK x64 desde o PR #8:** 62/62 entradas verificadas localmente e no job `wdk-abi` com MSVC e clang-cl; asserções `const` de offset em `nexus-types`. As fixtures `nexus_driver.c`, `standard_wdm.c` e `wdk_min.c` usam só `<ntddk.h>`. Isso cobre os campos usados pelos drivers de teste e **não** é uma alegação de compatibilidade com drivers de terceiros.
+- Os `.sys` versionados são gerados com `clang-cl`; no run 38163656509 `--check-fixtures` confirmou igualdade byte a byte com rebuild `clang-cl` 19.1.7 e hashes do manifesto. `--check-reproducible` compara builds repetidos do mesmo compilador. Os binários MSVC são verificados e executados separadamente; **não** há igualdade binária exigida entre MSVC e clang-cl.
 - `DbgPrint` não imprime; `IoCreateSymbolicLink`/`IoDeleteSymbolicLink` são no-ops; `IofCompleteRequest` (o `IoCompleteRequest` do x64) é um stub mínimo que só zera `PendingReturned`, sem rotinas de conclusão nem desempilhamento da pilha de devices (transferido para a Fase 4); não há I/O manager, `IoCallDriver` nem `DriverExtension` (doc 13, §5).
 - Os códigos `0x09`, `0x0A` e `0xC2` são códigos do Windows. Já os subcódigos de `0xC2` e os códigos `0x4E580001` (espera infinita não satisfazível) e `0x4E580002` (`IoDeleteDevice` inválido) são **específicos do Nexus**.
 - Todo pool é non-paged. Não há paginação de modo kernel.
