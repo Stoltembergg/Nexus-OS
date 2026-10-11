@@ -282,8 +282,12 @@ pub fn validate_nt_driver_subsystem() -> DriverValidationReport {
     // Minimal NT semantics (IRQL direction, events/waits, pool tags, device extensions and
     // deletion, pool registry exhaustion), before any driver is loaded. The self-test
     // swaps in a recording bugcheck handler and restores kernel_bugcheck_handler after.
+    // The kernel heap must return exactly to its baseline: the invalid IoDeleteDevice
+    // checks (double delete, foreign pointer) must not free anything.
+    let heap_before_semantics = heap_used_bytes();
     report.nt_semantics_checks = nexus_loader::driver::nt_semantics_self_test()
         .unwrap_or_else(|failed| panic!("NT semantics self-test failed: {failed}"));
+    expect_heap_balanced(heap_before_semantics, "nt_semantics_self_test");
     assert_eq!(
         BUGCHECK_HANDLER.load(Ordering::SeqCst),
         kernel_bugcheck_handler as *mut ()

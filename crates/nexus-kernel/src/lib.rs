@@ -199,7 +199,7 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
         report.wx_pages_expected
     );
     assert_eq!(
-        report.nt_semantics_checks, 13,
+        report.nt_semantics_checks, 14,
         "NT semantics self-test incomplete"
     );
     serial_println!("NEXUS_CHECK:nt-semantics:PASS");

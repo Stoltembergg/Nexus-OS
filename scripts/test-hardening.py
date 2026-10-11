@@ -43,8 +43,8 @@ def validate(returncode, serial):
     wx = re.search(r'^NEXUS_DRIVER_WX:pages_verified=([1-9][0-9]*):expected=([1-9][0-9]*)\r?$', serial, re.M)
     if not wx or wx.group(1) != wx.group(2):
         raise RuntimeError('Driver W^X was not verified by reading back exactly every expected PTE in the guest')
-    if serial.count('NEXUS_NT_SEMANTICS:checks=13') != 1:
-        raise RuntimeError('NT semantics self-test did not pass all 13 checks in guest Ring 0')
+    if serial.count('NEXUS_NT_SEMANTICS:checks=14') != 1:
+        raise RuntimeError('NT semantics self-test did not pass all 14 checks in guest Ring 0')
     if serial.count('NEXUS_DRIVER_LIFECYCLE:drivers=3:heap_balanced=true:pool_balanced=true:devices_deleted=true') != 1:
         raise RuntimeError('Driver lifecycles did not balance heap/pool/devices in the guest')
     if 'NEXUS_STRESS:cycles=64:processes=128:yields=1024:' not in serial:

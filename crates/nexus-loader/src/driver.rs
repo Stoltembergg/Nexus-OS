@@ -55,6 +55,17 @@ pub const BAD_POOL_UNKNOWN_BLOCK: usize = 2;
 /// infinite wait on a non-signaled object is a guaranteed deadlock. Windows would block
 /// forever; Nexus fails loudly instead of returning `STATUS_TIMEOUT`.
 pub const BUGCHECK_NEXUS_UNSATISFIABLE_WAIT: u32 = 0x4E58_0001;
+/// Nexus-specific stop code (not a Windows code): invalid `IoDeleteDevice`. Parameter 1 is
+/// one of the `DEVICE_DELETE_*` subcodes, parameter 2 the pointer passed in. In none of
+/// these cases is the device freed or its host header read.
+pub const BUGCHECK_NEXUS_INVALID_DEVICE_DELETE: u32 = 0x4E58_0002;
+/// Subcode: the pointer is not a live device created by `IoCreateDevice` (double delete,
+/// or a pointer that never was a device). The pointer is not dereferenced at all.
+pub const DEVICE_DELETE_NOT_LIVE: usize = 1;
+/// Subcode: live device whose `DriverObject` is null.
+pub const DEVICE_DELETE_NO_DRIVER: usize = 2;
+/// Subcode: live device that is not in its driver's device list.
+pub const DEVICE_DELETE_NOT_IN_LIST: usize = 3;
 
 /// Bugcheck handler: `(stop code, parameters)`. The kernel's handler does not return.
 pub type BugCheckHandler = fn(u32, [usize; 4]);
@@ -63,6 +74,12 @@ pub type BugCheckHandler = fn(u32, [usize; 4]);
 pub static BUGCHECK_HANDLER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 static BUGCHECK_COUNT: AtomicUsize = AtomicUsize::new(0);
 static LAST_BUGCHECK: AtomicU32 = AtomicU32::new(0);
+static LAST_BUGCHECK_PARAMS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+/// Parameters of the most recent bugcheck.
+pub fn last_bugcheck_params() -> [usize; 4] {
+    core::array::from_fn(|i| LAST_BUGCHECK_PARAMS[i].load(Ordering::SeqCst))
+}
 
 /// Number of bugchecks raised by the NT host since boot (monotonic).
 pub fn bugcheck_count() -> usize {
@@ -78,6 +95,9 @@ pub fn last_bugcheck() -> u32 {
 /// handlers do); the calling stub must then abort the offending operation.
 fn bug_check(code: u32, params: [usize; 4]) {
     LAST_BUGCHECK.store(code, Ordering::SeqCst);
+    for (slot, value) in LAST_BUGCHECK_PARAMS.iter().zip(params) {
+        slot.store(value, Ordering::SeqCst);
+    }
     BUGCHECK_COUNT.fetch_add(1, Ordering::SeqCst);
     let handler = BUGCHECK_HANDLER.load(Ordering::SeqCst);
     if handler.is_null() {
@@ -137,16 +157,19 @@ type PoolSlot = (usize, usize, u32);
 /// Frees are validated against this registry instead of reading a header in front of the
 /// pointer, so a double free or a foreign pointer is detected without touching freed memory.
 /// The registry never allocates, so it does not perturb kernel heap accounting.
-struct PoolTracker {
+/// Also used (with `usize` slots) for the live-device registry.
+struct SlotRegistry<S, const N: usize> {
     lock: AtomicBool,
-    slots: core::cell::UnsafeCell<[PoolSlot; POOL_TRACKER_CAPACITY]>,
+    slots: core::cell::UnsafeCell<[S; N]>,
 }
 
-// SAFETY: every access to `slots` happens while `lock` is held.
-unsafe impl Sync for PoolTracker {}
+type PoolTracker = SlotRegistry<PoolSlot, POOL_TRACKER_CAPACITY>;
 
-impl PoolTracker {
-    fn with<R>(&self, f: impl FnOnce(&mut [PoolSlot; POOL_TRACKER_CAPACITY]) -> R) -> R {
+// SAFETY: every access to `slots` happens while `lock` is held.
+unsafe impl<S: Send, const N: usize> Sync for SlotRegistry<S, N> {}
+
+impl<S, const N: usize> SlotRegistry<S, N> {
+    fn with<R>(&self, f: impl FnOnce(&mut [S; N]) -> R) -> R {
         while self
             .lock
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -165,6 +188,26 @@ static POOL_TRACKER: PoolTracker = PoolTracker {
     lock: AtomicBool::new(false),
     slots: core::cell::UnsafeCell::new([(0, 0, 0); POOL_TRACKER_CAPACITY]),
 };
+
+/// Maximum number of simultaneously live device objects.
+pub const DEVICE_TRACKER_CAPACITY: usize = 256;
+
+/// Registry of live device objects (address; 0 marks a free slot). `IoDeleteDevice`
+/// checks it before dereferencing the pointer, so a double delete or a foreign pointer
+/// never reads freed memory.
+static DEVICE_TRACKER: SlotRegistry<usize, DEVICE_TRACKER_CAPACITY> = SlotRegistry {
+    lock: AtomicBool::new(false),
+    slots: core::cell::UnsafeCell::new([0; DEVICE_TRACKER_CAPACITY]),
+};
+
+/// Number of device objects currently alive (created and not yet deleted).
+pub fn live_device_objects() -> usize {
+    DEVICE_TRACKER.with(|slots| slots.iter().filter(|&&s| s != 0).count())
+}
+
+fn device_is_live(device: *mut DeviceObject) -> bool {
+    DEVICE_TRACKER.with(|slots| slots.contains(&(device as usize)))
+}
 
 /// Count of rejected pool frees (double free, unknown pointer, tag mismatch).
 static POOL_VIOLATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -1170,6 +1213,16 @@ pub unsafe extern "win64" fn stub_io_create_device(
     }
     (base as *mut usize).write(extension_size);
     let dev = base.add(DEVICE_HEADER) as *mut DeviceObject;
+    let registered = DEVICE_TRACKER.with(|slots| {
+        slots
+            .iter_mut()
+            .find(|s| **s == 0)
+            .map(|slot| *slot = dev as usize)
+    });
+    if registered.is_none() {
+        alloc::alloc::dealloc(base, layout);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     let extension = if extension_size == 0 {
         core::ptr::null_mut()
     } else {
@@ -1204,24 +1257,53 @@ pub unsafe extern "win64" fn stub_io_create_device(
 /// frees it together with its extension. The extension size comes from the host's own
 /// header, not from fields the driver could have modified.
 ///
+/// The device is freed only if it is live and was found and unlinked from its driver's
+/// list. Otherwise this bugchecks with [`BUGCHECK_NEXUS_INVALID_DEVICE_DELETE`] and frees
+/// nothing: a pointer that is not a live device (double delete, foreign pointer) is not
+/// dereferenced at all, and the host header is never read.
+///
 /// # Safety
 ///
-/// `device_object` must point to an active `DeviceObject` allocated via `IoCreateDevice`.
+/// `device_object` must be null or a pointer the caller believes came from
+/// `IoCreateDevice`; anything else is detected through the live-device registry.
 pub unsafe extern "win64" fn stub_io_delete_device(device_object: *mut DeviceObject) {
     if device_object.is_null() {
         return;
     }
-    let drv = (*device_object).driver_object;
-    if !drv.is_null() {
-        let mut link: *mut *mut DeviceObject = &mut (*drv).device_object;
-        while !(*link).is_null() {
-            if *link == device_object {
-                *link = (*device_object).next_device;
-                break;
-            }
-            link = &mut (**link).next_device;
-        }
+    let invalid = |subcode: usize| {
+        bug_check(
+            BUGCHECK_NEXUS_INVALID_DEVICE_DELETE,
+            [subcode, device_object as usize, 0, 0],
+        )
+    };
+    if !device_is_live(device_object) {
+        invalid(DEVICE_DELETE_NOT_LIVE);
+        return;
     }
+    let drv = (*device_object).driver_object;
+    if drv.is_null() {
+        invalid(DEVICE_DELETE_NO_DRIVER);
+        return;
+    }
+    let mut unlinked = false;
+    let mut link: *mut *mut DeviceObject = &mut (*drv).device_object;
+    while !(*link).is_null() {
+        if *link == device_object {
+            *link = (*device_object).next_device;
+            unlinked = true;
+            break;
+        }
+        link = &mut (**link).next_device;
+    }
+    if !unlinked {
+        invalid(DEVICE_DELETE_NOT_IN_LIST);
+        return;
+    }
+    DEVICE_TRACKER.with(|slots| {
+        if let Some(slot) = slots.iter_mut().find(|s| **s == device_object as usize) {
+            *slot = 0;
+        }
+    });
     let base = (device_object as *mut u8).sub(DEVICE_HEADER);
     let extension_size = (base as *const usize).read();
     if let Some(layout) = device_layout(extension_size) {
@@ -1753,6 +1835,34 @@ unsafe fn run_nt_semantics_checks() -> Result<usize, &'static str> {
     check(
         after_middle && after_tail && drv.device_object.is_null(),
         "device-delete-any-position",
+        &mut passed,
+    )?;
+
+    // Invalid deletes bugcheck and free nothing: double delete, and a pointer that never
+    // was a device (its bytes, including the 16 in front, must be left untouched).
+    let live_devices = live_device_objects();
+    let mut dev = core::ptr::null_mut();
+    if stub_io_create_device(&mut drv, 32, core::ptr::null_mut(), 0x22, 0, 0, &mut dev)
+        != STATUS_SUCCESS
+    {
+        return Err("device-create");
+    }
+    stub_io_delete_device(dev);
+    let double = bugcheck_raised_by(|| stub_io_delete_device(dev));
+    let double_params = last_bugcheck_params();
+    let mut fake = [0xA5u8; 256];
+    let fake_dev = fake.as_mut_ptr().add(64) as *mut DeviceObject;
+    let foreign = bugcheck_raised_by(|| stub_io_delete_device(fake_dev));
+    let foreign_params = last_bugcheck_params();
+    check(
+        double == Some(BUGCHECK_NEXUS_INVALID_DEVICE_DELETE)
+            && double_params[..2] == [DEVICE_DELETE_NOT_LIVE, dev as usize]
+            && foreign == Some(BUGCHECK_NEXUS_INVALID_DEVICE_DELETE)
+            && foreign_params[..2] == [DEVICE_DELETE_NOT_LIVE, fake_dev as usize]
+            && fake.iter().all(|&b| b == 0xA5)
+            && live_device_objects() == live_devices
+            && drv.device_object.is_null(),
+        "device-invalid-delete-bugchecks",
         &mut passed,
     )?;
 
@@ -2486,7 +2596,7 @@ mod tests {
     #[test]
     fn test_nt_semantics_self_test_passes() {
         let _host_state = lock_nt_host_state_for_tests();
-        assert_eq!(nt_semantics_self_test(), Ok(13));
+        assert_eq!(nt_semantics_self_test(), Ok(14));
         assert!(
             BUGCHECK_HANDLER.load(Ordering::SeqCst).is_null(),
             "handler restored"
@@ -2733,5 +2843,59 @@ mod tests {
             )
         );
         assert_eq!(live_pool_allocations(), live0);
+    }
+
+    #[test]
+    fn test_invalid_device_delete_bugchecks_without_freeing() {
+        let _host_state = lock_nt_host_state_for_tests();
+        with_recorder();
+        unsafe {
+            let live0 = live_device_objects();
+            let mut drv = DriverObject::default();
+            let mut dev = core::ptr::null_mut();
+            let mut other = core::ptr::null_mut();
+            for d in [&mut dev, &mut other] {
+                assert_eq!(
+                    stub_io_create_device(&mut drv, 48, core::ptr::null_mut(), 0x22, 0, 0, d),
+                    STATUS_SUCCESS
+                );
+            }
+            assert_eq!(live_device_objects(), live0 + 2);
+            let expect = |ptr: *mut DeviceObject, subcode: usize| {
+                assert_eq!(
+                    bugcheck_raised_by(|| stub_io_delete_device(ptr)),
+                    Some(BUGCHECK_NEXUS_INVALID_DEVICE_DELETE)
+                );
+                assert_eq!(last_bugcheck_params()[..2], [subcode, ptr as usize]);
+            };
+
+            // Live device with a null DriverObject: bugcheck, nothing unlinked or freed.
+            (*dev).driver_object = core::ptr::null_mut();
+            expect(dev, DEVICE_DELETE_NO_DRIVER);
+            assert_eq!(live_device_objects(), live0 + 2);
+            assert_eq!(drv.device_object, dev);
+            (*dev).driver_object = &mut drv;
+
+            // Live device missing from its driver's list: bugcheck, not freed.
+            drv.device_object = other;
+            expect(dev, DEVICE_DELETE_NOT_IN_LIST);
+            assert_eq!(live_device_objects(), live0 + 2);
+            drv.device_object = dev;
+
+            // Valid deletes, then a double delete: bugcheck without touching freed memory.
+            stub_io_delete_device(dev);
+            stub_io_delete_device(other);
+            assert!(drv.device_object.is_null());
+            assert_eq!(live_device_objects(), live0);
+            expect(dev, DEVICE_DELETE_NOT_LIVE);
+            expect(other, DEVICE_DELETE_NOT_LIVE);
+
+            // Pointer that never was a device: not dereferenced, not freed.
+            let mut fake = [0x5Au8; 256];
+            let fake_dev = fake.as_mut_ptr().add(64) as *mut DeviceObject;
+            expect(fake_dev, DEVICE_DELETE_NOT_LIVE);
+            assert!(fake.iter().all(|&b| b == 0x5A));
+            assert_eq!(live_device_objects(), live0);
+        }
     }
 }
