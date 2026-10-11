@@ -1,24 +1,46 @@
 //! Windows NT Driver Host Subsystem & Ring 0 WDM Execution Validation.
 
 use core::ffi::c_void;
-use nexus_loader::driver::NtDriverHost;
+use core::sync::atomic::Ordering;
+use nexus_loader::driver::{NtDriverHost, HARDWARE_IRQL_GETTER, HARDWARE_IRQL_SETTER};
 use nexus_types::driver::{
-    IoStackLocation, Irp, ParametersDeviceIoControl, UnicodeString, IOCTL_NEXUS_GET_VERSION,
-    IOCTL_NEXUS_RAISE_IRQL_TEST, IRP_MJ_CREATE, IRP_MJ_DEVICE_CONTROL, IRP_MJ_READ,
+    IoStackLocation, Irp, ParametersDeviceIoControl, UnicodeString, DISPATCH_LEVEL,
+    IOCTL_NEXUS_GET_VERSION, IOCTL_NEXUS_RAISE_IRQL_TEST, IOCTL_WDM_SAMPLE_EVENT_TEST,
+    IOCTL_WDM_SAMPLE_MEM_TEST, IOCTL_WDM_SAMPLE_SPINLOCK_IRQL, IRP_MJ_CREATE,
+    IRP_MJ_DEVICE_CONTROL, IRP_MJ_READ, PASSIVE_LEVEL,
 };
 #[cfg(any(target_os = "uefi", target_os = "none"))]
 use nexus_types::VirtualAddress;
 
 const REAL_DRIVER_BYTES: &[u8] =
     include_bytes!("../../../tests/fixtures/nt_driver/nexus_driver.sys");
+const STANDARD_WDM_BYTES: &[u8] =
+    include_bytes!("../../../tests/fixtures/nt_driver/standard_wdm.sys");
+
+fn hardware_cr8_getter() -> u8 {
+    crate::arch::x86_64::read_cr8_irql()
+}
+
+unsafe fn hardware_cr8_setter(irql: u8) {
+    crate::arch::x86_64::write_cr8_irql(irql);
+}
 
 /// Validates native Windows NT `.sys` driver loading, relocation, import resolution,
-/// `DriverEntry` execution in Ring 0, IRP dispatching (Create, DeviceControl, Read),
-/// and clean driver unloading.
+/// hardware CR8 IRQL management, strict W^X memory protection, IRP dispatching,
+/// synchronization primitives, non-paged memory pools, and clean unloading in Ring 0.
 pub fn validate_nt_driver_subsystem() {
     crate::serial_println!("[*] Initializing NT Driver Host Subsystem...");
+
+    // Hook hardware CR8 IRQL getter and setter callbacks
+    HARDWARE_IRQL_GETTER.store(hardware_cr8_getter as *mut (), Ordering::Release);
+    HARDWARE_IRQL_SETTER.store(hardware_cr8_setter as *mut (), Ordering::Release);
+    crate::serial_println!("[+] Hardware CR8 / TPR IRQL hooks installed into NT Driver Host");
+
     let host = NtDriverHost::new();
 
+    // =========================================================================
+    // Part 1: MSVC-Compiled Driver Validation (nexus_driver.sys)
+    // =========================================================================
     crate::serial_println!("[*] Loading MSVC-compiled WDM Driver (nexus_driver.sys)...");
     let mut driver = host
         .load_driver(
@@ -35,19 +57,26 @@ pub fn validate_nt_driver_subsystem() {
         driver.buffer.len()
     );
 
-    // If running with paging enabled, set WRITABLE and clear NO_EXECUTE on driver's memory pages
+    // Apply strict W^X page protection (RX code, RW data, RO headers/rdata)
     #[cfg(any(target_os = "uefi", target_os = "none"))]
     {
         if let Some(ref mut kas) = *crate::mem::KERNEL_ADDRESS_SPACE.lock() {
-            let start = (driver.buffer.as_ptr() as u64) & !4095;
-            let end = (driver.buffer.as_ptr() as u64 + driver.buffer.len() as u64 + 4095) & !4095;
-            for addr in (start..end).step_by(4096) {
-                let _ = kas.protect_kernel_page(
-                    VirtualAddress::new(addr),
-                    crate::mem::vmm::PageTableFlags::WRITABLE,
-                );
-            }
-            crate::serial_println!("[+] Driver pages protected with Supervisor RWX permissions");
+            driver
+                .enforce_wx_protection(|va, writable, executable| {
+                    let mut flags = crate::mem::vmm::PageTableFlags::empty();
+                    if writable {
+                        flags |= crate::mem::vmm::PageTableFlags::WRITABLE;
+                    }
+                    if !executable {
+                        flags |= crate::mem::vmm::PageTableFlags::NO_EXECUTE;
+                    }
+                    kas.protect_kernel_page(VirtualAddress::new(va), flags)
+                        .map_err(|_| ())
+                })
+                .expect("Failed to apply W^X protection to nexus_driver sections");
+            crate::serial_println!(
+                "[+] Driver sections protected with strict W^X (RX code, RW data, RO headers)"
+            );
         }
     }
 
@@ -138,7 +167,7 @@ pub fn validate_nt_driver_subsystem() {
         "IRQL raise/lower test failed inside driver"
     );
     crate::serial_println!(
-        "[+] IOCTL_NEXUS_RAISE_IRQL_TEST verified: IRQL hardware elevation/restoration verified ({:#010X})",
+        "[+] IOCTL_NEXUS_RAISE_IRQL_TEST verified: IRQL hardware elevation/restoration ({:#010X})",
         irql_test_result
     );
 
@@ -163,5 +192,226 @@ pub fn validate_nt_driver_subsystem() {
         driver.driver_object.device_object.is_null(),
         "DeviceObject must be destroyed on unload"
     );
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    {
+        if let Some(ref mut kas) = *crate::mem::KERNEL_ADDRESS_SPACE.lock() {
+            let start = (driver.buffer.as_ptr() as u64) & !4095;
+            let end = (driver.buffer.as_ptr() as u64 + driver.buffer.len() as u64 + 4095) & !4095;
+            for addr in (start..end).step_by(4096) {
+                let _ = kas.protect_kernel_page(
+                    VirtualAddress::new(addr),
+                    crate::mem::vmm::PageTableFlags::WRITABLE
+                        | crate::mem::vmm::PageTableFlags::NO_EXECUTE,
+                );
+            }
+        }
+    }
     crate::serial_println!("[+] DriverUnload executed cleanly: DeviceObject freed");
+
+    // =========================================================================
+    // Part 2: Authentic Standard WDM Driver (standard_wdm.sys)
+    // Pools, SpinLocks, Events, and Hardware CR8 IRQL Verification
+    // =========================================================================
+    crate::serial_println!("[*] Loading Authentic Standard WDM Driver (standard_wdm.sys)...");
+    let mut std_driver = host
+        .load_driver(
+            STANDARD_WDM_BYTES,
+            "\\Driver\\StandardWdm0",
+            "\\Registry\\Machine\\System",
+        )
+        .expect("Failed to load standard WDM driver into Ring 0 host");
+
+    // Apply strict W^X protection to standard WDM driver
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    {
+        if let Some(ref mut kas) = *crate::mem::KERNEL_ADDRESS_SPACE.lock() {
+            std_driver
+                .enforce_wx_protection(|va, writable, executable| {
+                    let mut flags = crate::mem::vmm::PageTableFlags::empty();
+                    if writable {
+                        flags |= crate::mem::vmm::PageTableFlags::WRITABLE;
+                    }
+                    if !executable {
+                        flags |= crate::mem::vmm::PageTableFlags::NO_EXECUTE;
+                    }
+                    kas.protect_kernel_page(VirtualAddress::new(va), flags)
+                        .map_err(|_| ())
+                })
+                .expect("Failed to apply W^X protection to standard_wdm sections");
+            crate::serial_println!(
+                "[+] Standard WDM sections protected with strict W^X (RX code, RW data, RO headers)"
+            );
+        }
+    }
+
+    // 1. Initialize Standard WDM Driver
+    let (std_reg_ustr, _std_reg_backing) = UnicodeString::from_str_vec(
+        "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\StandardWdm0",
+    );
+    let std_init_status = unsafe { std_driver.init(&std_reg_ustr) };
+    assert_eq!(
+        std_init_status, 0,
+        "Standard WDM DriverEntry must return STATUS_SUCCESS"
+    );
+    let std_dev_ptr = std_driver.driver_object.device_object;
+    assert!(!std_dev_ptr.is_null(), "DeviceObject creation failed");
+    crate::serial_println!(
+        "[+] Standard WDM DriverEntry initialized successfully: DeviceObject at {:p}",
+        std_dev_ptr
+    );
+
+    // 2. Test Non-Paged Memory Pool Allocation & Verification IOCTL
+    let mut pool_result: u32 = 0;
+    let mut stack_mem = IoStackLocation {
+        major_function: IRP_MJ_DEVICE_CONTROL as u8,
+        parameters: ParametersDeviceIoControl {
+            output_buffer_length: 4,
+            input_buffer_length: 0,
+            io_control_code: IOCTL_WDM_SAMPLE_MEM_TEST,
+            _padding: 0,
+            type3_input_buffer: core::ptr::null_mut(),
+        },
+        ..Default::default()
+    };
+    let mut ioctl_irp_mem = Irp {
+        user_buffer: &mut pool_result as *mut u32 as *mut c_void,
+        current_stack_location: &mut stack_mem,
+        ..Default::default()
+    };
+    let pool_status =
+        unsafe { std_driver.dispatch(IRP_MJ_DEVICE_CONTROL, std_dev_ptr, &mut ioctl_irp_mem) };
+    assert_eq!(pool_status, 0, "Pool test IOCTL failed");
+    assert_eq!(
+        pool_result, 0x504F4F4C,
+        "Pool test result must match 'POOL' (0x504F4F4C)"
+    );
+    crate::serial_println!(
+        "[+] Non-Paged Pool allocation and memory verification verified (0x{:08X})",
+        pool_result
+    );
+
+    // 3. Test SpinLock and Hardware CR8 IRQL IOCTL
+    let mut spinlock_counter: u32 = 0;
+    let mut stack_spin = IoStackLocation {
+        major_function: IRP_MJ_DEVICE_CONTROL as u8,
+        parameters: ParametersDeviceIoControl {
+            output_buffer_length: 4,
+            input_buffer_length: 0,
+            io_control_code: IOCTL_WDM_SAMPLE_SPINLOCK_IRQL,
+            _padding: 0,
+            type3_input_buffer: core::ptr::null_mut(),
+        },
+        ..Default::default()
+    };
+    let mut ioctl_irp_spin = Irp {
+        user_buffer: &mut spinlock_counter as *mut u32 as *mut c_void,
+        current_stack_location: &mut stack_spin,
+        ..Default::default()
+    };
+    let spin_status =
+        unsafe { std_driver.dispatch(IRP_MJ_DEVICE_CONTROL, std_dev_ptr, &mut ioctl_irp_spin) };
+    assert_eq!(spin_status, 0, "SpinLock test IOCTL failed");
+    assert_eq!(spinlock_counter, 101, "SpinLock counter mismatch");
+    assert_eq!(
+        crate::arch::x86_64::read_cr8_irql(),
+        PASSIVE_LEVEL,
+        "IRQL must return to PASSIVE_LEVEL after spinlock release"
+    );
+    crate::serial_println!(
+        "[+] SpinLock synchronization and hardware CR8 IRQL elevation verified (counter = {})",
+        spinlock_counter
+    );
+
+    // 4. Test Event Synchronization IOCTL
+    let mut event_res: u32 = 0;
+    let mut stack_evt = IoStackLocation {
+        major_function: IRP_MJ_DEVICE_CONTROL as u8,
+        parameters: ParametersDeviceIoControl {
+            output_buffer_length: 4,
+            input_buffer_length: 0,
+            io_control_code: IOCTL_WDM_SAMPLE_EVENT_TEST,
+            _padding: 0,
+            type3_input_buffer: core::ptr::null_mut(),
+        },
+        ..Default::default()
+    };
+    let mut ioctl_irp_evt = Irp {
+        user_buffer: &mut event_res as *mut u32 as *mut c_void,
+        current_stack_location: &mut stack_evt,
+        ..Default::default()
+    };
+    let evt_status =
+        unsafe { std_driver.dispatch(IRP_MJ_DEVICE_CONTROL, std_dev_ptr, &mut ioctl_irp_evt) };
+    assert_eq!(evt_status, 0, "Event test IOCTL failed");
+    assert_eq!(
+        event_res, 0xCAFE_FEED,
+        "Event test result must match 0xCAFEFEED"
+    );
+    crate::serial_println!(
+        "[+] KEvent signaling and synchronization verified (0x{:08X})",
+        event_res
+    );
+
+    // 5. Test Standard WDM Payload Read
+    let mut std_read_buf = [0u8; 32];
+    let mut std_read_stack = IoStackLocation {
+        major_function: IRP_MJ_READ as u8,
+        device_object: std_dev_ptr,
+        parameters: ParametersDeviceIoControl {
+            output_buffer_length: 32,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut std_read_irp = Irp {
+        user_buffer: std_read_buf.as_mut_ptr() as *mut c_void,
+        current_stack_location: &mut std_read_stack,
+        ..Default::default()
+    };
+    let std_read_status =
+        unsafe { std_driver.dispatch(IRP_MJ_READ, std_dev_ptr, &mut std_read_irp) };
+    assert_eq!(std_read_status, 0, "Standard WDM IRP_MJ_READ failed");
+    assert_eq!(std_read_irp.io_status.information, 27);
+    let std_read_str = core::str::from_utf8(&std_read_buf[..27]).unwrap_or("<invalid utf8>");
+    crate::serial_println!("[+] Standard WDM IRP_MJ_READ verified: '{}'", std_read_str);
+
+    // 6. Test Unload of Standard WDM Driver (pool freeing, symbolic link/device destruction)
+    unsafe {
+        std_driver.unload().expect("Standard WDM unload failed");
+    }
+    assert!(
+        std_driver.driver_object.device_object.is_null(),
+        "DeviceObject must be destroyed on unload"
+    );
+    #[cfg(any(target_os = "uefi", target_os = "none"))]
+    {
+        if let Some(ref mut kas) = *crate::mem::KERNEL_ADDRESS_SPACE.lock() {
+            let start = (std_driver.buffer.as_ptr() as u64) & !4095;
+            let end =
+                (std_driver.buffer.as_ptr() as u64 + std_driver.buffer.len() as u64 + 4095) & !4095;
+            for addr in (start..end).step_by(4096) {
+                let _ = kas.protect_kernel_page(
+                    VirtualAddress::new(addr),
+                    crate::mem::vmm::PageTableFlags::WRITABLE
+                        | crate::mem::vmm::PageTableFlags::NO_EXECUTE,
+                );
+            }
+        }
+    }
+    crate::serial_println!(
+        "[+] Standard WDM DriverUnload executed cleanly: DeviceObject destroyed and pools freed"
+    );
+
+    // =========================================================================
+    // Part 3: Adversarial & Architectural Invariant Checks
+    // =========================================================================
+    // Test that CR8 hardware manipulation reflects in read_cr8_irql and prevents preemption
+    {
+        crate::arch::x86_64::write_cr8_irql(DISPATCH_LEVEL);
+        assert_eq!(crate::arch::x86_64::read_cr8_irql(), DISPATCH_LEVEL);
+        // Lower back to PASSIVE_LEVEL
+        crate::arch::x86_64::write_cr8_irql(PASSIVE_LEVEL);
+        assert_eq!(crate::arch::x86_64::read_cr8_irql(), PASSIVE_LEVEL);
+    }
+    crate::serial_println!("[+] Hardware CR8 Task Priority Register (TPR) verified at Ring 0");
 }

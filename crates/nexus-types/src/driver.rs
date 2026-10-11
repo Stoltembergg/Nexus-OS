@@ -22,11 +22,75 @@ pub const STATUS_SUCCESS: i32 = 0x0000_0000;
 pub const STATUS_INVALID_PARAMETER: i32 = -1073741811; // 0xC000000D
 pub const STATUS_NOT_IMPLEMENTED: i32 = -1073741822; // 0xC0000002
 pub const STATUS_BUFFER_TOO_SMALL: i32 = -1073741789; // 0xC0000023
+pub const STATUS_INSUFFICIENT_RESOURCES: i32 = -1073741801; // 0xC0000017
+pub const STATUS_UNSUCCESSFUL: i32 = -1073741823; // 0xC0000001
 
-/// Test IOCTL Codes
+/// Standard Windows NT Device Control Definition Macro (`CTL_CODE`).
+pub const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
+    (device_type << 16) | (access << 14) | (function << 2) | method
+}
+
+pub const FILE_DEVICE_UNKNOWN: u32 = 0x0000_0022;
+pub const METHOD_BUFFERED: u32 = 0;
+pub const FILE_ANY_ACCESS: u32 = 0;
+
+/// Generic WDM Sample IOCTLs (independent of OS vendor naming).
+pub const IOCTL_WDM_SAMPLE_MEM_TEST: u32 =
+    ctl_code(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS);
+pub const IOCTL_WDM_SAMPLE_SPINLOCK_IRQL: u32 =
+    ctl_code(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS);
+pub const IOCTL_WDM_SAMPLE_EVENT_TEST: u32 =
+    ctl_code(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS);
+
+/// Test IOCTL Codes for Nexus Verification
 pub const IOCTL_NEXUS_GET_VERSION: u32 = 0x8000_2000;
 pub const IOCTL_NEXUS_ECHO: u32 = 0x8000_2004;
 pub const IOCTL_NEXUS_RAISE_IRQL_TEST: u32 = 0x8000_2008;
+
+/// NT Memory Pool Types (`POOL_TYPE`).
+pub const POOL_TYPE_NON_PAGED: u32 = 0;
+pub const POOL_TYPE_PAGED: u32 = 1;
+pub const POOL_TYPE_NON_PAGED_NX: u32 = 512;
+
+/// NT Spinlock Type (`KSPIN_LOCK`).
+pub type KSpinLock = usize;
+
+/// NT Event Synchronization Object (`KEVENT`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KEvent {
+    pub header_type: u8,
+    pub header_signaled: u8,
+    pub header_size: u8,
+    pub header_reserved: u8,
+    pub signal_state: i32,
+    pub wait_list_blink: *mut c_void,
+    pub wait_list_flink: *mut c_void,
+}
+
+impl Default for KEvent {
+    fn default() -> Self {
+        Self {
+            header_type: 0,
+            header_signaled: 0,
+            header_size: core::mem::size_of::<Self>() as u8,
+            header_reserved: 0,
+            signal_state: 0,
+            wait_list_blink: core::ptr::null_mut(),
+            wait_list_flink: core::ptr::null_mut(),
+        }
+    }
+}
+
+/// Driver Section Mapping details for W^X enforcement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriverSectionMapping {
+    pub name: [u8; 8],
+    pub rva: u32,
+    pub size: u32,
+    pub is_executable: bool,
+    pub is_writable: bool,
+}
 
 /// Unicode String structure used across the Windows NT Kernel (`UNICODE_STRING`).
 #[repr(C)]
@@ -308,7 +372,7 @@ impl Default for Irp {
             _padding1: 0,
             associated_irp: core::ptr::null_mut(),
             io_status: IoStatusBlock::default(),
-            requestor_mode: 0, // KernelMode = 0
+            requestor_mode: 0,
             pending_returned: 0,
             stack_count: 1,
             current_location: 1,
@@ -327,6 +391,7 @@ mod tests {
     fn test_driver_object_sizes_and_alignments() {
         assert_eq!(core::mem::size_of::<UnicodeString>(), 16);
         assert_eq!(core::mem::size_of::<IoStatusBlock>(), 16);
+        assert_eq!(core::mem::size_of::<KEvent>(), 24);
         let drv = DriverObject::default();
         assert_eq!(drv.type_, 4);
         assert_eq!(drv.major_function.len(), 28);
@@ -338,5 +403,12 @@ mod tests {
         assert_eq!(ustr.length, 34); // 17 UTF-16 code units * 2 bytes
         assert_eq!(ustr.maximum_length, 36); // Including null terminator
         assert!(!ustr.buffer.is_null());
+    }
+
+    #[test]
+    fn test_ctl_code_calculation() {
+        let code = ctl_code(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS);
+        assert_eq!(code, 0x00222004);
+        assert_eq!(IOCTL_WDM_SAMPLE_MEM_TEST, code);
     }
 }

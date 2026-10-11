@@ -28,6 +28,8 @@ def validate(returncode, serial):
         raise RuntimeError('Original Phase 3 execution did not finish its outcome assertions')
     if serial.count('NEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0') != 1:
         raise RuntimeError('Phase 3.6 NT driver execution did not complete in guest Ring 0')
+    if serial.count('NEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0') != 1:
+        raise RuntimeError('Phase 3.7 NT driver hardening did not complete in guest Ring 0')
     if 'NEXUS_STRESS:cycles=64:processes=128:yields=1024:' not in serial:
         raise RuntimeError('Missing measured stress results')
 

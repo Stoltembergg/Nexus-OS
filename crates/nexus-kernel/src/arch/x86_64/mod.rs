@@ -26,6 +26,50 @@ pub fn set_kernel_stack(rsp0: u64) {
     }
 }
 
+/// Reads the current hardware Task Priority Register (TPR / IRQL) from CR8.
+#[inline(always)]
+pub fn read_cr8_irql() -> u8 {
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
+    {
+        let cr8: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {}, cr8",
+                out(reg) cr8,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        (cr8 & 0x0F) as u8
+    }
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
+    {
+        0
+    }
+}
+
+/// Writes the hardware Task Priority Register (TPR / IRQL) to CR8.
+///
+/// In x86_64 long mode, writing CR8 bits 3:0 updates the Local APIC TPR,
+/// hardware-masking all interrupts with priority <= TPR.
+#[inline(always)]
+pub fn write_cr8_irql(irql: u8) {
+    #[cfg(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none")))]
+    {
+        let cr8 = (irql & 0x0F) as u64;
+        unsafe {
+            core::arch::asm!(
+                "mov cr8, {}",
+                in(reg) cr8,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", any(target_os = "uefi", target_os = "none"))))]
+    {
+        let _ = irql;
+    }
+}
+
 /// Sets the user FS base address in IA32_FS_BASE (0xC0000100).
 ///
 /// # Safety

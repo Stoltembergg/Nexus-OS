@@ -7,20 +7,37 @@
 extern crate alloc;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use byteorder::{ByteOrder, LittleEndian};
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use nexus_types::driver::{
-    DeviceObject, DriverEntryFn, DriverObject, Irp, Kirql, UnicodeString, IMAGE_SUBSYSTEM_NATIVE,
-    IRP_MJ_MAXIMUM_FUNCTION, PASSIVE_LEVEL, STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED,
-    STATUS_SUCCESS,
+    DeviceObject, DriverEntryFn, DriverObject, DriverSectionMapping, Irp, KEvent, Kirql,
+    UnicodeString, DISPATCH_LEVEL, IMAGE_SUBSYSTEM_NATIVE, IRP_MJ_MAXIMUM_FUNCTION, PASSIVE_LEVEL,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_IMPLEMENTED, STATUS_SUCCESS,
 };
 
 use crate::error::LoaderError;
-use crate::pe::{PeImage, IMAGE_REL_BASED_DIR64};
+use crate::pe::{PeImage, IMAGE_REL_BASED_DIR64, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE};
 
-/// Global IRQL tracking register for the NT host executive.
+/// Global IRQL tracking register for the NT host executive (software fallback).
 pub static CURRENT_IRQL: AtomicU8 = AtomicU8::new(PASSIVE_LEVEL);
+
+/// Hardware IRQL getter callback hook (e.g. reading CR8 / TPR on bare metal).
+pub static HARDWARE_IRQL_GETTER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Hardware IRQL setter callback hook (e.g. writing CR8 / TPR on bare metal).
+pub static HARDWARE_IRQL_SETTER: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Pool header magic token: "NEXUSPOL" (0x4E455855_53504F4C).
+const POOL_HEADER_MAGIC: u64 = 0x4E455855_53504F4C;
+
+#[repr(C, align(16))]
+struct PoolHeader {
+    magic: u64,
+    size: u32,
+    tag: u32,
+}
 
 /// Errors encountered while loading, binding, and executing an NT kernel driver.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,6 +51,7 @@ pub enum NtDriverError {
     MemoryAllocationFailed,
     DriverEntryFailed(i32),
     NoUnloadRoutine,
+    ProtectionFailed,
 }
 
 impl From<LoaderError> for NtDriverError {
@@ -75,14 +93,14 @@ impl ExecutableBuffer {
 
         const MEM_COMMIT: u32 = 0x1000;
         const MEM_RESERVE: u32 = 0x2000;
-        const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+        const PAGE_READWRITE: u32 = 0x04;
 
         let ptr = unsafe {
             VirtualAlloc(
                 core::ptr::null_mut(),
                 size,
                 MEM_COMMIT | MEM_RESERVE,
-                PAGE_EXECUTE_READWRITE,
+                PAGE_READWRITE,
             )
         };
 
@@ -96,8 +114,48 @@ impl ExecutableBuffer {
         })
     }
 
+    pub fn protect_range(
+        &self,
+        offset: usize,
+        size: usize,
+        writable: bool,
+        executable: bool,
+    ) -> Result<(), NtDriverError> {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn VirtualProtect(
+                lpAddress: *mut c_void,
+                dwSize: usize,
+                flNewProtect: u32,
+                lpflOldProtect: *mut u32,
+            ) -> i32;
+        }
+
+        // Strict W^X policy: RWX is strictly forbidden!
+        let protect = match (writable, executable) {
+            (false, false) => 0x02, // PAGE_READONLY
+            (false, true) => 0x20,  // PAGE_EXECUTE_READ
+            (true, false) => 0x04,  // PAGE_READWRITE
+            (true, true) => return Err(NtDriverError::ProtectionFailed),
+        };
+
+        let mut old = 0u32;
+        let res =
+            unsafe { VirtualProtect(self.ptr.add(offset) as *mut c_void, size, protect, &mut old) };
+
+        if res == 0 {
+            return Err(NtDriverError::ProtectionFailed);
+        }
+
+        Ok(())
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.size) }
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -124,6 +182,7 @@ impl Drop for ExecutableBuffer {
         extern "system" {
             fn VirtualFree(lpAddress: *mut c_void, dwSize: usize, dwFreeType: u32) -> i32;
         }
+
         const MEM_RELEASE: u32 = 0x8000;
         if !self.ptr.is_null() {
             unsafe {
@@ -133,38 +192,21 @@ impl Drop for ExecutableBuffer {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(windows)))]
 impl ExecutableBuffer {
     pub fn allocate(size: usize) -> Result<Self, NtDriverError> {
-        extern "C" {
-            fn mmap(
-                addr: *mut c_void,
-                len: usize,
-                prot: i32,
-                flags: i32,
-                fd: i32,
-                offset: i64,
-            ) -> *mut c_void;
-        }
-
-        const PROT_READ: i32 = 1;
-        const PROT_WRITE: i32 = 2;
-        const PROT_EXEC: i32 = 4;
-        const MAP_PRIVATE: i32 = 2;
-        const MAP_ANONYMOUS: i32 = 0x20;
-
         let ptr = unsafe {
-            mmap(
+            libc::mmap(
                 core::ptr::null_mut(),
                 size,
-                PROT_READ | PROT_WRITE | PROT_EXEC,
-                MAP_PRIVATE | MAP_ANONYMOUS,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
                 0,
             )
         };
 
-        if ptr == (usize::MAX as *mut c_void) || ptr.is_null() {
+        if ptr == libc::MAP_FAILED || ptr.is_null() {
             return Err(NtDriverError::MemoryAllocationFailed);
         }
 
@@ -174,8 +216,33 @@ impl ExecutableBuffer {
         })
     }
 
+    pub fn protect_range(
+        &self,
+        offset: usize,
+        size: usize,
+        writable: bool,
+        executable: bool,
+    ) -> Result<(), NtDriverError> {
+        let prot = match (writable, executable) {
+            (false, false) => libc::PROT_READ,
+            (false, true) => libc::PROT_READ | libc::PROT_EXEC,
+            (true, false) => libc::PROT_READ | libc::PROT_WRITE,
+            (true, true) => return Err(NtDriverError::ProtectionFailed),
+        };
+
+        let res = unsafe { libc::mprotect(self.ptr.add(offset) as *mut c_void, size, prot) };
+        if res != 0 {
+            return Err(NtDriverError::ProtectionFailed);
+        }
+        Ok(())
+    }
+
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.size) }
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -195,15 +262,12 @@ impl ExecutableBuffer {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(windows)))]
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
-        extern "C" {
-            fn munmap(addr: *mut c_void, len: usize) -> i32;
-        }
         if !self.ptr.is_null() {
             unsafe {
-                munmap(self.ptr as *mut c_void, self.size);
+                libc::munmap(self.ptr as *mut c_void, self.size);
             }
         }
     }
@@ -218,11 +282,26 @@ impl ExecutableBuffer {
         if ptr.is_null() {
             return Err(NtDriverError::MemoryAllocationFailed);
         }
+
         Ok(Self { ptr, size })
+    }
+
+    pub fn protect_range(
+        &self,
+        _offset: usize,
+        _size: usize,
+        _writable: bool,
+        _executable: bool,
+    ) -> Result<(), NtDriverError> {
+        Ok(())
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.size) }
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -270,7 +349,7 @@ impl NtoskrnlTable {
             exports: BTreeMap::new(),
         };
 
-        // Register default WDM core exports
+        // Core I/O and Driver Management
         table.register(
             "NTOSKRNL.EXE",
             "DbgPrint",
@@ -301,6 +380,8 @@ impl NtoskrnlTable {
             "IoCompleteRequest",
             stub_io_complete_request as *const () as usize,
         );
+
+        // Hardware / Software IRQL Management
         table.register(
             "NTOSKRNL.EXE",
             "KeGetCurrentIrql",
@@ -316,10 +397,79 @@ impl NtoskrnlTable {
             "KeLowerIrql",
             stub_ke_lower_irql as *const () as usize,
         );
+
+        // String and Memory Management
         table.register(
             "NTOSKRNL.EXE",
             "RtlInitUnicodeString",
             stub_rtl_init_unicode_string as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "ExAllocatePoolWithTag",
+            stub_ex_allocate_pool_with_tag as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "ExFreePoolWithTag",
+            stub_ex_free_pool_with_tag as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "ExFreePool",
+            stub_ex_free_pool as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "RtlCopyMemory",
+            stub_rtl_copy_memory as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "RtlZeroMemory",
+            stub_rtl_zero_memory as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "RtlCompareMemory",
+            stub_rtl_compare_memory as *const () as usize,
+        );
+
+        // Synchronization Primitives (SpinLocks and Events)
+        table.register(
+            "NTOSKRNL.EXE",
+            "KeInitializeSpinLock",
+            stub_ke_initialize_spin_lock as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "KeAcquireSpinLock",
+            stub_ke_acquire_spin_lock as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "KeReleaseSpinLock",
+            stub_ke_release_spin_lock as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "KeInitializeEvent",
+            stub_ke_initialize_event as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "KeSetEvent",
+            stub_ke_set_event as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "KeResetEvent",
+            stub_ke_reset_event as *const () as usize,
+        );
+        table.register(
+            "NTOSKRNL.EXE",
+            "KeWaitForSingleObject",
+            stub_ke_wait_for_single_object as *const () as usize,
         );
 
         table
@@ -339,7 +489,7 @@ impl NtoskrnlTable {
     }
 }
 
-/// Active, loaded Windows NT kernel driver instance.
+/// A loaded and initialized NT driver instance in kernel memory.
 #[derive(Debug)]
 pub struct LoadedDriver {
     pub name: String,
@@ -347,50 +497,126 @@ pub struct LoadedDriver {
     pub entry_point: u64,
     pub driver_object: DriverObject,
     pub buffer: ExecutableBuffer,
+    pub sections: Vec<DriverSectionMapping>,
 }
 
 impl LoadedDriver {
-    /// Calls the driver's native `DriverEntry` routine.
+    /// Enforces W^X page protection on the driver's memory layout.
     ///
-    /// # Safety
-    ///
-    /// Executes native kernel-mode code at the driver's entry point.
-    pub unsafe fn init(&mut self, registry_path: *const UnicodeString) -> i32 {
-        let entry_fn: DriverEntryFn = core::mem::transmute(self.entry_point as *const ());
-        entry_fn(&mut self.driver_object, registry_path)
+    /// - Executable sections (.text) are strictly Read+Execute (NOT Writable).
+    /// - Data sections (.data, .bss, INIT) are strictly Read+Write (NOT Executable).
+    /// - Read-only sections (.rdata, .pdata) and headers are Read-Only (NOT Writable, NOT Executable).
+    /// - NO page is left with simultaneous Write and Execute permissions.
+    pub fn enforce_wx_protection<F>(&self, mut set_page_flags: F) -> Result<(), NtDriverError>
+    where
+        F: FnMut(
+            u64,  /* va */
+            bool, /* writable */
+            bool, /* executable */
+        ) -> Result<(), ()>,
+    {
+        // 1. Headers [0 .. first section RVA]: Read-Only (RO, NX)
+        let header_end = self.sections.first().map(|s| s.rva as u64).unwrap_or(4096);
+        let header_pages = (header_end + 4095) & !4095;
+        for offset in (0..header_pages).step_by(4096) {
+            set_page_flags(self.image_base + offset, false, false)
+                .map_err(|_| NtDriverError::ProtectionFailed)?;
+        }
+
+        // 2. Sections
+        for sec in &self.sections {
+            // Strict W^X assertion: no section can ever be both W and X
+            if sec.is_writable && sec.is_executable {
+                return Err(NtDriverError::InvalidImageFormat);
+            }
+
+            let start = (self.image_base + sec.rva as u64) & !4095;
+            let end = (self.image_base + sec.rva as u64 + sec.size as u64 + 4095) & !4095;
+
+            for va in (start..end).step_by(4096) {
+                set_page_flags(va, sec.is_writable, sec.is_executable)
+                    .map_err(|_| NtDriverError::ProtectionFailed)?;
+            }
+        }
+
+        Ok(())
     }
 
-    /// Dispatches an I/O Request Packet (IRP) to the driver's registered dispatch routine.
+    /// Automatically applies platform page permissions matching each section (W^X enforcement).
+    pub fn apply_platform_protection(&self) -> Result<(), NtDriverError> {
+        #[cfg(any(windows, unix))]
+        {
+            let header_end = self
+                .sections
+                .first()
+                .map(|s| s.rva as usize)
+                .unwrap_or(4096);
+            let header_pages = (header_end + 4095) & !4095;
+            self.buffer.protect_range(0, header_pages, false, false)?;
+
+            for sec in &self.sections {
+                let start = sec.rva as usize;
+                let size = ((sec.size as usize) + 4095) & !4095;
+                if start + size <= self.buffer.len() {
+                    self.buffer
+                        .protect_range(start, size, sec.is_writable, sec.is_executable)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Invokes the native `DriverEntry` routine of the loaded driver.
     ///
     /// # Safety
     ///
-    /// The caller must ensure that `device` points to a valid `DeviceObject` and `irp` points
-    /// to a valid `Irp` instance in accessible memory.
+    /// The entry point must point to valid native x86_64 code compiled for Ring 0.
+    pub unsafe fn init(&mut self, registry_path: &UnicodeString) -> i32 {
+        let entry: DriverEntryFn = core::mem::transmute(self.entry_point);
+        let status = entry(&mut self.driver_object, registry_path);
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+
+        // If DriverEntry created device objects, capture the head of the chain
+        if !self.driver_object.device_object.is_null() {
+            (*self.driver_object.device_object).driver_object = &mut self.driver_object;
+        }
+
+        STATUS_SUCCESS
+    }
+
+    /// Safely dispatches an IRP to the driver's registered major function handler.
+    ///
+    /// # Safety
+    ///
+    /// `device` and `irp` must be valid non-null pointers to WDM structures.
     pub unsafe fn dispatch(
-        &mut self,
+        &self,
         major_function: usize,
         device: *mut DeviceObject,
         irp: *mut Irp,
     ) -> i32 {
         if major_function > IRP_MJ_MAXIMUM_FUNCTION {
-            return STATUS_NOT_IMPLEMENTED;
+            return STATUS_INVALID_PARAMETER;
         }
 
-        if let Some(dispatch_fn) = self.driver_object.major_function[major_function] {
-            dispatch_fn(device, irp)
+        if let Some(handler) = self.driver_object.major_function[major_function] {
+            handler(device, irp)
         } else {
             STATUS_NOT_IMPLEMENTED
         }
     }
 
-    /// Calls the driver's registered `DriverUnload` routine.
+    /// Unloads the driver, invoking its `DriverUnload` routine and releasing resources.
     ///
     /// # Safety
     ///
-    /// Executes the driver's unload routine and frees associated devices.
+    /// Must be called at PASSIVE_LEVEL with no outstanding I/O requests.
     pub unsafe fn unload(&mut self) -> Result<(), NtDriverError> {
         if let Some(unload_fn) = self.driver_object.driver_unload {
             unload_fn(&mut self.driver_object);
+            self.driver_object.device_object = core::ptr::null_mut();
             Ok(())
         } else {
             Err(NtDriverError::NoUnloadRoutine)
@@ -398,9 +624,9 @@ impl LoadedDriver {
     }
 }
 
-/// Host executive capable of loading, binding, and executing Windows NT `.sys` drivers.
+/// Host environment capable of parsing, relocating, and executing NT drivers.
 pub struct NtDriverHost {
-    pub kernel_table: NtoskrnlTable,
+    kernel_table: NtoskrnlTable,
 }
 
 impl Default for NtDriverHost {
@@ -416,14 +642,17 @@ impl NtDriverHost {
         }
     }
 
-    /// Validates, maps, relocates, binds imports, and initializes an NT kernel driver from raw `.sys` PE bytes.
+    pub fn kernel_table_mut(&mut self) -> &mut NtoskrnlTable {
+        &mut self.kernel_table
+    }
+
+    /// Loads, maps, relocates, and binds a PE32+ native kernel driver.
     pub fn load_driver(
         &self,
         sys_bytes: &[u8],
         driver_name: &str,
         _registry_path: &str,
     ) -> Result<LoadedDriver, NtDriverError> {
-        // 1. Parse PE Image and verify subsystem
         let pe = PeImage::parse(sys_bytes)?;
 
         if pe.subsystem != IMAGE_SUBSYSTEM_NATIVE {
@@ -434,24 +663,40 @@ impl NtDriverHost {
             return Err(NtDriverError::NoEntryPoint);
         }
 
-        // 2. Allocate executable memory buffer for headers and sections
-        let image_size = pe.size_of_image as usize;
+        // 1. Allocate aligned buffer (initially PAGE_READWRITE for relocations and IAT)
+        let image_size = (pe.size_of_image as usize + 4095) & !4095;
         let mut buffer = ExecutableBuffer::allocate(image_size)?;
 
-        // Map PE Headers
+        // 2. Map PE Headers and Sections
         let header_copy_len = (pe.size_of_headers as usize).min(sys_bytes.len());
         buffer.as_mut_slice()[..header_copy_len].copy_from_slice(&sys_bytes[..header_copy_len]);
 
-        // Map Sections
+        let mut section_mappings = Vec::new();
         for sec in &pe.sections {
             let va_start = sec.virtual_address as usize;
             let raw_start = sec.pointer_to_raw_data as usize;
-            let raw_size = (sec.size_of_raw_data as usize).min(sec.virtual_size as usize);
+            let raw_size = sec.size_of_raw_data as usize;
 
             if raw_start + raw_size <= sys_bytes.len() && va_start + raw_size <= buffer.len() {
                 buffer.as_mut_slice()[va_start..va_start + raw_size]
                     .copy_from_slice(&sys_bytes[raw_start..raw_start + raw_size]);
             }
+
+            let mut name_bytes = [0u8; 8];
+            let src_bytes = sec.name.as_bytes();
+            let copy_len = src_bytes.len().min(8);
+            name_bytes[..copy_len].copy_from_slice(&src_bytes[..copy_len]);
+
+            let is_exec = (sec.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
+            let is_write = (sec.characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+
+            section_mappings.push(DriverSectionMapping {
+                name: name_bytes,
+                rva: sec.virtual_address,
+                size: sec.virtual_size,
+                is_executable: is_exec,
+                is_writable: is_write,
+            });
         }
 
         // 3. Process Base Relocations
@@ -512,13 +757,19 @@ impl NtDriverHost {
 
         let entry_va = actual_base + pe.entry_point_rva as u64;
 
-        Ok(LoadedDriver {
+        let loaded = LoadedDriver {
             name: driver_name.to_string(),
             image_base: actual_base,
             entry_point: entry_va,
             driver_object: driver_obj,
             buffer,
-        })
+            sections: section_mappings,
+        };
+
+        // 6. Enforce W^X platform page protection (Code -> RX, Data -> RW/RO, Headers -> RO)
+        loaded.apply_platform_protection()?;
+
+        Ok(loaded)
     }
 }
 
@@ -539,9 +790,15 @@ pub unsafe extern "win64" fn stub_dbg_print(_format_ptr: *const u8) -> i32 {
 ///
 /// # Safety
 ///
-/// Safe to call in any context; reads atomic IRQL status.
+/// Safe to call in any context. Queries hardware CR8 if hook is set, or software fallback.
 pub unsafe extern "win64" fn stub_ke_get_current_irql() -> Kirql {
-    CURRENT_IRQL.load(Ordering::SeqCst)
+    let fn_ptr = HARDWARE_IRQL_GETTER.load(Ordering::Acquire);
+    if !fn_ptr.is_null() {
+        let getter: fn() -> u8 = core::mem::transmute(fn_ptr);
+        getter()
+    } else {
+        CURRENT_IRQL.load(Ordering::SeqCst)
+    }
 }
 
 /// WDM KeRaiseIrql export stub.
@@ -550,10 +807,16 @@ pub unsafe extern "win64" fn stub_ke_get_current_irql() -> Kirql {
 ///
 /// If `old_irql` is non-null, it must be writable for a single byte.
 pub unsafe extern "win64" fn stub_ke_raise_irql(new_irql: Kirql, old_irql: *mut Kirql) {
-    let prev = CURRENT_IRQL.swap(new_irql, Ordering::SeqCst);
+    let current = stub_ke_get_current_irql();
     if !old_irql.is_null() {
-        *old_irql = prev;
+        *old_irql = current;
     }
+    let fn_ptr = HARDWARE_IRQL_SETTER.load(Ordering::Acquire);
+    if !fn_ptr.is_null() {
+        let setter: unsafe fn(u8) = core::mem::transmute(fn_ptr);
+        setter(new_irql);
+    }
+    CURRENT_IRQL.store(new_irql, Ordering::SeqCst);
 }
 
 /// WDM KeLowerIrql export stub.
@@ -562,6 +825,11 @@ pub unsafe extern "win64" fn stub_ke_raise_irql(new_irql: Kirql, old_irql: *mut 
 ///
 /// Restores previously recorded hardware or software IRQL.
 pub unsafe extern "win64" fn stub_ke_lower_irql(new_irql: Kirql) {
+    let fn_ptr = HARDWARE_IRQL_SETTER.load(Ordering::Acquire);
+    if !fn_ptr.is_null() {
+        let setter: unsafe fn(u8) = core::mem::transmute(fn_ptr);
+        setter(new_irql);
+    }
     CURRENT_IRQL.store(new_irql, Ordering::SeqCst);
 }
 
@@ -682,16 +950,256 @@ pub unsafe extern "win64" fn stub_io_complete_request(irp: *mut Irp, _priority_b
     }
 }
 
+/// WDM ExAllocatePoolWithTag export stub.
+///
+/// # Safety
+///
+/// Allocates non-paged aligned pool memory with safety tracking header.
+pub unsafe extern "win64" fn stub_ex_allocate_pool_with_tag(
+    _pool_type: u32,
+    number_of_bytes: usize,
+    tag: u32,
+) -> *mut c_void {
+    if number_of_bytes == 0 || number_of_bytes > 0x1000_0000 {
+        return core::ptr::null_mut();
+    }
+    let total_size = core::mem::size_of::<PoolHeader>() + number_of_bytes;
+    let layout = match alloc::alloc::Layout::from_size_align(total_size, 16) {
+        Ok(l) => l,
+        Err(_) => return core::ptr::null_mut(),
+    };
+    let ptr = alloc::alloc::alloc_zeroed(layout);
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    let header = ptr as *mut PoolHeader;
+    (*header).magic = POOL_HEADER_MAGIC;
+    (*header).size = number_of_bytes as u32;
+    (*header).tag = tag;
+    ptr.add(core::mem::size_of::<PoolHeader>()) as *mut c_void
+}
+
+/// WDM ExFreePoolWithTag export stub.
+///
+/// # Safety
+///
+/// Verifies pool header magic token and tag before deallocation.
+pub unsafe extern "win64" fn stub_ex_free_pool_with_tag(p: *mut c_void, tag: u32) {
+    if p.is_null() {
+        return;
+    }
+    let ptr = (p as *mut u8).sub(core::mem::size_of::<PoolHeader>());
+    let header = ptr as *mut PoolHeader;
+    if (*header).magic != POOL_HEADER_MAGIC {
+        return; // Guard against corrupted or invalid pool pointer
+    }
+    if tag != 0 && (*header).tag != tag {
+        return; // Guard against mismatched pool tag
+    }
+    let total_size = core::mem::size_of::<PoolHeader>() + (*header).size as usize;
+    (*header).magic = 0; // Invalidate header to detect double-free
+    if let Ok(layout) = alloc::alloc::Layout::from_size_align(total_size, 16) {
+        alloc::alloc::dealloc(ptr, layout);
+    }
+}
+
+/// WDM ExFreePool export stub.
+///
+/// # Safety
+///
+/// Deallocates pool memory without strict tag check.
+pub unsafe extern "win64" fn stub_ex_free_pool(p: *mut c_void) {
+    stub_ex_free_pool_with_tag(p, 0);
+}
+
+/// WDM RtlCopyMemory export stub.
+///
+/// # Safety
+///
+/// Memory buffers must be valid and non-overlapping.
+pub unsafe extern "win64" fn stub_rtl_copy_memory(
+    destination: *mut c_void,
+    source: *const c_void,
+    length: usize,
+) {
+    if !destination.is_null() && !source.is_null() && length > 0 {
+        core::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, length);
+    }
+}
+
+/// WDM RtlZeroMemory export stub.
+///
+/// # Safety
+///
+/// Buffer must be valid and writable for `length` bytes.
+pub unsafe extern "win64" fn stub_rtl_zero_memory(destination: *mut c_void, length: usize) {
+    if !destination.is_null() && length > 0 {
+        core::ptr::write_bytes(destination as *mut u8, 0, length);
+    }
+}
+
+/// WDM RtlCompareMemory export stub.
+///
+/// # Safety
+///
+/// Buffers must be valid for `length` bytes.
+pub unsafe extern "win64" fn stub_rtl_compare_memory(
+    source1: *const c_void,
+    source2: *const c_void,
+    length: usize,
+) -> usize {
+    if source1.is_null() || source2.is_null() || length == 0 {
+        return 0;
+    }
+    let s1 = core::slice::from_raw_parts(source1 as *const u8, length);
+    let s2 = core::slice::from_raw_parts(source2 as *const u8, length);
+    let mut match_len = 0;
+    for (b1, b2) in s1.iter().zip(s2.iter()) {
+        if *b1 == *b2 {
+            match_len += 1;
+        } else {
+            break;
+        }
+    }
+    match_len
+}
+
+/// WDM KeInitializeSpinLock export stub.
+///
+/// # Safety
+///
+/// Spinlock pointer must be valid and writable.
+pub unsafe extern "win64" fn stub_ke_initialize_spin_lock(spin_lock: *mut usize) {
+    if !spin_lock.is_null() {
+        *spin_lock = 0;
+    }
+}
+
+/// WDM KeAcquireSpinLock export stub.
+///
+/// # Safety
+///
+/// Raises IRQL to `DISPATCH_LEVEL` and acquires spinlock atomically.
+pub unsafe extern "win64" fn stub_ke_acquire_spin_lock(
+    spin_lock: *mut usize,
+    old_irql: *mut Kirql,
+) {
+    stub_ke_raise_irql(DISPATCH_LEVEL, old_irql);
+    if !spin_lock.is_null() {
+        let lock_ptr = spin_lock as *const core::sync::atomic::AtomicUsize;
+        while (*lock_ptr)
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// WDM KeReleaseSpinLock export stub.
+///
+/// # Safety
+///
+/// Releases spinlock and lowers IRQL back to `new_irql`.
+pub unsafe extern "win64" fn stub_ke_release_spin_lock(spin_lock: *mut usize, new_irql: Kirql) {
+    if !spin_lock.is_null() {
+        let lock_ptr = spin_lock as *const core::sync::atomic::AtomicUsize;
+        (*lock_ptr).store(0, Ordering::Release);
+    }
+    stub_ke_lower_irql(new_irql);
+}
+
+/// WDM KeInitializeEvent export stub.
+///
+/// # Safety
+///
+/// Initializes `KEvent` structure with specified type and state.
+pub unsafe extern "win64" fn stub_ke_initialize_event(
+    event: *mut KEvent,
+    event_type: u32,
+    initial_state: u8,
+) {
+    if !event.is_null() {
+        (*event).header_type = event_type as u8;
+        (*event).header_signaled = initial_state;
+        (*event).header_size = core::mem::size_of::<KEvent>() as u8;
+        (*event).header_reserved = 0;
+        (*event).signal_state = if initial_state != 0 { 1 } else { 0 };
+        (*event).wait_list_blink = core::ptr::null_mut();
+        (*event).wait_list_flink = core::ptr::null_mut();
+    }
+}
+
+/// WDM KeSetEvent export stub.
+///
+/// # Safety
+///
+/// Signals `KEvent` and returns previous state.
+pub unsafe extern "win64" fn stub_ke_set_event(
+    event: *mut KEvent,
+    _increment: i32,
+    _wait: u8,
+) -> i32 {
+    if event.is_null() {
+        return 0;
+    }
+    let prev = (*event).signal_state;
+    (*event).signal_state = 1;
+    (*event).header_signaled = 1;
+    prev
+}
+
+/// WDM KeResetEvent export stub.
+///
+/// # Safety
+///
+/// Clears signaled state of `KEvent`.
+pub unsafe extern "win64" fn stub_ke_reset_event(event: *mut KEvent) -> i32 {
+    if event.is_null() {
+        return 0;
+    }
+    let prev = (*event).signal_state;
+    (*event).signal_state = 0;
+    (*event).header_signaled = 0;
+    prev
+}
+
+/// WDM KeWaitForSingleObject export stub.
+///
+/// # Safety
+///
+/// Verifies object signal state and returns `STATUS_SUCCESS`.
+pub unsafe extern "win64" fn stub_ke_wait_for_single_object(
+    object: *mut c_void,
+    _wait_reason: u32,
+    _wait_mode: u8,
+    _alertable: u8,
+    _timeout: *const i64,
+) -> i32 {
+    if object.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let event = object as *mut KEvent;
+    if (*event).signal_state > 0 {
+        STATUS_SUCCESS
+    } else {
+        0x00000102 // STATUS_TIMEOUT
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use nexus_types::driver::{
         IoStackLocation, ParametersDeviceIoControl, IOCTL_NEXUS_ECHO, IOCTL_NEXUS_GET_VERSION,
-        IOCTL_NEXUS_RAISE_IRQL_TEST, IRP_MJ_CREATE, IRP_MJ_DEVICE_CONTROL, IRP_MJ_READ,
+        IOCTL_NEXUS_RAISE_IRQL_TEST, IOCTL_WDM_SAMPLE_EVENT_TEST, IOCTL_WDM_SAMPLE_MEM_TEST,
+        IOCTL_WDM_SAMPLE_SPINLOCK_IRQL, IRP_MJ_CREATE, IRP_MJ_DEVICE_CONTROL, IRP_MJ_READ,
     };
 
     const REAL_DRIVER_BYTES: &[u8] =
         include_bytes!("../../../tests/fixtures/nt_driver/nexus_driver.sys");
+    const STANDARD_WDM_BYTES: &[u8] =
+        include_bytes!("../../../tests/fixtures/nt_driver/standard_wdm.sys");
 
     #[test]
     fn test_driver_loader_validates_native_subsystem() {
@@ -751,14 +1259,29 @@ mod tests {
 
         // 4. Test IRP_MJ_CREATE dispatching
         let mut create_irp = Irp::default();
-        let create_status = unsafe { driver.dispatch(IRP_MJ_CREATE, dev_ptr, &mut create_irp) };
-        assert_eq!(create_status, STATUS_SUCCESS);
+        let mut create_stack = IoStackLocation {
+            major_function: IRP_MJ_CREATE as u8,
+            device_object: dev_ptr,
+            ..Default::default()
+        };
+        create_irp.current_stack_location = &mut create_stack;
+
+        let status = unsafe { driver.dispatch(IRP_MJ_CREATE, dev_ptr, &mut create_irp) };
+        assert_eq!(
+            status, STATUS_SUCCESS,
+            "IRP_MJ_CREATE dispatch must return STATUS_SUCCESS"
+        );
         assert_eq!(create_irp.io_status.status, STATUS_SUCCESS);
 
-        // 5. Test IRP_MJ_DEVICE_CONTROL: IOCTL_NEXUS_GET_VERSION
+        // 5. Test IOCTL_NEXUS_GET_VERSION
         let mut ver_output: u32 = 0;
-        let mut stack_ver = IoStackLocation {
+        let mut ioctl_irp_ver = Irp {
+            user_buffer: &mut ver_output as *mut u32 as *mut c_void,
+            ..Default::default()
+        };
+        let mut ioctl_stack_ver = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev_ptr,
             parameters: ParametersDeviceIoControl {
                 output_buffer_length: 4,
                 input_buffer_length: 0,
@@ -768,23 +1291,26 @@ mod tests {
             },
             ..Default::default()
         };
-
-        let mut ioctl_irp_ver = Irp {
-            user_buffer: &mut ver_output as *mut u32 as *mut c_void,
-            current_stack_location: &mut stack_ver,
-            ..Default::default()
-        };
+        ioctl_irp_ver.current_stack_location = &mut ioctl_stack_ver;
 
         let status = unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev_ptr, &mut ioctl_irp_ver) };
-        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(
+            status, STATUS_SUCCESS,
+            "IOCTL_NEXUS_GET_VERSION dispatch failed"
+        );
         assert_eq!(ioctl_irp_ver.io_status.status, STATUS_SUCCESS);
         assert_eq!(ioctl_irp_ver.io_status.information, 4);
-        assert_eq!(ver_output, 0x00030600, "Must return Phase 3.6 version tag");
+        assert_eq!(ver_output, 0x0003_0600);
 
-        // 6. Test IRP_MJ_DEVICE_CONTROL: IOCTL_NEXUS_ECHO (Case Transformation)
+        // 6. Test IOCTL_NEXUS_ECHO
         let mut text_buf = *b"Hello Nexus OS Kernel!\0";
-        let mut stack_echo = IoStackLocation {
+        let mut ioctl_irp_echo = Irp {
+            user_buffer: text_buf.as_mut_ptr() as *mut c_void,
+            ..Default::default()
+        };
+        let mut ioctl_stack_echo = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev_ptr,
             parameters: ParametersDeviceIoControl {
                 output_buffer_length: 22,
                 input_buffer_length: 22,
@@ -794,12 +1320,7 @@ mod tests {
             },
             ..Default::default()
         };
-
-        let mut ioctl_irp_echo = Irp {
-            user_buffer: text_buf.as_mut_ptr() as *mut c_void,
-            current_stack_location: &mut stack_echo,
-            ..Default::default()
-        };
+        ioctl_irp_echo.current_stack_location = &mut ioctl_stack_echo;
 
         let status =
             unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev_ptr, &mut ioctl_irp_echo) };
@@ -807,10 +1328,15 @@ mod tests {
         assert_eq!(ioctl_irp_echo.io_status.information, 22);
         assert_eq!(&text_buf[..22], b"hELLO nEXUS os kERNEL!");
 
-        // 7. Test IRP_MJ_DEVICE_CONTROL: IOCTL_NEXUS_RAISE_IRQL_TEST
+        // 7. Test IOCTL_NEXUS_RAISE_IRQL_TEST
         let mut irql_test_result: u32 = 0;
-        let mut stack_irql = IoStackLocation {
+        let mut ioctl_irp_irql = Irp {
+            user_buffer: &mut irql_test_result as *mut u32 as *mut c_void,
+            ..Default::default()
+        };
+        let mut ioctl_stack_irql = IoStackLocation {
             major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev_ptr,
             parameters: ParametersDeviceIoControl {
                 output_buffer_length: 4,
                 input_buffer_length: 0,
@@ -820,12 +1346,7 @@ mod tests {
             },
             ..Default::default()
         };
-
-        let mut ioctl_irp_irql = Irp {
-            user_buffer: &mut irql_test_result as *mut u32 as *mut c_void,
-            current_stack_location: &mut stack_irql,
-            ..Default::default()
-        };
+        ioctl_irp_irql.current_stack_location = &mut ioctl_stack_irql;
 
         let status =
             unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev_ptr, &mut ioctl_irp_irql) };
@@ -843,19 +1364,296 @@ mod tests {
             user_buffer: read_buf.as_mut_ptr() as *mut c_void,
             ..Default::default()
         };
+        let mut read_stack = IoStackLocation {
+            major_function: IRP_MJ_READ as u8,
+            device_object: dev_ptr,
+            parameters: ParametersDeviceIoControl {
+                output_buffer_length: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        read_irp.current_stack_location = &mut read_stack;
 
-        let read_status = unsafe { driver.dispatch(IRP_MJ_READ, dev_ptr, &mut read_irp) };
-        assert_eq!(read_status, STATUS_SUCCESS);
+        let status = unsafe { driver.dispatch(IRP_MJ_READ, dev_ptr, &mut read_irp) };
+        assert_eq!(status, STATUS_SUCCESS);
         assert_eq!(read_irp.io_status.information, 25);
-        assert_eq!(&read_buf[..25], b"NEXUS_OS_WDM_READ_SUCCESS");
+        assert_eq!(
+            &read_buf[..25],
+            b"NEXUS_OS_WDM_READ_SUCCESS",
+            "Read payload mismatch"
+        );
 
         // 9. Test safe driver unload
         unsafe {
-            driver.unload().expect("Driver unload must succeed");
+            driver.unload().expect("DriverUnload must succeed");
         }
         assert!(
             driver.driver_object.device_object.is_null(),
-            "Device object must be destroyed on unload"
+            "DeviceObject must be cleared after unload"
         );
+    }
+
+    #[test]
+    fn test_standard_wdm_driver_execution_and_pools() {
+        let host = NtDriverHost::new();
+
+        // 1. Load authentic standard WDM driver
+        let mut driver = host
+            .load_driver(
+                STANDARD_WDM_BYTES,
+                "\\Driver\\StandardWdm0",
+                "\\Registry\\Machine\\System",
+            )
+            .expect("Standard WDM driver load failed");
+
+        // 2. Validate section mappings for W^X
+        assert!(
+            driver.sections.len() >= 4,
+            "Driver must have standard sections"
+        );
+        let text_sec = driver
+            .sections
+            .iter()
+            .find(|s| s.name.starts_with(b".text"))
+            .expect(".text section missing");
+        assert!(
+            text_sec.is_executable && !text_sec.is_writable,
+            ".text must be RX"
+        );
+
+        let data_sec = driver
+            .sections
+            .iter()
+            .find(|s| s.name.starts_with(b".data"))
+            .expect(".data section missing");
+        assert!(
+            !data_sec.is_executable && data_sec.is_writable,
+            ".data must be RW"
+        );
+
+        // 3. Initialize via DriverEntry
+        let (reg_ustr, _backing) = UnicodeString::from_str_vec(
+            "\\Registry\\Machine\\System\\CurrentControlSet\\Services\\StandardWdm0",
+        );
+        let init_status = unsafe { driver.init(&reg_ustr) };
+        assert_eq!(
+            init_status, STATUS_SUCCESS,
+            "Standard WDM DriverEntry failed"
+        );
+
+        let dev_ptr = driver.driver_object.device_object;
+        assert!(!dev_ptr.is_null(), "DeviceObject must be created");
+
+        // 4. Test Pool Allocation & Memory Verification IOCTL
+        let mut pool_test_val: u32 = 0;
+        let mut ioctl_irp_mem = Irp {
+            user_buffer: &mut pool_test_val as *mut u32 as *mut c_void,
+            ..Default::default()
+        };
+        let mut ioctl_stack_mem = IoStackLocation {
+            major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev_ptr,
+            parameters: ParametersDeviceIoControl {
+                output_buffer_length: 4,
+                input_buffer_length: 0,
+                io_control_code: IOCTL_WDM_SAMPLE_MEM_TEST,
+                _padding: 0,
+                type3_input_buffer: core::ptr::null_mut(),
+            },
+            ..Default::default()
+        };
+        ioctl_irp_mem.current_stack_location = &mut ioctl_stack_mem;
+
+        let status = unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev_ptr, &mut ioctl_irp_mem) };
+        assert_eq!(status, STATUS_SUCCESS, "Pool test IOCTL failed");
+        assert_eq!(pool_test_val, 0x504F4F4C, "Pool test result must be 'POOL'");
+
+        // 5. Test SpinLock & Hardware IRQL IOCTL
+        let mut counter_val: u32 = 0;
+        let mut ioctl_irp_spin = Irp {
+            user_buffer: &mut counter_val as *mut u32 as *mut c_void,
+            ..Default::default()
+        };
+        let mut ioctl_stack_spin = IoStackLocation {
+            major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev_ptr,
+            parameters: ParametersDeviceIoControl {
+                output_buffer_length: 4,
+                input_buffer_length: 0,
+                io_control_code: IOCTL_WDM_SAMPLE_SPINLOCK_IRQL,
+                _padding: 0,
+                type3_input_buffer: core::ptr::null_mut(),
+            },
+            ..Default::default()
+        };
+        ioctl_irp_spin.current_stack_location = &mut ioctl_stack_spin;
+
+        let status =
+            unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev_ptr, &mut ioctl_irp_spin) };
+        assert_eq!(status, STATUS_SUCCESS, "SpinLock test IOCTL failed");
+        assert_eq!(counter_val, 101, "SpinLock counter increment verified");
+        assert_eq!(CURRENT_IRQL.load(Ordering::SeqCst), PASSIVE_LEVEL);
+
+        // 6. Test Event Synchronization IOCTL
+        let mut event_val: u32 = 0;
+        let mut ioctl_irp_evt = Irp {
+            user_buffer: &mut event_val as *mut u32 as *mut c_void,
+            ..Default::default()
+        };
+        let mut ioctl_stack_evt = IoStackLocation {
+            major_function: IRP_MJ_DEVICE_CONTROL as u8,
+            device_object: dev_ptr,
+            parameters: ParametersDeviceIoControl {
+                output_buffer_length: 4,
+                input_buffer_length: 0,
+                io_control_code: IOCTL_WDM_SAMPLE_EVENT_TEST,
+                _padding: 0,
+                type3_input_buffer: core::ptr::null_mut(),
+            },
+            ..Default::default()
+        };
+        ioctl_irp_evt.current_stack_location = &mut ioctl_stack_evt;
+
+        let status = unsafe { driver.dispatch(IRP_MJ_DEVICE_CONTROL, dev_ptr, &mut ioctl_irp_evt) };
+        assert_eq!(status, STATUS_SUCCESS, "Event test IOCTL failed");
+        assert_eq!(event_val, 0xCAFEFEED, "Event synchronization verified");
+
+        // 7. Test Read Payload
+        let mut read_buf = [0u8; 32];
+        let mut read_irp = Irp {
+            user_buffer: read_buf.as_mut_ptr() as *mut c_void,
+            ..Default::default()
+        };
+        let mut read_stack = IoStackLocation {
+            major_function: IRP_MJ_READ as u8,
+            device_object: dev_ptr,
+            parameters: ParametersDeviceIoControl {
+                output_buffer_length: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        read_irp.current_stack_location = &mut read_stack;
+
+        let status = unsafe { driver.dispatch(IRP_MJ_READ, dev_ptr, &mut read_irp) };
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(read_irp.io_status.information, 27);
+        assert_eq!(
+            &read_buf[..27],
+            b"STANDARD_WDM_DEVICE_PAYLOAD",
+            "Read payload mismatch"
+        );
+
+        // 8. Test Safe Unload
+        unsafe {
+            driver
+                .unload()
+                .expect("Standard WDM DriverUnload must succeed");
+        }
+        assert!(driver.driver_object.device_object.is_null());
+    }
+
+    #[test]
+    fn test_wx_protection_and_section_isolation() {
+        let host = NtDriverHost::new();
+        let driver = host
+            .load_driver(
+                STANDARD_WDM_BYTES,
+                "\\Driver\\WxCheck",
+                "\\Registry\\Machine\\System",
+            )
+            .expect("Load failed");
+
+        let mut rx_count = 0;
+        let mut rw_count = 0;
+        let mut ro_count = 0;
+
+        let res = driver.enforce_wx_protection(|_va, writable, executable| {
+            assert!(
+                !(writable && executable),
+                "W^X Violation: page cannot be both writable and executable!"
+            );
+            if executable {
+                rx_count += 1;
+            } else if writable {
+                rw_count += 1;
+            } else {
+                ro_count += 1;
+            }
+            Ok(())
+        });
+
+        assert!(res.is_ok(), "W^X enforcement failed");
+        assert!(rx_count > 0, "Must have RX pages for code");
+        assert!(rw_count > 0, "Must have RW pages for data");
+        assert!(ro_count > 0, "Must have RO pages for headers/rdata");
+
+        // Verify with Windows OS memory query that .text is indeed PAGE_EXECUTE_READ (0x20)
+        #[cfg(windows)]
+        unsafe {
+            #[repr(C)]
+            struct MemoryBasicInformation {
+                base_address: *mut c_void,
+                allocation_base: *mut c_void,
+                allocation_protect: u32,
+                partition_id: u16,
+                region_size: usize,
+                state: u32,
+                protect: u32,
+                type_: u32,
+            }
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn VirtualQuery(
+                    lpAddress: *const c_void,
+                    lpBuffer: *mut MemoryBasicInformation,
+                    dwLength: usize,
+                ) -> usize;
+            }
+
+            let mut mbi: MemoryBasicInformation = core::mem::zeroed();
+            let text_va = (driver.image_base + 0x1000) as *const c_void;
+            let q_res = VirtualQuery(
+                text_va,
+                &mut mbi,
+                core::mem::size_of::<MemoryBasicInformation>(),
+            );
+            assert!(q_res > 0);
+            assert_eq!(
+                mbi.protect, 0x20,
+                ".text section must be PAGE_EXECUTE_READ (0x20)"
+            );
+
+            let data_va = (driver.image_base + 0x3000) as *const c_void;
+            let q_res2 = VirtualQuery(
+                data_va,
+                &mut mbi,
+                core::mem::size_of::<MemoryBasicInformation>(),
+            );
+            assert!(q_res2 > 0);
+            assert_eq!(
+                mbi.protect, 0x04,
+                ".data section must be PAGE_READWRITE (0x04)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pool_tag_verification_and_double_free() {
+        unsafe {
+            // 1. Allocate valid pool
+            let ptr = stub_ex_allocate_pool_with_tag(0, 128, 0x41424344);
+            assert!(!ptr.is_null(), "Allocation failed");
+
+            // 2. Mismatched tag free must be rejected without crash
+            stub_ex_free_pool_with_tag(ptr, 0x99999999);
+
+            // 3. Free with matching tag must succeed
+            stub_ex_free_pool_with_tag(ptr, 0x41424344);
+
+            // 4. Double-free must be rejected safely
+            stub_ex_free_pool_with_tag(ptr, 0x41424344);
+        }
     }
 }

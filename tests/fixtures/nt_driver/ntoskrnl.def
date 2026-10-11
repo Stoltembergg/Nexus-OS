@@ -10,3 +10,16 @@ EXPORTS
     KeRaiseIrql
     KeLowerIrql
     RtlInitUnicodeString
+    ExAllocatePoolWithTag
+    ExFreePoolWithTag
+    ExFreePool
+    RtlCopyMemory
+    RtlZeroMemory
+    RtlCompareMemory
+    KeInitializeSpinLock
+    KeAcquireSpinLock
+    KeReleaseSpinLock
+    KeInitializeEvent
+    KeSetEvent
+    KeResetEvent
+    KeWaitForSingleObject

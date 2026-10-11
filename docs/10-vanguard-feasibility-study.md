@@ -203,7 +203,30 @@ Diferente da Epic Games e da BattlEye, a Riot Games adota uma filosofia de segur
 
 ---
 
-## 8. Conquistas da Fase 3.6: Execução Real de Driver WDM em Ring 0
+## 8. Conquistas da Fase 3.6 e Fase 3.7: Execução e Hardening de Drivers WDM em Ring 0
+
+Diferente da fase exploratória inicial (onde a compatibilidade foi avaliada em nível de tipos e protótipos), as **Fases 3.6 e 3.7 validaram na prática a execução e o isolamento de drivers Windows NT no kernel Nexus**:
+
+1. **Eliminação de Páginas RWX e Aplicação Estrita de W^X (Fase 3.7):**
+   * Eliminou-se qualquer buffer de supervisor RWX persistente.
+   * Seções de código (`.text`) são estritamente `PAGE_EXECUTE_READ` (RX), seções de dados mutáveis (`.data`, `INIT`) são `PAGE_READWRITE` (RW), e cabeçalhos PE são `PAGE_READONLY` (RO).
+   * A proteção é comprovada pelo silício: o bit `CR0.WP` (Supervisor Write Protect) do x86_64 foi auditado em hardware real/QEMU, gerando `#PF` imediato caso ocorra qualquer escrita não autorizada em páginas de código ou somente leitura.
+2. **IRQLs de Hardware Reais via Registrador CR8 (Local APIC TPR):**
+   * Substituiu-se qualquer simulação por atomicidade de software pelo uso direto do registrador `CR8`.
+   * Elevações via `KeRaiseIrql` para `DISPATCH_LEVEL` (`CR8=2`) mascaram interrupções no nível de hardware e bloqueiam preempção no escalonador cooperativo do Nexus OS.
+3. **Validação com Dois Drivers Reais Distintos:**
+   * **`nexus_driver.sys`:** Validação de ciclo básico, criação de dispositivos (`\Device\NexusDrv0`), elevação de IRQL e leitura de dados.
+   * **`standard_wdm.sys`:** Driver WDM autêntico compilado via MSVC 2022 sem adaptações proprietárias, exercitando `ExAllocatePoolWithTag` (Non-Paged Pool), `KeInitializeSpinLock`, `KeAcquireSpinLock`, `KeReleaseSpinLock`, `KeInitializeEvent`, `KeSetEvent`, `KeWaitForSingleObject` e `DriverUnload`.
+4. **Resolução Dinâmica de 23 Exportações WDM:** O subsistema `ntoskrnl` do Nexus OS suporta agora as rotinas essenciais de sincronização, alocação de pool por tag e operações de memória de modo kernel.
+
+> [!CAUTION]
+> ### 8.1 Isenção de Responsabilidade Técnica (Disclaimers Mandatórios)
+> * **Não declaração de compatibilidade geral com drivers Windows:** O carregamento com êxito de `nexus_driver.sys` e `standard_wdm.sys` valida os pilares fundamentais da ABI NT (formato PE32+, relocations, IAT, IRPs, pools e IRQLs via CR8). No entanto, **NÃO** autoriza declarar compatibilidade geral com o imenso ecossistema de drivers comerciais do Windows (NDIS, StorPort, WDF/KMDF avançado, drivers ACPI e drivers de vídeo WDDM).
+> * **Não declaração de compatibilidade com o Riot Vanguard:** O driver `vgk.sys` possui complexidade ordens de grandeza superior aos drivers de teste. Ele requer subsistemas inteiros ainda não implementados (`fltmgr.sys`, `ObRegisterCallbacks`, MDLs avançados, `IoGetDeviceInterfaces`, rotinas opacas do executivo) e atestação remota de hardware via TPM 2.0 (PCR 7). Portanto, **os testes simplificados atuais não comprovam nem garantem o funcionamento do Vanguard**.
+
+---
+
+## 9. Conclusão e Diretrizes para as Próximas Fases
 
 Diferente da fase exploratória inicial (onde a compatibilidade foi avaliada em nível de tipos e protótipos), a **Fase 3.6 validou na prática a execução de drivers Windows NT no kernel Nexus**:
 

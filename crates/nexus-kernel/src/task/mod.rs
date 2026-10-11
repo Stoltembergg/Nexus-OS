@@ -622,6 +622,11 @@ impl Scheduler {
             .iter()
             .any(|p| !matches!(p.state, ProcessState::Terminated(_)))
         {
+            // Windows NT architectural rule: Preemption / thread dispatching is strictly forbidden
+            // when hardware IRQL >= DISPATCH_LEVEL (2).
+            if crate::arch::x86_64::read_cr8_irql() >= nexus_types::driver::DISPATCH_LEVEL {
+                return Err(ProcessError::UnsupportedExecution);
+            }
             let idx = self.current_idx % self.processes.len();
             self.current_idx = self.current_idx.wrapping_add(1);
             let process = &mut self.processes[idx];

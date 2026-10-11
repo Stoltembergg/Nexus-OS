@@ -18,6 +18,7 @@ impl NtStatus {
     pub const STATUS_IMAGE_ALREADY_LOADED: Self = Self(0xC000010E);
     pub const STATUS_INVALID_IMAGE_FORMAT: Self = Self(0xC000007B);
     pub const STATUS_NOT_FOUND: Self = Self(0xC0000225);
+    pub const STATUS_TIMEOUT: Self = Self(0x00000102);
 
     /// Checks if the status represents success (severity code 0x0).
     #[inline]

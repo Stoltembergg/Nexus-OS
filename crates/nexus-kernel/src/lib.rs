@@ -183,6 +183,10 @@ pub fn nexus_kernel_init(boot_info: &BootHandoverInfo) {
     serial_println!("============================================================");
     serial_println!(" NEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0");
     serial_println!("============================================================");
+    serial_println!(
+        " NEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0"
+    );
+    serial_println!("============================================================");
 
     #[cfg(feature = "hardening-tests")]
     hardening::exit_success();
