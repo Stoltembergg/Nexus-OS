@@ -147,7 +147,8 @@ def main():
         if existing != set(manifest['fixtures']): raise SystemExit('ACPI fixture set differs from generator')
         for name, (data, _) in generated.items():
             if (OUT / (name + '.bin')).read_bytes() != data: raise SystemExit(f'ACPI fixture differs: {name}.bin')
-        if (OUT / 'manifest.json').read_bytes() != manifest_bytes: raise SystemExit('ACPI manifest differs from generator')
+        existing_manifest = (OUT / 'manifest.json').read_bytes().replace(b'\r\n', b'\n')
+        if existing_manifest != manifest_bytes: raise SystemExit('ACPI manifest differs from generator')
         print(f'ACPI fixtures reproducible: {len(generated)} files')
     else:
         OUT.mkdir(parents=True, exist_ok=True)
