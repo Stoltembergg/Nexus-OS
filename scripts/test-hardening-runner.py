@@ -10,7 +10,7 @@ spec.loader.exec_module(runner)
 
 class RunnerTests(unittest.TestCase):
     def serial(self):
-        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in sorted(runner.CHECKS | runner.DRIVER_CHECKS)) + '\nNEXUS_DRIVER_WX:pages_verified=20:expected=20\nNEXUS_NT_SEMANTICS:checks=14\nNEXUS_DRIVER_WDK_MIN:entry=0x0:ioctl=0xedcba987:requests=1:flags_ok=true\nNEXUS_DRIVER_LIFECYCLE:drivers=4:heap_balanced=true:pool_balanced=true:devices_deleted=true' + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\nNEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0\nNEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n'
+        return '\n'.join(f'NEXUS_CHECK:{name}:PASS' for name in sorted(runner.CHECKS | runner.DRIVER_CHECKS)) + '\nNEXUS_ACPI:revision=2:madt=0x102000:lapic=0xfee00000:processors=2:ioapics=1:overrides=1:if_clear=true\nNEXUS_DRIVER_WX:pages_verified=20:expected=20\nNEXUS_NT_SEMANTICS:checks=14\nNEXUS_DRIVER_WDK_MIN:entry=0x0:ioctl=0xedcba987:requests=1:flags_ok=true\nNEXUS_DRIVER_LIFECYCLE:drivers=4:heap_balanced=true:pool_balanced=true:devices_deleted=true' + '\nNEXUS_STRESS:cycles=64:processes=128:yields=1024:frames=1:heap=0\nNEXUS_HARDENING_PASS:checks=8\nNEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified\nNEXUS_PHASE3_6_SUCCESS: Native NT Driver Execution Verified in Ring 0\nNEXUS_PHASE3_7_SUCCESS: NT Driver Runtime Hardening & W^X Verified in Ring 0\nNEXUS_DRIVER_RELOC:applied=3:rebased=true:entry_status=0x0\nNEXUS_DRIVER_FAIL_CLOSED:imports=rejected:relocs=rejected\n'
 
     def test_complete_protocol_requires_success_exit(self):
         runner.validate(33, self.serial())
@@ -20,6 +20,22 @@ class RunnerTests(unittest.TestCase):
 
     def test_marker_only_missing_duplicate_and_failed_checks_are_rejected(self):
         for serial in ['NEXUS_HARDENING_PASS:checks=8', self.serial().replace('NEXUS_CHECK:msrs:PASS', ''), self.serial() + 'NEXUS_CHECK:context:PASS\n', self.serial().replace('context:PASS', 'context:FAIL'), self.serial().replace('NEXUS_PHASE3_SUCCESS:', 'INCOMPLETE:')]:
+            with self.assertRaises(RuntimeError):
+                runner.validate(33, serial)
+
+    def test_acpi_markers_and_inventory_must_be_unique_well_formed_and_if_clear(self):
+        valid = self.serial()
+        invalid_serials = [
+            valid.replace('NEXUS_CHECK:acpi:PASS\n', ''),
+            valid + 'NEXUS_CHECK:acpi:PASS\n',
+            valid.replace('NEXUS_ACPI:revision=2:', ''),
+            valid + 'NEXUS_ACPI:revision=2:madt=0x102000:lapic=0xfee00000:processors=2:ioapics=1:overrides=1:if_clear=true\n',
+            valid.replace('lapic=0xfee00000', 'lapic=not-hex'),
+            valid.replace('processors=2', 'processors=0'),
+            valid.replace('ioapics=1', 'ioapics=0'),
+            valid.replace('if_clear=true', 'if_clear=false'),
+        ]
+        for serial in invalid_serials:
             with self.assertRaises(RuntimeError):
                 runner.validate(33, serial)
 

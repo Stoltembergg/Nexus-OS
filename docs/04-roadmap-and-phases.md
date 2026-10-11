@@ -25,6 +25,7 @@ This is the **current planning source of truth**. Detailed implementation report
 | **3.5 — Kernel hardening** | [Closure criteria and evidence](09-phase3.5-kernel-hardening.md); [audit](13-auditoria-fases-3.5-3.7.md) | **Closed (2026-10-11)** in QEMU/OVMF + CI: audited defects fixed with regression tests, CI green on 5 jobs after PRs #3–#6. No physical-hardware evidence; toolchain pinned to 1.98.0 (issue #2) |
 | **3.6 — NT WDM driver PoC** | [MSVC-built .sys](11-phase3.6-nt-driver-validation.md) executed in QEMU Ring 0; I/O and unload | **PoC achieved** with Nexus-defined NT structs, not arbitrary .sys support. RWX mapping and silent leaks were fixed in 3.7 work (PRs #4–#6) |
 | **3.7 — NT runtime hardening** | [Revised scope and closure evidence](12-phase3.7-nt-driver-hardening.md): PTE-verified W^X, fail-closed loader + DIR64 fixture, leak-checked lifecycles, 14 Ring 0 NT-semantics checks, official WDK ABI and test-driver execution (PRs #4–#6, #10) | **Closed (2026-10-11, revised scope).** PR #10 CI run [38163656509](https://github.com/Stoltembergg/Nexus-OS/actions/runs/38163656509), tested code revision `40f985e`, passed all six jobs, including 62/62 WDK layouts, three MSVC drivers and negative controls. IRQL remains software-validated and routed to CR8 **without interrupt masking**; hardware-aware IRQL moved to Phase 4. No physical-hardware evidence or general Windows driver compatibility claim. |
+| **4.1 — ACPI inventory** | [Scope and local evidence](16-phase4.1-acpi-inventory-evidence.md): UEFI RSDP handoff, bounded root/MADT parser, generated malformed fixtures, and three QEMU/OVMF TCG guest profiles | **Closed (2026-10-11, inventory only)** after local validation / CI-equivalent gates and independent review. Branch is unpublished; no remote GitHub Actions run. No APIC MMIO access/programming, interrupt enablement, or physical-hardware evidence. |
 
 3.5 and 3.7 were closed against explicit criteria, not because a driver marker alone reported success. For 3.7, the WDK/MSVC gate and all existing host/QEMU jobs passed in PR #10 run 38163656509; closure is limited to the revised scope in [doc 12](12-phase3.7-nt-driver-hardening.md). See the [Vanguard study](10-vanguard-feasibility-study.md) for claims requiring explicit evidence.
 
@@ -38,13 +39,13 @@ This is the **current planning source of truth**. Detailed implementation report
 4. **Completed for Phase 3.7:** rebuild test drivers with official WDK headers, generate the `sizeof`/`offsetof` table and align `nexus-types`/fixtures (PR-5/PR-6); CI run 38163656509 reports 62/62 layouts, passes layout/import negative controls, and executes MSVC-built drivers on the Nexus host and in QEMU/OVMF. The `wdk-abi` artifact preserves reports, hashes and guest evidence.
 5. Differentiate guest evidence, host tests, hardware tests, and unverified statements; maintain strict negative tests.
 
-**Exit:** reproducible QEMU guest tests plus a written limitations and security audit ([doc 13](13-auditoria-fases-3.5-3.7.md)). No assertion of compatibility with Vanguard. Status: 3.5 and 3.7 closed; Phase 4 Gate E remains planned and unimplemented.
+**Exit:** reproducible QEMU guest tests plus a written limitations and security audit ([doc 13](13-auditoria-fases-3.5-3.7.md)). No assertion of compatibility with Vanguard. Status: 3.5 and 3.7 closed; Phase 4.1 ACPI inventory is complete; remaining Gate E work stays planned.
 
 ### Gate E — Core executive & device foundations (Phase 4)
 
 - Preemptive single-core scheduling before SMP; per-thread context, FPU/SIMD, locks, interrupt routing, timers, cancellation, object lifetimes and handles.
 - **Transferred from 3.7:** real IRQL with LAPIC/IOAPIC, PIC masking, IRQ vectors and IF=1, with a test that a pending interrupt is held while TPR ≥ its class and delivered when TPR is lowered (plus the CR8 check in `run_user_process`); the NT pool-registry spin lock must raise to `DISPATCH_LEVEL` or disable interrupts once ISRs/DPCs can allocate; blocking `KeWaitForSingleObject` with waiter lists, wake-ups and real timeouts; device-object reference counting so a reused device address cannot be mistaken for a stale pointer (`ObReferenceObject`-style deferred deletion).
-- Hardware discovery (ACPI/PCIe), block-device interfaces, DMA/IOMMU and IRQ APIs. VFS, initial FAT32/GPT support, durable flush and mount semantics.
+- **ACPI/MADT inventory only (Phase 4.1) is complete**; it validates and reports firmware metadata without reading/programming APIC MMIO. APIC hardware initialization, interrupt routing/IRQs, PCIe discovery, block-device interfaces and DMA/IOMMU remain planned. VFS, initial FAT32/GPT support, durable flush and mount semantics also remain planned.
 - Production-style process lifecycle, IPC and basic user services needed by the update agent and display stack.
 - **Exit:** crash-resistant multi-process test suite and persistent read/write on a QEMU block device with power-loss fault injection.
 
@@ -123,6 +124,7 @@ This is the **current planning source of truth**. Detailed implementation report
 - [Fase 3.5 hardening (closed)](09-phase3.5-kernel-hardening.md)
 - [Fase 3.7 NT driver hardening (closed, revised scope)](12-phase3.7-nt-driver-hardening.md)
 - [Fases 3.5/3.7 closure audit](13-auditoria-fases-3.5-3.7.md)
+- [Phase 4.1 ACPI inventory evidence](16-phase4.1-acpi-inventory-evidence.md)
 - [Vanguard feasibility](10-vanguard-feasibility-study.md)
 - [Phase 3.6 driver demonstration](11-phase3.6-nt-driver-validation.md)
 - [Nexus Update detailed design](12-nexus-update-architecture.md)

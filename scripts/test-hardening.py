@@ -12,7 +12,7 @@ import platform
 from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parents[1]
-CHECKS = {'msrs', 'permissions', 'context', 'faults', 'exit-and-boundary', 'rollback-oom', 'loader-bytes', 'stress'}
+CHECKS = {'msrs', 'permissions', 'context', 'faults', 'exit-and-boundary', 'rollback-oom', 'loader-bytes', 'stress', 'acpi'}
 # Emitted by the NT driver host after reading PTEs back / balancing heap, pool and devices.
 DRIVER_CHECKS = {'driver-wx', 'driver-lifecycle', 'nt-semantics'}
 # isa-debug-exit failure codes written by the guest (status = (code << 1) | 1).
@@ -28,6 +28,12 @@ def validate(returncode, serial):
     expected = {f'NEXUS_CHECK:{name}:PASS' for name in CHECKS | DRIVER_CHECKS}
     if set(checks) != expected or len(checks) != len(expected):
         raise RuntimeError(f'Missing/duplicate/unexpected guest checks: {checks}')
+    acpi_lines = re.findall(r'^NEXUS_ACPI:revision=([0-9]+):madt=(0x[0-9a-f]+):lapic=(0x[0-9a-f]+):processors=([0-9]+):ioapics=([0-9]+):overrides=([0-9]+):if_clear=(true|false)\r?$', serial, re.M)
+    if len(acpi_lines) != 1 or serial.count('NEXUS_CHECK:acpi:PASS') != 1:
+        raise RuntimeError('Missing or duplicate Phase 4.1 ACPI success/inventory marker')
+    revision, madt, lapic, processors, ioapics, overrides, if_clear = acpi_lines[0]
+    if if_clear != 'true' or int(lapic, 16) == 0 or int(lapic, 16) & 0xfff or int(processors) < 1 or int(ioapics) < 1:
+        raise RuntimeError('Invalid ACPI inventory values or IF state')
     if serial.count('NEXUS_HARDENING_PASS:checks=8') != 1:
         raise RuntimeError('Missing unique suite completion result')
     if serial.count('NEXUS_PHASE3_SUCCESS: Unified PE32+/ELF64 Execution Verified') != 1:
@@ -77,6 +83,8 @@ def main():
         data = (fixture_dir / name).read_bytes()
         if hashlib.sha256(data).hexdigest() != expected['sha256'] or len(data) != expected['bytes']:
             parser.error(f'Fixture bytes differ from compiler manifest: {name}')
+    acpi_manifest_path = ROOT / 'tests' / 'fixtures' / 'acpi' / 'manifest.json'
+    acpi_manifest_hash = hashlib.sha256(acpi_manifest_path.read_bytes()).hexdigest()
     env = dict(os.environ, NEXUS_FIXTURES_DIR=str(fixture_dir))
     cmd = ['cargo', 'build', '--locked', '-p', 'nexus-boot', '--target', 'x86_64-unknown-uefi', '--features', 'hardening-tests']
     if args.release:
@@ -103,7 +111,8 @@ def main():
     result = {'started_at_utc': datetime.now(timezone.utc).isoformat(), 'host': platform.platform(),
               'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
               'ram_mb': args.ram, 'cpu': args.cpu, 'release': args.release, 'passed': False, 'command': cmd,
-              'compiler': manifest['compiler'], 'fixture_manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+               'compiler': manifest['compiler'], 'fixture_manifest_sha256': hashlib.sha256(manifest_bytes).hexdigest(),
+               'acpi_fixture_manifest_sha256': acpi_manifest_hash,
               'efi_sha256': hashlib.sha256(image.read_bytes()).hexdigest(),
               'firmware_sha256': hashlib.sha256(Path(firmware).read_bytes()).hexdigest(),
               'source_sha256': source_hash.hexdigest(),
@@ -120,6 +129,8 @@ def main():
         result['checks'] = sorted(CHECKS)
         result['phase3_outcomes_verified'] = True
         result['phase3_6_nt_driver_verified'] = True
+        acpi = re.search(r'^NEXUS_ACPI:revision=([0-9]+):madt=(0x[0-9a-f]+):lapic=(0x[0-9a-f]+):processors=([0-9]+):ioapics=([0-9]+):overrides=([0-9]+):if_clear=true\r?$', serial, re.M)
+        result['acpi_inventory'] = {'revision': int(acpi.group(1)), 'madt_address': int(acpi.group(2), 16), 'lapic_address': int(acpi.group(3), 16), 'processors': int(acpi.group(4)), 'ioapics': int(acpi.group(5)), 'overrides': int(acpi.group(6)), 'if_clear': True}
         result['binary_writes_verified'] = 130
         stress = re.search(r'NEXUS_STRESS:cycles=(\d+):processes=(\d+):yields=(\d+):frames=(\d+):heap=(\d+)', serial)
         result['stress'] = dict(zip(['cycles', 'processes', 'yields', 'free_frames', 'heap_used_bytes'], map(int, stress.groups())))
